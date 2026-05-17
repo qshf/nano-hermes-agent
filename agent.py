@@ -46,16 +46,13 @@ def run_agent():
     )
     model = os.environ.get("MODEL", "gpt-4o-mini")
 
-    tools_schema = get_tool_definitions(ENABLED_TOOLSETS)
-    available = get_available_tool_names(ENABLED_TOOLSETS)
-
     messages = [{"role": "system", "content": build_system_prompt()}]
 
     print("=" * 60)
     print("  Nano Hermes Agent v2 — Toolsets + check_fn")
     print(f"  Model: {model}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
-    print(f"  Available tools: {', '.join(available)}")
+    print(f"  Available tools: {', '.join(get_available_tool_names(ENABLED_TOOLSETS))}")
     print("  输入 'quit' 退出")
     print("=" * 60)
     print()
@@ -76,6 +73,9 @@ def run_agent():
         messages.append({"role": "user", "content": user_input})
 
         while True:
+            # 每轮重新计算：check_fn 结果可能变化（如用户中途装了 Docker）
+            tools_schema = get_tool_definitions(ENABLED_TOOLSETS)
+
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
