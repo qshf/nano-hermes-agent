@@ -1,0 +1,12 @@
+[project]
+name = "nano-hermes-agent"
+version = "0.0.1"
+description = "教程项目：从零搭建 AI Agent 工具系统"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+nano-hermes = "agent:run_agent"
