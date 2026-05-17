@@ -1,11 +1,11 @@
 """
-Nano Hermes Agent — V1: 注册表版本
+Nano Hermes Agent — V2: Toolsets + check_fn
 
-架构变化（相比 V0）：
-- 引入 ToolRegistry，工具通过 register() 自注册
-- agent.py 不再需要逐个 import 工具的 schema 和 handler
-- 新增工具只需创建 *_tool.py 文件，无需改 agent.py
-- 自动发现机制：import tools 时扫描所有 *_tool.py 并触发注册
+架构变化（相比 V1）：
+- 引入 toolsets.py：工具按组管理，agent 只需指定 toolset 名
+- 引入 model_tools.py：薄包装层，串联 toolsets 展开 + registry 过滤
+- registry 新增 check_fn：运行时判断工具是否可用
+- 新增 docker_exec 工具演示 check_fn（Docker 未装则自动隐藏）
 
 运行方式：
     python agent.py
@@ -17,11 +17,12 @@ import os
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# 一行 import 触发所有工具的自动发现和注册
-import tools  # noqa: F401
+from model_tools import get_tool_definitions, get_available_tool_names
 from tools.registry import registry
 
-# ─── 系统提示词（根据已注册工具动态生成）────────────────────────────────────
+# ─── 配置 ────────────────────────────────────────────────────────────────────
+ENABLED_TOOLSETS = ["core"]
+
 SYSTEM_PROMPT = """You are a helpful coding assistant. You have access to the following tools:
 {tool_list}
 
@@ -31,13 +32,12 @@ Respond in the same language as the user."""
 
 
 def build_system_prompt() -> str:
-    """根据注册表中的工具动态构建系统提示词。"""
-    tool_list = "\n".join(f"- `{name}`" for name in registry.tool_names)
+    tool_names = get_available_tool_names(ENABLED_TOOLSETS)
+    tool_list = "\n".join(f"- `{name}`" for name in tool_names)
     return SYSTEM_PROMPT.format(tool_list=tool_list)
 
 
 def run_agent():
-    """Agent 主循环：对话 → LLM → 工具调用 → 循环。"""
     load_dotenv()
 
     client = OpenAI(
@@ -46,12 +46,16 @@ def run_agent():
     )
     model = os.environ.get("MODEL", "gpt-4o-mini")
 
+    tools_schema = get_tool_definitions(ENABLED_TOOLSETS)
+    available = get_available_tool_names(ENABLED_TOOLSETS)
+
     messages = [{"role": "system", "content": build_system_prompt()}]
 
     print("=" * 60)
-    print("  Nano Hermes Agent v1 — 注册表版本")
+    print("  Nano Hermes Agent v2 — Toolsets + check_fn")
     print(f"  Model: {model}")
-    print(f"  Tools: {', '.join(registry.tool_names)}")
+    print(f"  Toolsets: {ENABLED_TOOLSETS}")
+    print(f"  Available tools: {', '.join(available)}")
     print("  输入 'quit' 退出")
     print("=" * 60)
     print()
@@ -71,12 +75,11 @@ def run_agent():
 
         messages.append({"role": "user", "content": user_input})
 
-        # Agent 循环
         while True:
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                tools=registry.get_openai_tools(),
+                tools=tools_schema,
             )
 
             choice = response.choices[0]
