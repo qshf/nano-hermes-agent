@@ -19,7 +19,5 @@ def get_tool_definitions(enabled_toolsets: list[str]) -> list[dict]:
 def get_available_tool_names(enabled_toolsets: list[str]) -> list[str]:
     """返回当前可用的工具名（经过 check_fn 过滤）。"""
     tool_names = resolve_toolsets(enabled_toolsets)
-    return [
-        name for name in tool_names
-        if name in registry.available_tool_names
-    ]
+    available = set(registry.available_tool_names)
+    return [name for name in tool_names if name in available]
