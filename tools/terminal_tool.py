@@ -1,11 +1,13 @@
 """
 Terminal Tool — 执行 shell 命令并返回结果。
 
-V0 版本：最简实现，仅支持本地同步执行。
+V1：通过 registry.register() 自注册，不再需要 agent.py 手动 import。
 """
 
 import json
 import subprocess
+
+from tools.registry import registry
 
 TERMINAL_SCHEMA = {
     "name": "terminal",
@@ -54,3 +56,7 @@ def terminal_handler(args: dict) -> str:
         return json.dumps({"error": f"Command timed out after {timeout}s."}, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+# 自注册
+registry.register(TERMINAL_SCHEMA, terminal_handler)

@@ -1,11 +1,13 @@
 """
 Read File Tool — 读取文件内容。
 
-V0 版本：最简实现，带行号输出。
+V1：通过 registry.register() 自注册。
 """
 
 import json
 from pathlib import Path
+
+from tools.registry import registry
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
@@ -44,3 +46,7 @@ def read_file_handler(args: dict) -> str:
         return json.dumps({"content": numbered}, ensure_ascii=False)
     except Exception as exc:
         return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+# 自注册
+registry.register(READ_FILE_SCHEMA, read_file_handler)
