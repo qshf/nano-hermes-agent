@@ -1,11 +1,12 @@
 """
-Nano Hermes Agent — V2: Toolsets + check_fn
+Nano Hermes Agent — V3: 缓存层 + MCP 集成
 
-架构变化（相比 V1）：
-- 引入 toolsets.py：工具按组管理，agent 只需指定 toolset 名
-- 引入 model_tools.py：薄包装层，串联 toolsets 展开 + registry 过滤
-- registry 新增 check_fn：运行时判断工具是否可用
-- 新增 docker_exec 工具演示 check_fn（Docker 未装则自动隐藏）
+架构变化（相比 V2）：
+- registry 新增 _generation 计数器，每次 register/deregister 递增
+- registry 的 check_fn 结果带 30s TTL 缓存
+- model_tools 新增外层缓存，cache_key = (toolsets, generation)
+- 注册表没变时 get_tool_definitions() 直接返回缓存，~0ms
+- 新增 MCP 客户端：/mcp 命令按需连接 MCP server，动态注册工具
 
 运行方式：
     python agent.py
@@ -49,7 +50,7 @@ def run_agent():
     messages = [{"role": "system", "content": build_system_prompt()}]
 
     print("=" * 60)
-    print("  Nano Hermes Agent v2 — Toolsets + check_fn")
+    print("  Nano Hermes Agent v3 — 缓存层")
     print(f"  Model: {model}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
     print(f"  Available tools: {', '.join(get_available_tool_names(ENABLED_TOOLSETS))}")
@@ -69,6 +70,83 @@ def run_agent():
         if user_input.lower() in ("quit", "exit", "q"):
             print("Bye!")
             break
+
+        # /load 命令：运行时动态加载 plugins/ 下的工具
+        if user_input.startswith("/load "):
+            filename = user_input[6:].strip()
+            try:
+                from tools import load_plugin
+                old_gen = registry.generation
+                load_plugin(filename)
+                print(f"  [loaded] {filename} (generation: {old_gen} → {registry.generation})")
+                print(f"  [tools] {registry.tool_names}")
+            except Exception as e:
+                print(f"  [error] {e}")
+            continue
+
+        # /mcp 命令：按需连接 MCP server
+        if user_input.startswith("/mcp"):
+            from tools.mcp_client import mcp_manager
+            parts = user_input.split()
+
+            if len(parts) == 1 or parts[1] == "list":
+                servers = mcp_manager.connected_servers
+                if not servers:
+                    print("  [mcp] No connected servers. Use: /mcp connect <name> <command> [args...]")
+                else:
+                    for s in servers:
+                        tools = mcp_manager.get_tools(s)
+                        print(f"  [mcp] {s}: {', '.join(tools)}")
+                continue
+
+            if parts[1] == "connect" and len(parts) >= 4:
+                # /mcp connect mcp_server_demo python mcp_server_demo.py
+                name = parts[2]
+                command = parts[3]
+                args = parts[4:] if len(parts) > 4 else []
+                try:
+                    old_gen = registry.generation
+                    mcp_manager.connect(name, command, args)
+                    tools = mcp_manager.get_tools(name)
+                    print(f"  [mcp] Connected to '{name}' (generation: {old_gen} → {registry.generation})")
+                    print(f"  [mcp] Tools: {', '.join(tools)}")
+                except Exception as e:
+                    print(f"  [mcp error] {e}")
+                continue
+
+            if parts[1] == "disconnect" and len(parts) >= 3:
+                name = parts[2]
+                old_gen = registry.generation
+                disconnected = mcp_manager.disconnect(name)
+                if disconnected:
+                    print(f"  [mcp] Disconnected '{name}' (generation: {old_gen} → {registry.generation})")
+                else:
+                    print(f"  [mcp] '{name}' is not connected. Use /mcp list to see connected servers.")
+                continue
+
+            if parts[1] == "refresh" and len(parts) >= 3:
+                name = parts[2]
+                old_gen = registry.generation
+                mcp_manager.refresh(name)
+                tools = mcp_manager.get_tools(name)
+                print(f"  [mcp] Refreshed '{name}' (generation: {old_gen} → {registry.generation})")
+                print(f"  [mcp] Tools: {', '.join(tools)}")
+                continue
+
+            print("  Usage:")
+            print("    /mcp                          — list connected servers")
+            print("    /mcp connect <name> <cmd> [args...]  — connect to MCP server")
+            print("    /mcp disconnect <name>        — disconnect")
+            print("    /mcp refresh <name>           — refresh tool list")
+            continue
+
+        # /tools 命令：查看当前可用工具
+        if user_input == "/tools":
+            available = get_available_tool_names(ENABLED_TOOLSETS)
+            print(f"  [toolset] {ENABLED_TOOLSETS}")
+            print(f"  [available] {', '.join(available)}")
+            print(f"  [registered] {', '.join(registry.tool_names)}")
+            continue
 
         messages.append({"role": "user", "content": user_input})
 

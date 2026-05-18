@@ -10,10 +10,12 @@ TOOLSETS: dict[str, list[str]] = {
     "core": [
         "terminal",
         "read_file",
+        "write_file",
     ],
     "docker": [
         "terminal",
         "read_file",
+        "write_file",
         "docker_exec",
     ],
 }
