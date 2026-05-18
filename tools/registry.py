@@ -3,11 +3,13 @@ ToolRegistry — 工具注册表。
 
 V3：新增 _generation 计数器 + check_fn TTL 缓存。
 V4：新增 is_async 标记 + _run_async 桥接 + dispatch 前自动 coerce。
+V5：dispatch 集成 pre/post/transform 钩子。
 
 - _generation：每次 register/deregister 递增，供外层缓存判断是否失效
 - check_fn 结果缓存 30s，避免每轮都 fork 进程探测
 - is_async：标记 handler 是否为 async def，dispatch 自动桥接
 - coerce：dispatch 前根据 schema 自动修正参数类型
+- hooks：dispatch 流程中的三个扩展点（pre/post/transform）
 """
 
 import asyncio
@@ -114,19 +116,41 @@ class ToolRegistry:
         return self.get_definitions(list(self._tools.keys()))
 
     def dispatch(self, name: str, args: dict) -> str:
-        """根据工具名分发调用。V4: 先 coerce 参数，再处理 async。"""
+        """根据工具名分发调用。V5: coerce → pre_hook → 执行 → post_hook → transform。"""
         entry = self._tools.get(name)
         if entry is None:
             return json.dumps({"error": f"Unknown tool: {name}"}, ensure_ascii=False)
 
-        # V4: 类型强制转换（根据 schema 把 "42" → 42, "true" → True）
+        # V4: 类型强制转换
         from tools.coerce import coerce_args
         coerced = coerce_args(entry["schema"], args)
 
-        # V4: 异步桥接（async handler 自动通过 _run_async 执行）
+        # V5: pre_tool_call 钩子（可阻止执行）
+        from tools.hooks import hook_manager
+        pre_results = hook_manager.invoke("pre_tool_call", tool_name=name, args=coerced)
+        for r in pre_results:
+            if isinstance(r, dict) and r.get("action") == "block":
+                return json.dumps({"error": f"Blocked: {r.get('message', '')}"}, ensure_ascii=False)
+
+        # 执行 handler（计时）
+        start = time.monotonic()
         if entry.get("is_async"):
-            return _run_async(entry["handler"](coerced))
-        return entry["handler"](coerced)
+            result = _run_async(entry["handler"](coerced))
+        else:
+            result = entry["handler"](coerced)
+        duration_ms = int((time.monotonic() - start) * 1000)
+
+        # V5: post_tool_call 钩子（观察者，返回值忽略）
+        hook_manager.invoke("post_tool_call", tool_name=name, args=coerced, result=result, duration_ms=duration_ms)
+
+        # V5: transform_tool_result 钩子（第一个非 None 字符串替换结果）
+        transform_results = hook_manager.invoke("transform_tool_result", tool_name=name, args=coerced, result=result)
+        for r in transform_results:
+            if isinstance(r, str):
+                result = r
+                break
+
+        return result
 
     @property
     def tool_names(self) -> list[str]:

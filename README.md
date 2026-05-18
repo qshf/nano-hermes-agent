@@ -10,8 +10,8 @@
 | `v1` | 注册表 | 自注册 + dispatch |
 | `v2` | Toolsets | 名字展开 + check_fn |
 | `v3` | 缓存 + MCP | generation + TTL + MCP 动态加载 |
-| `v4` | 类型修复 | coerce + 异步桥接（计划中） |
-| `v5` | 插件钩子 | pre/post/transform（计划中） |
+| `v4` | 类型修复 | coerce + 异步桥接 |
+| `v5` | 插件钩子 | pre/post/transform |
 
 ## 快速开始
 
@@ -33,100 +33,124 @@ source .venv/bin/activate
 python agent.py
 ```
 
-## 当前版本：V4 — 类型修复 + 异步桥接
+## 当前版本：V5 — 插件钩子系统
 
-在 dispatch 层统一解决 LLM 参数类型错误和 async handler 执行问题。
+在 dispatch 流程中插入三个钩子点，并增强插件系统支持 load/unload 生命周期。
 
 ```
 nano_hermes_agent/
-├── agent.py              # 主循环 + /mcp /load /tools 命令
+├── agent.py              # 主循环 + /plugin /mcp /load /tools 命令
 ├── model_tools.py        # 外层缓存 + MCP 工具自动包含
 ├── toolsets.py           # 工具组定义
 ├── mcp_server_demo.py    # 示例 MCP server（FastMCP，stdio）
 ├── tools/
-│   ├── __init__.py       # 自动发现 + load_plugin()
-│   ├── registry.py       # dispatch: coerce + is_async 桥接
-│   ├── coerce.py         # V4 新增：类型强制转换
+│   ├── __init__.py       # 自动发现 + load/unload 生命周期
+│   ├── registry.py       # dispatch: coerce + async + hooks
+│   ├── hooks.py          # V5 新增：HookManager
+│   ├── coerce.py         # 类型强制转换
 │   ├── mcp_client.py     # MCP 客户端
 │   ├── terminal_tool.py
 │   ├── read_file_tool.py
-│   ├── async_demo_tool.py  # V4 新增：异步工具演示
+│   ├── async_demo_tool.py
 │   └── docker_exec_tool.py
 ├── plugins/
-│   └── write_file_tool.py
+│   ├── write_file_tool.py    # 动态工具加载演示
+│   ├── logging_hook.py       # V5：日志钩子
+│   ├── truncate_hook.py      # V5：截断钩子
+│   └── rate_limit_hook.py    # V5：限流钩子
 ├── pyproject.toml
 ├── .env.example
 └── .gitignore
 ```
 
-### V4 解决了 V3 的什么问题？
+### V5 解决了 V4 的什么问题？
 
-| V3 的问题 | V4 的解法 |
+| V4 的问题 | V5 的解法 |
 |-----------|-----------|
-| LLM 返回 `"42"` 而非 `42` | dispatch 前根据 schema 自动 coerce |
-| LLM 返回 `"true"` 而非 `true` | `_coerce_bool("true")` → `True` |
-| 每个 handler 各自做类型转换 | 集中在 `coerce_args()` 一处处理 |
-| async handler 无法在 sync 循环执行 | `is_async=True` + `_run_async()` 自动桥接 |
+| 无法统一做调用日志 | `post_tool_call` 钩子观察每次调用 |
+| 无法统一限流/权限检查 | `pre_tool_call` 钩子可阻止执行 |
+| 无法统一截断/格式化结果 | `transform_tool_result` 钩子替换结果 |
+| 插件 load 了不能 unload | `unload_plugin()` + `deregister()` |
 
-### 类型强制转换（coerce）
+### 三种钩子
+
+| 钩子 | 时机 | 语义 | 返回值 |
+|------|------|------|--------|
+| `pre_tool_call` | handler 执行前 | 可阻止 | `{"action": "block", "message": "..."}` |
+| `post_tool_call` | handler 执行后 | 观察者 | 忽略 |
+| `transform_tool_result` | post 之后 | 可替换 | 第一个非 None 字符串替换结果 |
+
+### dispatch 流程（V5 完整版）
 
 ```
-LLM 返回: {"command": "ls", "timeout": "30"}
-                                        ↑ schema 声明 "type": "integer"
-        ↓ coerce_args()
-Handler 收到: {"command": "ls", "timeout": 30}
-                                          ↑ 已转为 int
+registry.dispatch("terminal", {"command": "ls", "timeout": "30"})
+        ↓
+1. coerce_args()                    # V4: "30" → 30
+        ↓
+2. pre_tool_call hooks              # V5: 可阻止（如限流）
+   ├─ rate_limit → block?
+   └─ logging → print "→ terminal(...)"
+        ↓
+3. handler(coerced_args)            # 执行工具（计时）
+        ↓
+4. post_tool_call hooks             # V5: 观察（如日志）
+   └─ logging → print "← terminal (5ms)"
+        ↓
+5. transform_tool_result hooks      # V5: 可替换（如截断）
+   └─ truncate → 超长则截断
+        ↓
+6. return result
 ```
 
-**支持的转换：**
-
-| Schema 类型 | 输入 | 输出 |
-|-------------|------|------|
-| `integer` | `"42"` | `42` |
-| `number` | `"3.14"` | `3.14` |
-| `boolean` | `"true"` | `True` |
-| `array` | `"[1,2,3]"` | `[1, 2, 3]` |
-| `object` | `'{"a":1}'` | `{"a": 1}` |
-
-**安全原则：** 转换失败时保留原值，不抛异常。Handler 仍然可以自行处理。
-
-### 异步桥接（async bridge）
+### 插件生命周期
 
 ```python
-# 注册时声明 is_async=True
-async def my_handler(args: dict) -> str:
-    result = await some_async_api(args["query"])
-    return json.dumps({"output": result})
+# plugins/logging_hook.py
 
-registry.register(schema, my_handler, is_async=True)
+def pre_tool_call(tool_name, args, **kw):
+    print(f"  [hook:log] → {tool_name}({args})")
+
+def post_tool_call(tool_name, args, result, duration_ms, **kw):
+    print(f"  [hook:log] ← {tool_name} ({duration_ms}ms)")
+
+def register(hook_manager):
+    hook_manager.register("pre_tool_call", pre_tool_call)
+    hook_manager.register("post_tool_call", post_tool_call)
+
+def deregister(hook_manager):
+    hook_manager.deregister("pre_tool_call", pre_tool_call)
+    hook_manager.deregister("post_tool_call", post_tool_call)
 ```
 
-**dispatch 内部流程：**
+**使用方式：**
 
 ```
-registry.dispatch("async_demo", {"seconds": "2"})
-        ↓
-1. coerce_args() → {"seconds": 2}     # 先修正类型
-        ↓
-2. entry["is_async"] == True?
-   → _run_async(handler(coerced_args))  # 桥接到 async
-        ↓
-3. _run_async 策略：
-   - 无 running loop → asyncio.run()
-   - 有 running loop → 开新线程跑 asyncio.run()
+You > /plugin load logging_hook.py
+  [plugin] Loaded 'logging_hook.py'
+  [plugin] Hooks: pre_tool_call, post_tool_call
+
+You > 列出当前目录的文件
+  [hook:log] → terminal({'command': 'ls'})
+  [hook:log] ← terminal (3ms) {"output": "..."}
+
+Agent > 当前目录包含以下文件：...
+
+You > /plugin unload logging_hook.py
+  [plugin] Unloaded 'logging_hook.py'
 ```
 
-**对比 MCP 工具的异步方案：**
+**插件命令：**
 
-| | MCP 工具 | V4 async 工具 |
-|---|----------|---------------|
-| 场景 | 长连接（session 持续存在） | 一次性协程（用完即走） |
-| 机制 | 专用后台 event loop + `run_coroutine_threadsafe` | `_run_async()` 按需创建/复用 loop |
-| 注册 | `is_async=False`（handler 内部自己桥接） | `is_async=True`（dispatch 自动桥接） |
-| 复杂度 | 高（需要管理 loop 生命周期） | 低（~15 行代码） |
+| 命令 | 说明 |
+|------|------|
+| `/plugin` | 列出已加载的插件 |
+| `/plugin load <file>` | 加载插件并注册钩子 |
+| `/plugin unload <file>` | 注销钩子并卸载插件 |
 
-### V4 的问题（V5 要解决的）
+### 示例插件
 
-1. 工具调用没有 pre/post 钩子（无法统一做日志、限流、重试）
-2. 工具结果没有 transform 机制（无法统一截断、格式化）
-3. 没有插件生命周期管理（load 了就不能 unload）
+| 插件 | 钩子 | 功能 |
+|------|------|------|
+| `logging_hook.py` | pre + post | 打印调用入口/出口日志（含耗时） |
+| `truncate_hook.py` | transform | 截断超过 2000 字符的结果 |
+| `rate_limit_hook.py` | pre (block) | 每分钟最多 10 次调用 |

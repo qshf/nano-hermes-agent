@@ -1,10 +1,10 @@
 """
-Nano Hermes Agent — V4: 类型修复 + 异步桥接
+Nano Hermes Agent — V5: 插件钩子系统
 
-架构变化（相比 V3）：
-- dispatch 前自动根据 JSON Schema 做参数类型强制转换（coerce）
-- 注册时可声明 is_async=True，dispatch 自动桥接 async handler
-- 新增 async_demo 工具演示异步桥接
+架构变化（相比 V4）：
+- dispatch 流程新增三个钩子点：pre_tool_call / post_tool_call / transform_tool_result
+- 插件支持 load/unload 生命周期管理
+- 插件通过 register(hook_manager) / deregister(hook_manager) 注册钩子
 
 运行方式：
     python agent.py
@@ -48,7 +48,7 @@ def run_agent():
     messages = [{"role": "system", "content": build_system_prompt()}]
 
     print("=" * 60)
-    print("  Nano Hermes Agent v4 — 类型修复 + 异步桥接")
+    print("  Nano Hermes Agent v5 — 插件钩子系统")
     print(f"  Model: {model}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
     print(f"  Available tools: {', '.join(get_available_tool_names(ENABLED_TOOLSETS))}")
@@ -136,6 +136,46 @@ def run_agent():
             print("    /mcp connect <name> <cmd> [args...]  — connect to MCP server")
             print("    /mcp disconnect <name>        — disconnect")
             print("    /mcp refresh <name>           — refresh tool list")
+            continue
+
+        # /plugin 命令：V5 插件生命周期管理
+        if user_input.startswith("/plugin"):
+            from tools import load_plugin, unload_plugin, list_plugins
+            parts = user_input.split()
+
+            if len(parts) == 1 or parts[1] == "list":
+                plugins = list_plugins()
+                if not plugins:
+                    print("  [plugin] No loaded plugins. Use: /plugin load <filename>")
+                else:
+                    for name, hooks in plugins.items():
+                        print(f"  [plugin] {name}: {', '.join(hooks) if hooks else '(no hooks)'}")
+                continue
+
+            if parts[1] == "load" and len(parts) >= 3:
+                filename = parts[2]
+                try:
+                    load_plugin(filename)
+                    plugins = list_plugins()
+                    hooks = plugins.get(filename.replace(".py", "").replace(".py", ""), [])
+                    print(f"  [plugin] Loaded '{filename}'")
+                    print(f"  [plugin] Hooks: {', '.join(hooks) if hooks else '(none)'}")
+                except Exception as e:
+                    print(f"  [plugin error] {e}")
+                continue
+
+            if parts[1] == "unload" and len(parts) >= 3:
+                filename = parts[2]
+                if unload_plugin(filename):
+                    print(f"  [plugin] Unloaded '{filename}'")
+                else:
+                    print(f"  [plugin] '{filename}' is not loaded.")
+                continue
+
+            print("  Usage:")
+            print("    /plugin                  — list loaded plugins")
+            print("    /plugin load <file>      — load plugin and register hooks")
+            print("    /plugin unload <file>    — unload plugin and deregister hooks")
             continue
 
         # /tools 命令：查看当前可用工具
