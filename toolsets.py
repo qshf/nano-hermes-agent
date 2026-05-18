@@ -12,6 +12,7 @@ TOOLSETS: dict[str, list[str]] = {
         "read_file",
         "write_file",
         "async_demo",
+        "memory",
     ],
     "docker": [
         "terminal",
@@ -19,6 +20,7 @@ TOOLSETS: dict[str, list[str]] = {
         "write_file",
         "docker_exec",
         "async_demo",
+        "memory",
     ],
 }
 

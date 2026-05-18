@@ -1,10 +1,11 @@
 """
-Nano Hermes Agent — V5: 插件钩子系统
+Nano Hermes Agent — V6: 文件记忆工具
 
-架构变化（相比 V4）：
-- dispatch 流程新增三个钩子点：pre_tool_call / post_tool_call / transform_tool_result
-- 插件支持 load/unload 生命周期管理
-- 插件通过 register(hook_manager) / deregister(hook_manager) 注册钩子
+架构变化（相比 V5）：
+- 新增 MemoryStore：文件持久化记忆，§ 分隔条目，字符限制
+- 新增 memory tool：agent 可主动 add/replace/remove 记忆
+- 冻结快照：system prompt 用加载时快照，tool 响应返回实时状态
+- 记忆注入 system prompt，跨会话持久化
 
 运行方式：
     python agent.py
@@ -18,6 +19,7 @@ from openai import OpenAI
 
 from model_tools import get_tool_definitions, get_available_tool_names
 from tools.registry import registry
+from tools.memory_tool import _store as memory_store
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
 ENABLED_TOOLSETS = ["core"]
@@ -27,13 +29,27 @@ SYSTEM_PROMPT = """You are a helpful coding assistant. You have access to the fo
 
 When the user asks you to do something, use the appropriate tool.
 Always explain what you're doing before and after tool use.
-Respond in the same language as the user."""
+Respond in the same language as the user.
+
+{memory_block}"""
+
+MEMORY_GUIDANCE = """Use the `memory` tool to persist important information across sessions:
+- User preferences and corrections
+- Project context and conventions
+- Facts you've learned that will be useful later
+Do NOT store: task progress, session-specific state, or information already in files."""
 
 
 def build_system_prompt() -> str:
     tool_names = get_available_tool_names(ENABLED_TOOLSETS)
     tool_list = "\n".join(f"- `{name}`" for name in tool_names)
-    return SYSTEM_PROMPT.format(tool_list=tool_list)
+
+    # 冻结快照：加载时的记忆状态，不随 tool 调用变化
+    memory_block = memory_store.snapshot or ""
+    if memory_block:
+        memory_block = memory_block + "\n\n" + MEMORY_GUIDANCE
+
+    return SYSTEM_PROMPT.format(tool_list=tool_list, memory_block=memory_block).strip()
 
 
 def run_agent():
@@ -48,9 +64,12 @@ def run_agent():
     messages = [{"role": "system", "content": build_system_prompt()}]
 
     print("=" * 60)
-    print("  Nano Hermes Agent v5 — 插件钩子系统")
+    print("  Nano Hermes Agent v6 — 文件记忆工具")
     print(f"  Model: {model}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
+    print(f"  Memory: {memory_store._file_path}")
+    print(f"    entries: {len(memory_store._entries)}, "
+          f"usage: {memory_store._char_count()}/{memory_store._char_limit} chars")
     print(f"  Available tools: {', '.join(get_available_tool_names(ENABLED_TOOLSETS))}")
     print("  输入 'quit' 退出")
     print("=" * 60)
@@ -68,6 +87,19 @@ def run_agent():
         if user_input.lower() in ("quit", "exit", "q"):
             print("Bye!")
             break
+
+        # /memory 命令：查看当前记忆状态
+        if user_input == "/memory":
+            entries = memory_store._entries
+            if not entries:
+                print("  [memory] (empty)")
+            else:
+                print(f"  [memory] {len(entries)} entries, "
+                      f"{memory_store._char_count()}/{memory_store._char_limit} chars")
+                for i, entry in enumerate(entries, 1):
+                    display = entry[:80] + "..." if len(entry) > 80 else entry
+                    print(f"    {i}. {display}")
+            continue
 
         # /load 命令：运行时动态加载 plugins/ 下的工具
         if user_input.startswith("/load "):
