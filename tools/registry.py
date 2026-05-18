@@ -2,10 +2,16 @@
 ToolRegistry — 工具注册表。
 
 V3：新增 _generation 计数器 + check_fn TTL 缓存。
+V4：新增 is_async 标记 + _run_async 桥接 + dispatch 前自动 coerce。
+
 - _generation：每次 register/deregister 递增，供外层缓存判断是否失效
 - check_fn 结果缓存 30s，避免每轮都 fork 进程探测
+- is_async：标记 handler 是否为 async def，dispatch 自动桥接
+- coerce：dispatch 前根据 schema 自动修正参数类型
 """
 
+import asyncio
+import concurrent.futures
 import json
 import logging
 import time
@@ -14,6 +20,27 @@ from typing import Callable, Optional
 CHECK_FN_TTL = 30.0  # check_fn 缓存有效期（秒）
 
 log = logging.getLogger(__name__)
+
+
+# --- V4: 异步桥接 ---
+
+def _run_async(coro) -> str:
+    """在 sync 上下文中运行 async 协程。
+
+    策略：
+    - 没有 running loop → asyncio.run()（最简单，CLI 场景）
+    - 有 running loop → 开新线程跑 asyncio.run()（嵌入 async 框架时）
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        with concurrent.futures.ThreadPoolExecutor(1) as pool:
+            return pool.submit(asyncio.run, coro).result(timeout=60)
+    else:
+        return asyncio.run(coro)
 
 
 class ToolRegistry:
@@ -34,6 +61,7 @@ class ToolRegistry:
         schema: dict,
         handler: Callable[[dict], str],
         check_fn: Optional[Callable[[], bool]] = None,
+        is_async: bool = False,
     ):
         """注册一个工具。每次注册递增 generation。"""
         name = schema["name"]
@@ -41,6 +69,7 @@ class ToolRegistry:
             "schema": schema,
             "handler": handler,
             "check_fn": check_fn,
+            "is_async": is_async,
         }
         self._generation += 1
 
@@ -85,11 +114,19 @@ class ToolRegistry:
         return self.get_definitions(list(self._tools.keys()))
 
     def dispatch(self, name: str, args: dict) -> str:
-        """根据工具名分发调用。"""
+        """根据工具名分发调用。V4: 先 coerce 参数，再处理 async。"""
         entry = self._tools.get(name)
         if entry is None:
             return json.dumps({"error": f"Unknown tool: {name}"}, ensure_ascii=False)
-        return entry["handler"](args)
+
+        # V4: 类型强制转换（根据 schema 把 "42" → 42, "true" → True）
+        from tools.coerce import coerce_args
+        coerced = coerce_args(entry["schema"], args)
+
+        # V4: 异步桥接（async handler 自动通过 _run_async 执行）
+        if entry.get("is_async"):
+            return _run_async(entry["handler"](coerced))
+        return entry["handler"](coerced)
 
     @property
     def tool_names(self) -> list[str]:

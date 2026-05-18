@@ -11,12 +11,14 @@ TOOLSETS: dict[str, list[str]] = {
         "terminal",
         "read_file",
         "write_file",
+        "async_demo",
     ],
     "docker": [
         "terminal",
         "read_file",
         "write_file",
         "docker_exec",
+        "async_demo",
     ],
 }
 

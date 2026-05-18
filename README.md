@@ -33,9 +33,9 @@ source .venv/bin/activate
 python agent.py
 ```
 
-## 当前版本：V3 — 缓存层 + MCP 集成
+## 当前版本：V4 — 类型修复 + 异步桥接
 
-引入两层缓存解决性能问题，同时添加 MCP 协议支持实现按需动态加载外部工具。
+在 dispatch 层统一解决 LLM 参数类型错误和 async handler 执行问题。
 
 ```
 nano_hermes_agent/
@@ -45,140 +45,88 @@ nano_hermes_agent/
 ├── mcp_server_demo.py    # 示例 MCP server（FastMCP，stdio）
 ├── tools/
 │   ├── __init__.py       # 自动发现 + load_plugin()
-│   ├── registry.py       # _generation + check_fn TTL 缓存
-│   ├── mcp_client.py     # MCP 客户端：connect/discover/call/refresh
+│   ├── registry.py       # dispatch: coerce + is_async 桥接
+│   ├── coerce.py         # V4 新增：类型强制转换
+│   ├── mcp_client.py     # MCP 客户端
 │   ├── terminal_tool.py
 │   ├── read_file_tool.py
+│   ├── async_demo_tool.py  # V4 新增：异步工具演示
 │   └── docker_exec_tool.py
 ├── plugins/
-│   └── write_file_tool.py  # 动态加载演示
+│   └── write_file_tool.py
 ├── pyproject.toml
 ├── .env.example
 └── .gitignore
 ```
 
-### V3 解决了 V2 的什么问题？
+### V4 解决了 V3 的什么问题？
 
-| V2 的问题 | V3 的解法 |
+| V3 的问题 | V4 的解法 |
 |-----------|-----------|
-| 每轮都遍历注册表 + 调 check_fn | 外层缓存命中时 ~0μs 返回 |
-| check_fn 可能 fork 进程，每轮都调 | 30s TTL 缓存，过期才重新执行 |
-| 无法感知注册表是否变化 | `_generation` 计数器，O(1) 比较 |
-| 工具只能静态加载 | MCP 协议支持按需连接外部工具服务 |
+| LLM 返回 `"42"` 而非 `42` | dispatch 前根据 schema 自动 coerce |
+| LLM 返回 `"true"` 而非 `true` | `_coerce_bool("true")` → `True` |
+| 每个 handler 各自做类型转换 | 集中在 `coerce_args()` 一处处理 |
+| async handler 无法在 sync 循环执行 | `is_async=True` + `_run_async()` 自动桥接 |
 
-### 两层缓存架构
+### 类型强制转换（coerce）
 
 ```
-Agent 每轮调用 get_tool_definitions(["core"])
+LLM 返回: {"command": "ls", "timeout": "30"}
+                                        ↑ schema 声明 "type": "integer"
+        ↓ coerce_args()
+Handler 收到: {"command": "ls", "timeout": 30}
+                                          ↑ 已转为 int
+```
+
+**支持的转换：**
+
+| Schema 类型 | 输入 | 输出 |
+|-------------|------|------|
+| `integer` | `"42"` | `42` |
+| `number` | `"3.14"` | `3.14` |
+| `boolean` | `"true"` | `True` |
+| `array` | `"[1,2,3]"` | `[1, 2, 3]` |
+| `object` | `'{"a":1}'` | `{"a": 1}` |
+
+**安全原则：** 转换失败时保留原值，不抛异常。Handler 仍然可以自行处理。
+
+### 异步桥接（async bridge）
+
+```python
+# 注册时声明 is_async=True
+async def my_handler(args: dict) -> str:
+    result = await some_async_api(args["query"])
+    return json.dumps({"output": result})
+
+registry.register(schema, my_handler, is_async=True)
+```
+
+**dispatch 内部流程：**
+
+```
+registry.dispatch("async_demo", {"seconds": "2"})
         ↓
-┌─ model_tools 外层缓存 ─────────────────────┐
-│  cache_key = (enabled_toolsets, generation) │
-│  命中 → 直接返回（~0μs）                    │
-│  未命中 → 重算 ↓                            │
-└─────────────────────────────────────────────┘
+1. coerce_args() → {"seconds": 2}     # 先修正类型
         ↓
-┌─ registry 内层缓存 ─────────────────────────┐
-│  check_fn 结果 → (timestamp, bool)          │
-│  30s 内 → 返回缓存结果                       │
-│  过期 → 重新执行 check_fn()                  │
-└─────────────────────────────────────────────┘
-```
-
-### MCP 集成
-
-通过 `/mcp` 命令按需连接 MCP server，避免全部加载导致上下文过长。
-
-**使用方式：**
-
-```
-You > /mcp connect demo python mcp_server_demo.py
-  [mcp] Connected to 'demo' (generation: 3 → 5)
-  [mcp] Tools: mcp_demo_get_weather, mcp_demo_get_time
-
-You > 北京今天天气怎么样？
-  [tool] mcp_demo_get_weather({"city": "北京"})
-  [result] (ok)
-
-Agent > 北京今天天气晴，气温 22°C，湿度 45%。
-
-You > /mcp disconnect demo
-  [mcp] Disconnected 'demo'
-```
-
-**MCP 命令：**
-
-| 命令 | 说明 |
-|------|------|
-| `/mcp` | 列出已连接的 MCP servers |
-| `/mcp connect <name> <cmd> [args...]` | 连接 MCP server |
-| `/mcp disconnect <name>` | 断开连接 |
-| `/mcp refresh <name>` | 刷新工具列表 |
-
-**什么时候用 `/mcp refresh`？**
-
-`refresh` 会对当前已连接的 MCP server 重新执行 `list_tools()`，然后把旧工具从 registry 注销，再按最新列表重新注册。
-
-适合用 `refresh` 的情况：
-
-- MCP server 进程还在运行
-- 工具是否可用取决于运行时环境
-- 这个环境变化能被当前进程实时感知
-
-例如：
-
-```
-# 连接时 Docker 没启动，相关工具不可用
-# 后来启动了 Docker
-You > /mcp refresh demo
-```
-
-不适合只用 `refresh` 的情况：
-
-- 修改了 MCP server 的 Python 源码
-- 新增了 `@mcp.tool()` 函数
-- 安装了新的 Python import 包依赖
-- 改了启动参数或环境变量，而当前子进程无法自动感知
-
-这种情况建议重启 MCP server：
-
-```
-You > /mcp disconnect demo
-You > /mcp connect demo python mcp_server_demo.py
-```
-
-简单规则：
-
-```
-外部运行状态变了，进程能实时看到 → /mcp refresh <name>
-代码、Python 包、启动参数变了 → disconnect + connect
-```
-
-**工作原理：**
-
-```
-/mcp connect demo python mcp_server_demo.py
+2. entry["is_async"] == True?
+   → _run_async(handler(coerced_args))  # 桥接到 async
         ↓
-┌─ mcp_client.py ─────────────────────────────┐
-│  1. _ensure_mcp_loop() → 后台 daemon 线程    │
-│  2. stdio_client() → 子进程启动 MCP server   │
-│  3. session.list_tools() → 发现工具          │
-│  4. registry.register() → generation 递增    │
-└─────────────────────────────────────────────┘
-        ↓
-下一轮对话 get_tool_definitions()
-  → cache_key 中 generation 变了
-  → 缓存失效 → 重算 → MCP 工具出现在列表中
+3. _run_async 策略：
+   - 无 running loop → asyncio.run()
+   - 有 running loop → 开新线程跑 asyncio.run()
 ```
 
-### 动态加载（plugins）
+**对比 MCP 工具的异步方案：**
 
-```
-You > /load write_file_tool.py
-  [loaded] write_file_tool.py (generation: 3 → 4)
-```
+| | MCP 工具 | V4 async 工具 |
+|---|----------|---------------|
+| 场景 | 长连接（session 持续存在） | 一次性协程（用完即走） |
+| 机制 | 专用后台 event loop + `run_coroutine_threadsafe` | `_run_async()` 按需创建/复用 loop |
+| 注册 | `is_async=False`（handler 内部自己桥接） | `is_async=True`（dispatch 自动桥接） |
+| 复杂度 | 高（需要管理 loop 生命周期） | 低（~15 行代码） |
 
-### V3 的问题（V4 要解决的）
+### V4 的问题（V5 要解决的）
 
-1. LLM 返回的参数类型经常不对（`"42"` 而非 `42`，`"true"` 而非 `true`）
-2. async handler 在 sync 上下文无法执行
-3. 没有类型强制转换机制
+1. 工具调用没有 pre/post 钩子（无法统一做日志、限流、重试）
+2. 工具结果没有 transform 机制（无法统一截断、格式化）
+3. 没有插件生命周期管理（load 了就不能 unload）

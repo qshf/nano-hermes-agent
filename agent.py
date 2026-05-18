@@ -1,12 +1,10 @@
 """
-Nano Hermes Agent — V3: 缓存层 + MCP 集成
+Nano Hermes Agent — V4: 类型修复 + 异步桥接
 
-架构变化（相比 V2）：
-- registry 新增 _generation 计数器，每次 register/deregister 递增
-- registry 的 check_fn 结果带 30s TTL 缓存
-- model_tools 新增外层缓存，cache_key = (toolsets, generation)
-- 注册表没变时 get_tool_definitions() 直接返回缓存，~0ms
-- 新增 MCP 客户端：/mcp 命令按需连接 MCP server，动态注册工具
+架构变化（相比 V3）：
+- dispatch 前自动根据 JSON Schema 做参数类型强制转换（coerce）
+- 注册时可声明 is_async=True，dispatch 自动桥接 async handler
+- 新增 async_demo 工具演示异步桥接
 
 运行方式：
     python agent.py
@@ -50,7 +48,7 @@ def run_agent():
     messages = [{"role": "system", "content": build_system_prompt()}]
 
     print("=" * 60)
-    print("  Nano Hermes Agent v3 — 缓存层")
+    print("  Nano Hermes Agent v4 — 类型修复 + 异步桥接")
     print(f"  Model: {model}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
     print(f"  Available tools: {', '.join(get_available_tool_names(ENABLED_TOOLSETS))}")
