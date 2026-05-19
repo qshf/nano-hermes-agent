@@ -1,26 +1,19 @@
 """
-Memory Tool — 文件持久化记忆。
+MemoryStore — 文件持久化记忆存储引擎。
 
-V6 核心：让 Agent 拥有跨会话记忆。
-- MemoryStore：文件持久化引擎，§ 分隔条目，字符限制
-- 冻结快照：system prompt 用加载时快照，tool 响应返回实时状态
-- 操作：add / replace / remove，子串匹配定位条目
+纯存储层：文件 I/O、§ 分隔、字符限制、子串匹配。
+不包含工具 schema 或注册逻辑（那些在 BuiltinMemoryProvider 中）。
 
-对应源项目：tools/memory_tool.py
+V7 重构：从 tools/memory_tool.py 拆出，成为独立存储引擎。
 """
 
-import json
 from pathlib import Path
 from typing import Optional
-
-from tools.registry import registry
 
 ENTRY_DELIMITER = "\n§\n"
 DEFAULT_CHAR_LIMIT = 2200
 MEMORY_FILE = Path.home() / ".hermes" / "nano_memory" / "MEMORY.md"
 
-
-# ─── MemoryStore ─────────────────────────────────────────────────────────────
 
 class MemoryStore:
     """文件持久化记忆存储。
@@ -46,6 +39,21 @@ class MemoryStore:
         """返回冻结快照（用于 system prompt 注入）。"""
         return self._snapshot
 
+    @property
+    def file_path(self) -> Path:
+        return self._file_path
+
+    @property
+    def entries(self) -> list[str]:
+        return self._entries
+
+    @property
+    def char_limit(self) -> int:
+        return self._char_limit
+
+    def char_count(self) -> int:
+        return sum(len(e) for e in self._entries)
+
     def add(self, content: str) -> dict:
         """添加一条记忆。"""
         content = content.strip()
@@ -55,7 +63,7 @@ class MemoryStore:
         if content in self._entries:
             return {"error": "Duplicate entry"}
 
-        new_total = self._char_count() + len(content)
+        new_total = self.char_count() + len(content)
         if new_total > self._char_limit:
             return {
                 "error": f"Exceeds limit: {new_total}/{self._char_limit} chars. "
@@ -78,7 +86,7 @@ class MemoryStore:
             return {"error": f"No entry contains: '{old_text[:50]}'"}
 
         size_diff = len(new_content) - len(self._entries[idx])
-        if self._char_count() + size_diff > self._char_limit:
+        if self.char_count() + size_diff > self._char_limit:
             return {"error": "Replacement would exceed char limit"}
 
         self._entries[idx] = new_content
@@ -102,29 +110,24 @@ class MemoryStore:
     # ─── 内部方法 ────────────────────────────────────────────────────────
 
     def _find_entry(self, substring: str) -> Optional[int]:
-        """子串匹配定位条目索引。"""
         for i, entry in enumerate(self._entries):
             if substring in entry:
                 return i
         return None
-
-    def _char_count(self) -> int:
-        return sum(len(e) for e in self._entries)
 
     def _success(self, action: str) -> dict:
         return {
             "status": "ok",
             "action": action,
             "entries": len(self._entries),
-            "usage": f"{self._char_count()}/{self._char_limit} chars",
+            "usage": f"{self.char_count()}/{self._char_limit} chars",
         }
 
     def _render_block(self) -> Optional[str]:
-        """渲染 system prompt 注入块。"""
         if not self._entries:
             return None
         lines = "\n".join(f"- {entry}" for entry in self._entries)
-        usage = f"{self._char_count()}/{self._char_limit} chars"
+        usage = f"{self.char_count()}/{self._char_limit} chars"
         return f"## Your Memory ({usage})\n{lines}"
 
     def _read_file(self) -> list[str]:
@@ -139,59 +142,3 @@ class MemoryStore:
         self._file_path.parent.mkdir(parents=True, exist_ok=True)
         text = ENTRY_DELIMITER.join(self._entries)
         self._file_path.write_text(text, encoding="utf-8")
-
-
-# ─── Tool Schema & Handler ───────────────────────────────────────────────────
-
-MEMORY_SCHEMA = {
-    "name": "memory",
-    "description": (
-        "Manage your persistent memory. Use this to remember important information "
-        "across sessions: user preferences, project context, corrections, etc."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["add", "replace", "remove"],
-                "description": "Action to perform on memory.",
-            },
-            "content": {
-                "type": "string",
-                "description": "The memory content to add, or the new content for replace.",
-            },
-            "old_text": {
-                "type": "string",
-                "description": "Substring to locate the target entry (for replace/remove).",
-            },
-        },
-        "required": ["action"],
-    },
-}
-
-
-def memory_tool_handler(args: dict) -> str:
-    """memory tool 的分发入口。"""
-    action = args.get("action")
-    content = args.get("content", "")
-    old_text = args.get("old_text", "")
-
-    if action == "add":
-        result = _store.add(content)
-    elif action == "replace":
-        result = _store.replace(old_text, content)
-    elif action == "remove":
-        result = _store.remove(old_text)
-    else:
-        result = {"error": f"Unknown action: {action}"}
-
-    return json.dumps(result, ensure_ascii=False)
-
-
-# ─── 全局实例 & 自注册 ───────────────────────────────────────────────────────
-
-_store = MemoryStore()
-_store.load()
-
-registry.register(schema=MEMORY_SCHEMA, handler=memory_tool_handler)

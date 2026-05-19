@@ -1,11 +1,12 @@
 """
-Nano Hermes Agent — V6: 文件记忆工具
+Nano Hermes Agent — V7: MemoryProvider ABC
 
-架构变化（相比 V5）：
-- 新增 MemoryStore：文件持久化记忆，§ 分隔条目，字符限制
-- 新增 memory tool：agent 可主动 add/replace/remove 记忆
-- 冻结快照：system prompt 用加载时快照，tool 响应返回实时状态
-- 记忆注入 system prompt，跨会话持久化
+架构变化（相比 V6）：
+- 新增 MemoryProvider ABC：定义记忆后端统一契约
+- 新增 BuiltinMemoryProvider：将 MemoryStore 包装为 Provider 实现
+- MemoryStore 拆为独立存储引擎（tools/memory_store.py）
+- agent.py 通过 provider 接口调用，不再直接操作 MemoryStore
+- memory tool 不再通过 registry 自注册，由 provider 管理 schema 和 dispatch
 
 运行方式：
     python agent.py
@@ -19,7 +20,7 @@ from openai import OpenAI
 
 from model_tools import get_tool_definitions, get_available_tool_names
 from tools.registry import registry
-from tools.memory_tool import _store as memory_store
+from memory.builtin import BuiltinMemoryProvider
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
 ENABLED_TOOLSETS = ["core"]
@@ -33,21 +34,19 @@ Respond in the same language as the user.
 
 {memory_block}"""
 
-MEMORY_GUIDANCE = """Use the `memory` tool to persist important information across sessions:
-- User preferences and corrections
-- Project context and conventions
-- Facts you've learned that will be useful later
-Do NOT store: task progress, session-specific state, or information already in files."""
+# V7: 通过 provider 接口管理记忆
+memory_provider = BuiltinMemoryProvider()
+memory_provider.initialize()
 
 
 def build_system_prompt() -> str:
     tool_names = get_available_tool_names(ENABLED_TOOLSETS)
-    tool_list = "\n".join(f"- `{name}`" for name in tool_names)
+    # 合并 provider 暴露的工具名
+    provider_tool_names = [s["name"] for s in memory_provider.get_tool_schemas()]
+    all_tool_names = sorted(set(tool_names + provider_tool_names))
+    tool_list = "\n".join(f"- `{name}`" for name in all_tool_names)
 
-    # 冻结快照：加载时的记忆状态，不随 tool 调用变化
-    memory_block = memory_store.snapshot or ""
-    if memory_block:
-        memory_block = memory_block + "\n\n" + MEMORY_GUIDANCE
+    memory_block = memory_provider.system_prompt_block()
 
     return SYSTEM_PROMPT.format(tool_list=tool_list, memory_block=memory_block).strip()
 
@@ -64,12 +63,13 @@ def run_agent():
     messages = [{"role": "system", "content": build_system_prompt()}]
 
     print("=" * 60)
-    print("  Nano Hermes Agent v6 — 文件记忆工具")
+    print("  Nano Hermes Agent v7 — MemoryProvider ABC")
     print(f"  Model: {model}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
-    print(f"  Memory: {memory_store._file_path}")
-    print(f"    entries: {len(memory_store._entries)}, "
-          f"usage: {memory_store._char_count()}/{memory_store._char_limit} chars")
+    print(f"  Memory provider: {memory_provider.name}")
+    print(f"    file: {memory_provider.store.file_path}")
+    print(f"    entries: {len(memory_provider.store.entries)}, "
+          f"usage: {memory_provider.store.char_count()}/{memory_provider.store.char_limit} chars")
     print(f"  Available tools: {', '.join(get_available_tool_names(ENABLED_TOOLSETS))}")
     print("  输入 'quit' 退出")
     print("=" * 60)
@@ -90,12 +90,13 @@ def run_agent():
 
         # /memory 命令：查看当前记忆状态
         if user_input == "/memory":
-            entries = memory_store._entries
+            store = memory_provider.store
+            entries = store.entries
             if not entries:
                 print("  [memory] (empty)")
             else:
                 print(f"  [memory] {len(entries)} entries, "
-                      f"{memory_store._char_count()}/{memory_store._char_limit} chars")
+                      f"{store.char_count()}/{store.char_limit} chars")
                 for i, entry in enumerate(entries, 1):
                     display = entry[:80] + "..." if len(entry) > 80 else entry
                     print(f"    {i}. {display}")
@@ -223,11 +224,17 @@ def run_agent():
         while True:
             # 每轮重新计算：check_fn 结果可能变化（如用户中途装了 Docker）
             tools_schema = get_tool_definitions(ENABLED_TOOLSETS)
+            # V7: 合并 provider 暴露的工具 schema
+            provider_schemas = memory_provider.get_tool_schemas()
+            all_tools_schema = tools_schema + [
+                {"type": "function", "function": s} for s in provider_schemas
+            ]
+            provider_tool_names = {s["name"] for s in provider_schemas}
 
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                tools=tools_schema,
+                tools=all_tools_schema,
             )
 
             choice = response.choices[0]
@@ -243,7 +250,11 @@ def run_agent():
                 args = json.loads(tool_call.function.arguments)
                 print(f"  [tool] {name}({tool_call.function.arguments})")
 
-                result = registry.dispatch(name, args)
+                # V7: 路由 — provider 工具走 provider，其余走 registry
+                if name in provider_tool_names:
+                    result = memory_provider.handle_tool_call(name, args)
+                else:
+                    result = registry.dispatch(name, args)
 
                 messages.append({
                     "role": "tool",
