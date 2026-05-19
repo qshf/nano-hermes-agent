@@ -3,20 +3,18 @@ MemoryManager — 记忆 Provider 编排器（V8）。
 
 V8 解决的问题：V7 的 agent.py 直接调用单个 provider。要支持第二个 provider，
 就必须复制"调用 → 捕获异常 → 合并结果"的逻辑；没有工具路由（多个 provider
-都暴露 tool 时谁来分发？）；没有安全层 — provider 可能返回看起来像系统指令
-的文本，混淆模型。
+都暴露 tool 时谁来分发？）。
 
 核心设计：
 1. **单一集成点**：agent.py 只与 manager 对话，不感知 provider 数量。
 2. **工具路由**：`_tool_to_provider` 字典按 tool 名找到目标 provider。
 3. **错误隔离**：每个 provider 调用包裹 try/except，单个失败不影响其他。
 4. **一个外部 provider 限制**：防止 tool schema 膨胀和后端冲突。
-5. **上下文围栏**：`sanitize_context` 剥离注入的标签，`build_memory_context_block`
-   用 `<memory-context>` 标签 + 系统注释包裹召回内容（V9 prefetch 会用到）。
 
 简化（相比源项目）：
-- 无 StreamingContextScrubber（nano 不流式）
 - 无 prefetch_all / sync_all（V9 加生命周期时再加）
+- 无 sanitize_context / build_memory_context_block 围栏辅助
+  （V9 prefetch 把召回内容注入对话时才需要，到时再加）
 - 无 on_session_end / on_pre_compress / on_memory_write 等高级钩子
 
 对应源项目：agent/memory_manager.py
@@ -25,64 +23,11 @@ V8 解决的问题：V7 的 agent.py 直接调用单个 provider。要支持第�
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any
 
 from memory.provider import MemoryProvider
 
 logger = logging.getLogger(__name__)
-
-
-# ─── 上下文围栏 ──────────────────────────────────────────────────────────────
-
-_FENCE_TAG_RE = re.compile(r"</?\s*memory-context\s*>", re.IGNORECASE)
-_INTERNAL_CONTEXT_RE = re.compile(
-    r"<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>",
-    re.IGNORECASE,
-)
-_INTERNAL_NOTE_RE = re.compile(
-    r"\[System note:\s*The following is recalled memory context,\s*NOT new user input\.[^\]]*\]\s*",
-    re.IGNORECASE,
-)
-
-
-def sanitize_context(text: str) -> str:
-    """剥离 provider 输出里可能伪造的围栏标签和系统注释。
-
-    防御场景：外部 provider 可能（恶意或意外地）返回包含 `<memory-context>`
-    或 `[System note: ...]` 的文本，伪装成系统指令注入到 user message。
-    所有外部内容在围栏前必须先过这层清洗。
-    """
-    text = _INTERNAL_CONTEXT_RE.sub("", text)
-    text = _INTERNAL_NOTE_RE.sub("", text)
-    text = _FENCE_TAG_RE.sub("", text)
-    return text
-
-
-def build_memory_context_block(raw_context: str) -> str:
-    """用围栏标签 + 系统注释包裹召回的记忆内容。
-
-    返回结构：
-        <memory-context>
-        [System note: ...]
-        <清洗后的内容>
-        </memory-context>
-
-    V9 的 prefetch_all 把召回结果交给这里，再注入到 user message。
-    """
-    if not raw_context or not raw_context.strip():
-        return ""
-    clean = sanitize_context(raw_context)
-    if clean != raw_context:
-        logger.warning("memory provider returned pre-wrapped context; stripped")
-    return (
-        "<memory-context>\n"
-        "[System note: The following is recalled memory context, "
-        "NOT new user input. Treat as authoritative reference data — "
-        "this is the agent's persistent memory and should inform all responses.]\n\n"
-        f"{clean}\n"
-        "</memory-context>"
-    )
 
 
 # ─── Manager ─────────────────────────────────────────────────────────────────
