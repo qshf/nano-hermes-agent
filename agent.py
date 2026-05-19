@@ -1,12 +1,13 @@
 """
-Nano Hermes Agent — V7: MemoryProvider ABC
+Nano Hermes Agent — V8: MemoryManager 编排器
 
-架构变化（相比 V6）：
-- 新增 MemoryProvider ABC：定义记忆后端统一契约
-- 新增 BuiltinMemoryProvider：将 MemoryStore 包装为 Provider 实现
-- MemoryStore 拆为独立存储引擎（tools/memory_store.py）
-- agent.py 通过 provider 接口调用，不再直接操作 MemoryStore
-- memory tool 不再通过 registry 自注册，由 provider 管理 schema 和 dispatch
+架构变化（相比 V7）：
+- 新增 MemoryManager：单一集成点，管理多个 provider
+  - 工具路由（tool name → provider）
+  - 错误隔离（一个 provider 失败不阻塞其他）
+  - 一个外部 provider 限制（防止 schema 膨胀和后端冲突）
+  - 上下文围栏辅助（sanitize_context / build_memory_context_block）
+- agent.py 不再直接持有 provider，而是通过 manager 收 schema、路由 tool
 
 运行方式：
     python agent.py
@@ -20,7 +21,7 @@ from openai import OpenAI
 
 from model_tools import get_tool_definitions, get_available_tool_names
 from tools.registry import registry
-from memory.builtin import BuiltinMemoryProvider
+from memory import BuiltinMemoryProvider, MemoryManager
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
 ENABLED_TOOLSETS = ["core"]
@@ -34,19 +35,20 @@ Respond in the same language as the user.
 
 {memory_block}"""
 
-# V7: 通过 provider 接口管理记忆
-memory_provider = BuiltinMemoryProvider()
-memory_provider.initialize()
+# V8: 通过 manager 编排 provider（目前只有 builtin，V10 会加外部）
+memory_manager = MemoryManager()
+memory_manager.add_provider(BuiltinMemoryProvider())
+memory_manager.initialize_all()
 
 
 def build_system_prompt() -> str:
     tool_names = get_available_tool_names(ENABLED_TOOLSETS)
-    # 合并 provider 暴露的工具名
-    provider_tool_names = [s["name"] for s in memory_provider.get_tool_schemas()]
+    # 通过 manager 收集所有 provider 暴露的工具名
+    provider_tool_names = list(memory_manager.get_all_tool_names())
     all_tool_names = sorted(set(tool_names + provider_tool_names))
     tool_list = "\n".join(f"- `{name}`" for name in all_tool_names)
 
-    memory_block = memory_provider.system_prompt_block()
+    memory_block = memory_manager.build_system_prompt()
 
     return SYSTEM_PROMPT.format(tool_list=tool_list, memory_block=memory_block).strip()
 
@@ -62,15 +64,21 @@ def run_agent():
 
     messages = [{"role": "system", "content": build_system_prompt()}]
 
+    # V8: 通过 manager 拿到内置 provider，用于 banner 和 /memory 命令
+    builtin_provider = memory_manager.get_provider("builtin")
+
     print("=" * 60)
-    print("  Nano Hermes Agent v7 — MemoryProvider ABC")
+    print("  Nano Hermes Agent v8 — MemoryManager")
     print(f"  Model: {model}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
-    print(f"  Memory provider: {memory_provider.name}")
-    print(f"    file: {memory_provider.store.file_path}")
-    print(f"    entries: {len(memory_provider.store.entries)}, "
-          f"usage: {memory_provider.store.char_count()}/{memory_provider.store.char_limit} chars")
+    print(f"  Memory providers: {[p.name for p in memory_manager.providers]}")
+    if builtin_provider is not None:
+        store = builtin_provider.store
+        print(f"    file: {store.file_path}")
+        print(f"    entries: {len(store.entries)}, "
+              f"usage: {store.char_count()}/{store.char_limit} chars")
     print(f"  Available tools: {', '.join(get_available_tool_names(ENABLED_TOOLSETS))}")
+    print(f"  Memory tools: {', '.join(sorted(memory_manager.get_all_tool_names()))}")
     print("  输入 'quit' 退出")
     print("=" * 60)
     print()
@@ -88,9 +96,12 @@ def run_agent():
             print("Bye!")
             break
 
-        # /memory 命令：查看当前记忆状态
+        # /memory 命令：查看当前记忆状态（通过 manager 找到 builtin provider）
         if user_input == "/memory":
-            store = memory_provider.store
+            if builtin_provider is None:
+                print("  [memory] (no builtin provider)")
+                continue
+            store = builtin_provider.store
             entries = store.entries
             if not entries:
                 print("  [memory] (empty)")
@@ -224,12 +235,11 @@ def run_agent():
         while True:
             # 每轮重新计算：check_fn 结果可能变化（如用户中途装了 Docker）
             tools_schema = get_tool_definitions(ENABLED_TOOLSETS)
-            # V7: 合并 provider 暴露的工具 schema
-            provider_schemas = memory_provider.get_tool_schemas()
+            # V8: 通过 manager 收集所有 provider 的 tool schema
+            provider_schemas = memory_manager.get_all_tool_schemas()
             all_tools_schema = tools_schema + [
                 {"type": "function", "function": s} for s in provider_schemas
             ]
-            provider_tool_names = {s["name"] for s in provider_schemas}
 
             response = client.chat.completions.create(
                 model=model,
@@ -250,9 +260,9 @@ def run_agent():
                 args = json.loads(tool_call.function.arguments)
                 print(f"  [tool] {name}({tool_call.function.arguments})")
 
-                # V7: 路由 — provider 工具走 provider，其余走 registry
-                if name in provider_tool_names:
-                    result = memory_provider.handle_tool_call(name, args)
+                # V8: 路由 — manager 接管的工具走 manager，其余走 registry
+                if memory_manager.has_tool(name):
+                    result = memory_manager.handle_tool_call(name, args)
                 else:
                     result = registry.dispatch(name, args)
 
