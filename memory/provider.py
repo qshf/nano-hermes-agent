@@ -2,9 +2,10 @@
 MemoryProvider ABC — 记忆后端的统一契约。
 
 V7 核心：定义任何记忆后端必须满足的接口。
-将"工具接口 + 存储逻辑 + 生命周期"三个关注点解耦。
+V9 扩展：新增三个默认 no-op 的生命周期方法，让 manager 能在
+agent loop 的正确时机广播事件，而无需 provider 强制实现。
 
-核心方法：
+核心方法（必须实现）：
 - name: 短标识符
 - is_available(): 是否就绪
 - initialize(): 每会话初始化
@@ -12,6 +13,16 @@ V7 核心：定义任何记忆后端必须满足的接口。
 - handle_tool_call(): 分发工具调用
 - system_prompt_block(): 注入 system prompt 的静态文本
 - shutdown(): 清理退出
+
+V9 生命周期钩子（默认 no-op，按需 override）：
+- on_turn_start(): 每轮开始时通知（轮数计数、定期维护）
+- prefetch(): 每轮前根据用户查询召回相关上下文
+- sync_turn(): 每轮结束后持久化完成的对话
+
+为什么 prefetch/sync_turn 是默认实现而不是 abstractmethod：
+内置 provider（文件存储）通过 system_prompt_block 一次性注入全部记忆，
+不需要召回逻辑；只有外部 provider（语义搜索/知识图谱）才需要 override。
+强制所有子类实现会污染最简实现。
 """
 
 from abc import ABC, abstractmethod
@@ -49,8 +60,46 @@ class MemoryProvider(ABC):
         raise NotImplementedError(f"Provider {self.name} does not handle tool {tool_name}")
 
     def system_prompt_block(self) -> str:
-        """返回注入 system prompt 的静态文本。空字符串表示跳过。"""
+        """返回注入 system prompt 的静态文本。空字符串表示跳过。
+
+        用于 STATIC provider 信息（指令、状态）。动态召回内容应该
+        通过 prefetch() 注入 user message，避免破坏前缀缓存。
+        """
         return ""
 
     def shutdown(self) -> None:
         """清理退出 — 刷新队列、关闭连接。"""
+
+    # ─── V9 生命周期钩子（默认 no-op）─────────────────────────────────────
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        """每轮开始时调用，传入用户消息。
+
+        用于轮数计数、作用域管理、定期维护。
+        kwargs 可能包含 model、platform 等，provider 按需取用，多余的忽略。
+        """
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """为即将到来的一轮召回相关上下文。
+
+        在每次 API 调用前被调用。返回格式化文本注入 user message，
+        或空字符串表示无相关内容。
+
+        nano 版是同步实现 — 源项目用后台线程 + queue_prefetch 预热下一轮，
+        这里简化为同步阻塞调用，足以演示生命周期模式。
+        """
+        return ""
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+    ) -> None:
+        """持久化完成的一轮对话到后端。
+
+        在每轮 tool loop 结束、最终文本响应到达后被调用。
+        实现应该非阻塞 — 有延迟的后端用后台线程入队（nano 简化为同步）。
+        """
+

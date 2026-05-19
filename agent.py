@@ -1,13 +1,16 @@
 """
-Nano Hermes Agent — V8: MemoryManager 编排器
+Nano Hermes Agent — V9: Agent Loop 生命周期集成
 
-架构变化（相比 V7）：
-- 新增 MemoryManager：单一集成点，管理多个 provider
-  - 工具路由（tool name → provider）
-  - 错误隔离（一个 provider 失败不阻塞其他）
-  - 一个外部 provider 限制（防止 schema 膨胀和后端冲突）
-  - 上下文围栏辅助（sanitize_context / build_memory_context_block）
-- agent.py 不再直接持有 provider，而是通过 manager 收 schema、路由 tool
+架构变化（相比 V8）：
+- Provider ABC 新增三个默认 no-op 方法：on_turn_start / prefetch / sync_turn
+- Manager 新增三个广播方法：on_turn_start_all / prefetch_all / sync_all
+- agent 主循环接入生命周期时序：
+  1. 用户输入到达 → on_turn_start_all
+  2. prefetch_all(query) → 召回内容用 <memory-context> 围栏包裹后注入 user message
+     （注入到 user message 而非 system prompt，保前缀缓存稳定）
+  3. tool loop → 最终文本响应到达
+  4. sync_all(user_content, assistant_content) → 持久化完成的对话
+- 内置 provider 的 prefetch/sync_turn 是 no-op；外部 provider（V10）会真正用到
 
 运行方式：
     python agent.py
@@ -68,7 +71,7 @@ def run_agent():
     builtin_provider = memory_manager.get_provider("builtin")
 
     print("=" * 60)
-    print("  Nano Hermes Agent v8 — MemoryManager")
+    print("  Nano Hermes Agent v9 — Lifecycle Integration")
     print(f"  Model: {model}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
     print(f"  Memory providers: {[p.name for p in memory_manager.providers]}")
@@ -82,6 +85,8 @@ def run_agent():
     print("  输入 'quit' 退出")
     print("=" * 60)
     print()
+
+    turn_count = 0  # V9: 每轮递增，传给 on_turn_start
 
     while True:
         try:
@@ -230,7 +235,25 @@ def run_agent():
             print(f"  [registered] {', '.join(registry.tool_names)}")
             continue
 
-        messages.append({"role": "user", "content": user_input})
+        # V9 生命周期：每轮开始通知 + prefetch 召回
+        # 在 user message 入队前完成，prefetch 结果用围栏包裹后注入
+        memory_manager.on_turn_start_all(turn_count, user_input)
+        recalled = memory_manager.prefetch_all(user_input)
+        turn_count += 1
+
+        # prefetch 结果与原始 user 输入合并到同一条 user message
+        # 注入位置选 user message（不是 system prompt）有两个原因：
+        #   1. 召回内容每轮不同，放进 system prompt 会破坏前缀缓存
+        #   2. 围栏 + 系统注释明确告诉模型"这是召回内容，不是新输入"
+        if recalled:
+            user_message_content = f"{recalled}\n\n{user_input}"
+        else:
+            user_message_content = user_input
+
+        messages.append({"role": "user", "content": user_message_content})
+
+        # 收集本轮 assistant 的最终文本响应（不含 tool call），用于 sync
+        final_assistant_text = ""
 
         while True:
             # 每轮重新计算：check_fn 结果可能变化（如用户中途装了 Docker）
@@ -252,7 +275,8 @@ def run_agent():
             messages.append(assistant_message.model_dump())
 
             if not assistant_message.tool_calls:
-                print(f"\nAgent > {assistant_message.content}\n")
+                final_assistant_text = assistant_message.content or ""
+                print(f"\nAgent > {final_assistant_text}\n")
                 break
 
             for tool_call in assistant_message.tool_calls:
@@ -285,6 +309,10 @@ def run_agent():
                         print(f"  [result] (ok)")
                 except json.JSONDecodeError:
                     print(f"  [result] {result[:100]}")
+
+        # V9 生命周期：tool loop 结束后持久化对话
+        # sync 用原始 user 输入（不含围栏），保持后端记录干净
+        memory_manager.sync_all(user_input, final_assistant_text)
 
 
 if __name__ == "__main__":
