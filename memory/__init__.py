@@ -7,11 +7,13 @@ from memory.manager import (
     sanitize_context,
     build_memory_context_block,
 )
+from memory.remote_semantic import RemoteSemanticProvider
 
 __all__ = [
     "MemoryProvider",
     "BuiltinMemoryProvider",
     "MemoryManager",
+    "RemoteSemanticProvider",
     "sanitize_context",
     "build_memory_context_block",
 ]

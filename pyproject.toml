@@ -7,6 +7,15 @@ dependencies = [
     "openai>=1.0",
     "python-dotenv>=1.0",
     "mcp>=1.2.0,<2",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+# V10 mock 服务依赖 — agent 主进程不需要，运行 scripts/mock_memory_server.py 才装
+mock-server = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pydantic>=2.5",
 ]
 
 [project.scripts]

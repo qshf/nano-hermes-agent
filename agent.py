@@ -1,18 +1,20 @@
 """
-Nano Hermes Agent — V9: Agent Loop 生命周期集成
+Nano Hermes Agent — V10: 外部 Provider（HTTP 服务）
 
-架构变化（相比 V8）：
-- Provider ABC 新增三个默认 no-op 方法：on_turn_start / prefetch / sync_turn
-- Manager 新增三个广播方法：on_turn_start_all / prefetch_all / sync_all
-- agent 主循环接入生命周期时序：
-  1. 用户输入到达 → on_turn_start_all
-  2. prefetch_all(query) → 召回内容用 <memory-context> 围栏包裹后注入 user message
-     （注入到 user message 而非 system prompt，保前缀缓存稳定）
-  3. tool loop → 最终文本响应到达
-  4. sync_all(user_content, assistant_content) → 持久化完成的对话
-- 内置 provider 的 prefetch/sync_turn 是 no-op；外部 provider（V10）会真正用到
+架构变化（相比 V9）：
+- 引入 RemoteSemanticProvider — 通过 HTTP 调用远端语义记忆服务
+- 按环境变量 MEMORY_SERVICE_URL 条件注册（不设则只跑 builtin，行为同 V9）
+- V9 钩子在这里第一次有真正消费者：
+    prefetch  → POST /recall  → 召回内容拼到 user message 前
+    sync_turn → POST /sync    → 持久化完成的对话
+- Provider 端不暴露 tool — 与 builtin 形成对照（"prefetch 钩子做事"vs"tool 显式调用"）
 
-运行方式：
+启动 mock 服务（另开终端）：
+    pip install fastapi uvicorn
+    python scripts/mock_memory_server.py
+
+启用外部 provider：
+    export MEMORY_SERVICE_URL=http://127.0.0.1:8765
     python agent.py
 """
 
@@ -24,7 +26,7 @@ from openai import OpenAI
 
 from model_tools import get_tool_definitions, get_available_tool_names
 from tools.registry import registry
-from memory import BuiltinMemoryProvider, MemoryManager
+from memory import BuiltinMemoryProvider, MemoryManager, RemoteSemanticProvider
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
 ENABLED_TOOLSETS = ["core"]
@@ -38,10 +40,22 @@ Respond in the same language as the user.
 
 {memory_block}"""
 
-# V8: 通过 manager 编排 provider（目前只有 builtin，V10 会加外部）
+# V8: 通过 manager 编排 provider；V10: 按环境变量加挂外部 provider
 memory_manager = MemoryManager()
 memory_manager.add_provider(BuiltinMemoryProvider())
-memory_manager.initialize_all()
+
+# V10: 按需注册远端语义记忆 provider（mock 服务见 scripts/mock_memory_server.py）
+# 没设环境变量就不挂 — 零额外配置时行为完全等同 V9
+_remote_url = os.environ.get("MEMORY_SERVICE_URL", "").strip()
+if _remote_url:
+    _remote = RemoteSemanticProvider(base_url=_remote_url)
+    if _remote.is_available():
+        memory_manager.add_provider(_remote)
+    else:
+        print(f"  [warn] MEMORY_SERVICE_URL set but {_remote_url}/healthz unreachable — skipping")
+        _remote.shutdown()
+
+memory_manager.initialize_all(session_id=os.environ.get("MEMORY_SESSION_ID", "default"))
 
 
 def build_system_prompt() -> str:
@@ -71,7 +85,7 @@ def run_agent():
     builtin_provider = memory_manager.get_provider("builtin")
 
     print("=" * 60)
-    print("  Nano Hermes Agent v9 — Lifecycle Integration")
+    print("  Nano Hermes Agent v10 — External Memory Provider (HTTP)")
     print(f"  Model: {model}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
     print(f"  Memory providers: {[p.name for p in memory_manager.providers]}")
@@ -88,231 +102,235 @@ def run_agent():
 
     turn_count = 0  # V9: 每轮递增，传给 on_turn_start
 
-    while True:
-        try:
-            user_input = input("You > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nBye!")
-            break
-
-        if not user_input:
-            continue
-        if user_input.lower() in ("quit", "exit", "q"):
-            print("Bye!")
-            break
-
-        # /memory 命令：查看当前记忆状态（通过 manager 找到 builtin provider）
-        if user_input == "/memory":
-            if builtin_provider is None:
-                print("  [memory] (no builtin provider)")
-                continue
-            store = builtin_provider.store
-            entries = store.entries
-            if not entries:
-                print("  [memory] (empty)")
-            else:
-                print(f"  [memory] {len(entries)} entries, "
-                      f"{store.char_count()}/{store.char_limit} chars")
-                for i, entry in enumerate(entries, 1):
-                    display = entry[:80] + "..." if len(entry) > 80 else entry
-                    print(f"    {i}. {display}")
-            continue
-
-        # /load 命令：运行时动态加载 plugins/ 下的工具
-        if user_input.startswith("/load "):
-            filename = user_input[6:].strip()
-            try:
-                from tools import load_plugin
-                old_gen = registry.generation
-                load_plugin(filename)
-                print(f"  [loaded] {filename} (generation: {old_gen} → {registry.generation})")
-                print(f"  [tools] {registry.tool_names}")
-            except Exception as e:
-                print(f"  [error] {e}")
-            continue
-
-        # /mcp 命令：按需连接 MCP server
-        if user_input.startswith("/mcp"):
-            from tools.mcp_client import mcp_manager
-            parts = user_input.split()
-
-            if len(parts) == 1 or parts[1] == "list":
-                servers = mcp_manager.connected_servers
-                if not servers:
-                    print("  [mcp] No connected servers. Use: /mcp connect <name> <command> [args...]")
-                else:
-                    for s in servers:
-                        tools = mcp_manager.get_tools(s)
-                        print(f"  [mcp] {s}: {', '.join(tools)}")
-                continue
-
-            if parts[1] == "connect" and len(parts) >= 4:
-                # /mcp connect mcp_server_demo python mcp_server_demo.py
-                name = parts[2]
-                command = parts[3]
-                args = parts[4:] if len(parts) > 4 else []
-                try:
-                    old_gen = registry.generation
-                    mcp_manager.connect(name, command, args)
-                    tools = mcp_manager.get_tools(name)
-                    print(f"  [mcp] Connected to '{name}' (generation: {old_gen} → {registry.generation})")
-                    print(f"  [mcp] Tools: {', '.join(tools)}")
-                except Exception as e:
-                    print(f"  [mcp error] {e}")
-                continue
-
-            if parts[1] == "disconnect" and len(parts) >= 3:
-                name = parts[2]
-                old_gen = registry.generation
-                disconnected = mcp_manager.disconnect(name)
-                if disconnected:
-                    print(f"  [mcp] Disconnected '{name}' (generation: {old_gen} → {registry.generation})")
-                else:
-                    print(f"  [mcp] '{name}' is not connected. Use /mcp list to see connected servers.")
-                continue
-
-            if parts[1] == "refresh" and len(parts) >= 3:
-                name = parts[2]
-                old_gen = registry.generation
-                mcp_manager.refresh(name)
-                tools = mcp_manager.get_tools(name)
-                print(f"  [mcp] Refreshed '{name}' (generation: {old_gen} → {registry.generation})")
-                print(f"  [mcp] Tools: {', '.join(tools)}")
-                continue
-
-            print("  Usage:")
-            print("    /mcp                          — list connected servers")
-            print("    /mcp connect <name> <cmd> [args...]  — connect to MCP server")
-            print("    /mcp disconnect <name>        — disconnect")
-            print("    /mcp refresh <name>           — refresh tool list")
-            continue
-
-        # /plugin 命令：V5 插件生命周期管理
-        if user_input.startswith("/plugin"):
-            from tools import load_plugin, unload_plugin, list_plugins
-            parts = user_input.split()
-
-            if len(parts) == 1 or parts[1] == "list":
-                plugins = list_plugins()
-                if not plugins:
-                    print("  [plugin] No loaded plugins. Use: /plugin load <filename>")
-                else:
-                    for name, hooks in plugins.items():
-                        print(f"  [plugin] {name}: {', '.join(hooks) if hooks else '(no hooks)'}")
-                continue
-
-            if parts[1] == "load" and len(parts) >= 3:
-                filename = parts[2]
-                try:
-                    load_plugin(filename)
-                    plugins = list_plugins()
-                    hooks = plugins.get(filename.replace(".py", "").replace(".py", ""), [])
-                    print(f"  [plugin] Loaded '{filename}'")
-                    print(f"  [plugin] Hooks: {', '.join(hooks) if hooks else '(none)'}")
-                except Exception as e:
-                    print(f"  [plugin error] {e}")
-                continue
-
-            if parts[1] == "unload" and len(parts) >= 3:
-                filename = parts[2]
-                if unload_plugin(filename):
-                    print(f"  [plugin] Unloaded '{filename}'")
-                else:
-                    print(f"  [plugin] '{filename}' is not loaded.")
-                continue
-
-            print("  Usage:")
-            print("    /plugin                  — list loaded plugins")
-            print("    /plugin load <file>      — load plugin and register hooks")
-            print("    /plugin unload <file>    — unload plugin and deregister hooks")
-            continue
-
-        # /tools 命令：查看当前可用工具
-        if user_input == "/tools":
-            available = get_available_tool_names(ENABLED_TOOLSETS)
-            print(f"  [toolset] {ENABLED_TOOLSETS}")
-            print(f"  [available] {', '.join(available)}")
-            print(f"  [registered] {', '.join(registry.tool_names)}")
-            continue
-
-        # V9 生命周期：每轮开始通知 + prefetch 召回
-        # 在 user message 入队前完成，prefetch 结果用围栏包裹后注入
-        memory_manager.on_turn_start_all(turn_count, user_input)
-        recalled = memory_manager.prefetch_all(user_input)
-        turn_count += 1
-
-        # prefetch 结果与原始 user 输入合并到同一条 user message
-        # 注入位置选 user message（不是 system prompt）有两个原因：
-        #   1. 召回内容每轮不同，放进 system prompt 会破坏前缀缓存
-        #   2. 围栏 + 系统注释明确告诉模型"这是召回内容，不是新输入"
-        if recalled:
-            user_message_content = f"{recalled}\n\n{user_input}"
-        else:
-            user_message_content = user_input
-
-        messages.append({"role": "user", "content": user_message_content})
-
-        # 收集本轮 assistant 的最终文本响应（不含 tool call），用于 sync
-        final_assistant_text = ""
-
+    try:
         while True:
-            # 每轮重新计算：check_fn 结果可能变化（如用户中途装了 Docker）
-            tools_schema = get_tool_definitions(ENABLED_TOOLSETS)
-            # V8: 通过 manager 收集所有 provider 的 tool schema
-            provider_schemas = memory_manager.get_all_tool_schemas()
-            all_tools_schema = tools_schema + [
-                {"type": "function", "function": s} for s in provider_schemas
-            ]
-
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=all_tools_schema,
-            )
-
-            choice = response.choices[0]
-            assistant_message = choice.message
-            messages.append(assistant_message.model_dump())
-
-            if not assistant_message.tool_calls:
-                final_assistant_text = assistant_message.content or ""
-                print(f"\nAgent > {final_assistant_text}\n")
+            try:
+                user_input = input("You > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nBye!")
                 break
 
-            for tool_call in assistant_message.tool_calls:
-                name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments)
-                print(f"  [tool] {name}({tool_call.function.arguments})")
+            if not user_input:
+                continue
+            if user_input.lower() in ("quit", "exit", "q"):
+                print("Bye!")
+                break
 
-                # V8: 路由 — manager 接管的工具走 manager，其余走 registry
-                if memory_manager.has_tool(name):
-                    result = memory_manager.handle_tool_call(name, args)
+            # /memory 命令：查看当前记忆状态（通过 manager 找到 builtin provider）
+            if user_input == "/memory":
+                if builtin_provider is None:
+                    print("  [memory] (no builtin provider)")
+                    continue
+                store = builtin_provider.store
+                entries = store.entries
+                if not entries:
+                    print("  [memory] (empty)")
                 else:
-                    result = registry.dispatch(name, args)
+                    print(f"  [memory] {len(entries)} entries, "
+                          f"{store.char_count()}/{store.char_limit} chars")
+                    for i, entry in enumerate(entries, 1):
+                        display = entry[:80] + "..." if len(entry) > 80 else entry
+                        print(f"    {i}. {display}")
+                continue
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": result,
-                })
-
+            # /load 命令：运行时动态加载 plugins/ 下的工具
+            if user_input.startswith("/load "):
+                filename = user_input[6:].strip()
                 try:
-                    parsed = json.loads(result)
-                    if "error" in parsed:
-                        print(f"  [error] {parsed['error']}")
-                    elif "output" in parsed:
-                        output = parsed["output"]
-                        if len(output) > 200:
-                            output = output[:200] + "..."
-                        print(f"  [result] {output}")
-                    else:
-                        print(f"  [result] (ok)")
-                except json.JSONDecodeError:
-                    print(f"  [result] {result[:100]}")
+                    from tools import load_plugin
+                    old_gen = registry.generation
+                    load_plugin(filename)
+                    print(f"  [loaded] {filename} (generation: {old_gen} → {registry.generation})")
+                    print(f"  [tools] {registry.tool_names}")
+                except Exception as e:
+                    print(f"  [error] {e}")
+                continue
 
-        # V9 生命周期：tool loop 结束后持久化对话
-        # sync 用原始 user 输入（不含围栏），保持后端记录干净
-        memory_manager.sync_all(user_input, final_assistant_text)
+            # /mcp 命令：按需连接 MCP server
+            if user_input.startswith("/mcp"):
+                from tools.mcp_client import mcp_manager
+                parts = user_input.split()
+
+                if len(parts) == 1 or parts[1] == "list":
+                    servers = mcp_manager.connected_servers
+                    if not servers:
+                        print("  [mcp] No connected servers. Use: /mcp connect <name> <command> [args...]")
+                    else:
+                        for s in servers:
+                            tools = mcp_manager.get_tools(s)
+                            print(f"  [mcp] {s}: {', '.join(tools)}")
+                    continue
+
+                if parts[1] == "connect" and len(parts) >= 4:
+                    # /mcp connect mcp_server_demo python mcp_server_demo.py
+                    name = parts[2]
+                    command = parts[3]
+                    args = parts[4:] if len(parts) > 4 else []
+                    try:
+                        old_gen = registry.generation
+                        mcp_manager.connect(name, command, args)
+                        tools = mcp_manager.get_tools(name)
+                        print(f"  [mcp] Connected to '{name}' (generation: {old_gen} → {registry.generation})")
+                        print(f"  [mcp] Tools: {', '.join(tools)}")
+                    except Exception as e:
+                        print(f"  [mcp error] {e}")
+                    continue
+
+                if parts[1] == "disconnect" and len(parts) >= 3:
+                    name = parts[2]
+                    old_gen = registry.generation
+                    disconnected = mcp_manager.disconnect(name)
+                    if disconnected:
+                        print(f"  [mcp] Disconnected '{name}' (generation: {old_gen} → {registry.generation})")
+                    else:
+                        print(f"  [mcp] '{name}' is not connected. Use /mcp list to see connected servers.")
+                    continue
+
+                if parts[1] == "refresh" and len(parts) >= 3:
+                    name = parts[2]
+                    old_gen = registry.generation
+                    mcp_manager.refresh(name)
+                    tools = mcp_manager.get_tools(name)
+                    print(f"  [mcp] Refreshed '{name}' (generation: {old_gen} → {registry.generation})")
+                    print(f"  [mcp] Tools: {', '.join(tools)}")
+                    continue
+
+                print("  Usage:")
+                print("    /mcp                          — list connected servers")
+                print("    /mcp connect <name> <cmd> [args...]  — connect to MCP server")
+                print("    /mcp disconnect <name>        — disconnect")
+                print("    /mcp refresh <name>           — refresh tool list")
+                continue
+
+            # /plugin 命令：V5 插件生命周期管理
+            if user_input.startswith("/plugin"):
+                from tools import load_plugin, unload_plugin, list_plugins
+                parts = user_input.split()
+
+                if len(parts) == 1 or parts[1] == "list":
+                    plugins = list_plugins()
+                    if not plugins:
+                        print("  [plugin] No loaded plugins. Use: /plugin load <filename>")
+                    else:
+                        for name, hooks in plugins.items():
+                            print(f"  [plugin] {name}: {', '.join(hooks) if hooks else '(no hooks)'}")
+                    continue
+
+                if parts[1] == "load" and len(parts) >= 3:
+                    filename = parts[2]
+                    try:
+                        load_plugin(filename)
+                        plugins = list_plugins()
+                        hooks = plugins.get(filename.replace(".py", "").replace(".py", ""), [])
+                        print(f"  [plugin] Loaded '{filename}'")
+                        print(f"  [plugin] Hooks: {', '.join(hooks) if hooks else '(none)'}")
+                    except Exception as e:
+                        print(f"  [plugin error] {e}")
+                    continue
+
+                if parts[1] == "unload" and len(parts) >= 3:
+                    filename = parts[2]
+                    if unload_plugin(filename):
+                        print(f"  [plugin] Unloaded '{filename}'")
+                    else:
+                        print(f"  [plugin] '{filename}' is not loaded.")
+                    continue
+
+                print("  Usage:")
+                print("    /plugin                  — list loaded plugins")
+                print("    /plugin load <file>      — load plugin and register hooks")
+                print("    /plugin unload <file>    — unload plugin and deregister hooks")
+                continue
+
+            # /tools 命令：查看当前可用工具
+            if user_input == "/tools":
+                available = get_available_tool_names(ENABLED_TOOLSETS)
+                print(f"  [toolset] {ENABLED_TOOLSETS}")
+                print(f"  [available] {', '.join(available)}")
+                print(f"  [registered] {', '.join(registry.tool_names)}")
+                continue
+
+            # V9 生命周期：每轮开始通知 + prefetch 召回
+            # 在 user message 入队前完成，prefetch 结果用围栏包裹后注入
+            memory_manager.on_turn_start_all(turn_count, user_input)
+            recalled = memory_manager.prefetch_all(user_input)
+            turn_count += 1
+
+            # prefetch 结果与原始 user 输入合并到同一条 user message
+            # 注入位置选 user message（不是 system prompt）有两个原因：
+            #   1. 召回内容每轮不同，放进 system prompt 会破坏前缀缓存
+            #   2. 围栏 + 系统注释明确告诉模型"这是召回内容，不是新输入"
+            if recalled:
+                user_message_content = f"{recalled}\n\n{user_input}"
+            else:
+                user_message_content = user_input
+
+            messages.append({"role": "user", "content": user_message_content})
+
+            # 收集本轮 assistant 的最终文本响应（不含 tool call），用于 sync
+            final_assistant_text = ""
+
+            while True:
+                # 每轮重新计算：check_fn 结果可能变化（如用户中途装了 Docker）
+                tools_schema = get_tool_definitions(ENABLED_TOOLSETS)
+                # V8: 通过 manager 收集所有 provider 的 tool schema
+                provider_schemas = memory_manager.get_all_tool_schemas()
+                all_tools_schema = tools_schema + [
+                    {"type": "function", "function": s} for s in provider_schemas
+                ]
+
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=all_tools_schema,
+                )
+
+                choice = response.choices[0]
+                assistant_message = choice.message
+                messages.append(assistant_message.model_dump())
+
+                if not assistant_message.tool_calls:
+                    final_assistant_text = assistant_message.content or ""
+                    print(f"\nAgent > {final_assistant_text}\n")
+                    break
+
+                for tool_call in assistant_message.tool_calls:
+                    name = tool_call.function.name
+                    args = json.loads(tool_call.function.arguments)
+                    print(f"  [tool] {name}({tool_call.function.arguments})")
+
+                    # V8: 路由 — manager 接管的工具走 manager，其余走 registry
+                    if memory_manager.has_tool(name):
+                        result = memory_manager.handle_tool_call(name, args)
+                    else:
+                        result = registry.dispatch(name, args)
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result,
+                    })
+
+                    try:
+                        parsed = json.loads(result)
+                        if "error" in parsed:
+                            print(f"  [error] {parsed['error']}")
+                        elif "output" in parsed:
+                            output = parsed["output"]
+                            if len(output) > 200:
+                                output = output[:200] + "..."
+                            print(f"  [result] {output}")
+                        else:
+                            print(f"  [result] (ok)")
+                    except json.JSONDecodeError:
+                        print(f"  [result] {result[:100]}")
+
+            # V9 生命周期：tool loop 结束后持久化对话
+            # sync 用原始 user 输入（不含围栏），保持后端记录干净
+            memory_manager.sync_all(user_input, final_assistant_text)
+    finally:
+        # V10: 释放外部 provider 的 httpx client；builtin 的 shutdown 是 no-op
+        memory_manager.shutdown_all()
 
 
 if __name__ == "__main__":

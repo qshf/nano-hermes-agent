@@ -15,14 +15,14 @@
 | `v7` | MemoryProvider ABC | 接口抽象 + BuiltinMemoryProvider |
 | `v8` | MemoryManager 编排器 | 路由 + 上下文围栏 + 错误隔离 |
 | `v9` | 生命周期集成 | prefetch/sync 接入 agent loop |
-| `v10` | 外部 Provider 插件 | MockSemanticProvider 验证架构 |
+| `v10` | 外部 Provider（HTTP） | RemoteSemanticProvider + Mock 服务（FastAPI） |
 
 ## 快速开始
 
 ```bash
-# 克隆并切到最新版本（V9）
+# 克隆并切到最新版本（V10）
 git clone <repo-url>
-git checkout v9
+git checkout v10
 
 # 初始化环境
 uv venv .venv --python 3.11
@@ -37,7 +37,7 @@ source .venv/bin/activate
 python agent.py
 ```
 
-## 演进脉络（V6 → V9）
+## 演进脉络（V6 → V10）
 
 每个版本只解决前一版暴露的**一个问题**，避免一次性把所有抽象端上来。
 
@@ -123,18 +123,72 @@ agent.py 不再直接持有 store，而是通过 provider 收 schema、路由 to
 
 **V9 的 trade-off**：内置 provider 的 prefetch/sync_turn 都是 no-op，钩子的实际消费者要等 V10 的外部 provider 验证。架构对不对，V10 才能下结论。
 
-## 项目结构（V9）
+### V10 — 外部 Provider（HTTP 服务）
+
+**问题**：V9 的钩子接好了，但只有内置 provider 用，而它基本 no-op 这些方法。架构对不对没人能下结论——要证明 V7 的 ABC 抽象 + V8 的 manager 路由 + V9 的生命周期钩子真正成立，得有一个**真正使用** prefetch/sync 的外部 provider。
+
+**解法**：把"语义记忆"做成独立 HTTP 服务，provider 端走 httpx 调用。
+
+为什么选 HTTP 边界？源项目 `plugins/memory/` 8 个 provider 里 5 个是 HTTP 客户端（mem0、honcho、supermemory、retaindb、openviking）。HTTP 边界比"plugin 内嵌 Python 类"更贴近生产形态——provider 与服务端独立演化，把 mock server 换成真后端时 provider **一行不改**。
+
+| 文件 | 职责 |
+|------|------|
+| `memory/remote_semantic.py` | `RemoteSemanticProvider`——HTTP 客户端 |
+| `scripts/mock_memory_server.py` | FastAPI mock 服务（教学用，进程内 dict + hash 假向量） |
+
+**钩子到 HTTP 端点的 1:1 映射**：
+
+| 钩子 | HTTP 调用 | 备注 |
+|------|----------|------|
+| `is_available()` | `GET /healthz` | 失败时 manager 跳过本 provider |
+| `initialize(session_id)` | 无网络 | 缓存 base_url 和 session_id |
+| `prefetch(query)` | `POST /recall` | 返回 hits 拼成文本注入 user message |
+| `sync_turn(u, a)` | `POST /sync` | 同步阻塞 |
+| `system_prompt_block()` | 无 | 固定一行 "Long-term memory available" |
+| `get_tool_schemas()` | 无 | 返回 `[]`——召回是隐式的 |
+| `shutdown()` | 关闭 httpx client | |
+
+**为什么不暴露 tool？**与 builtin 形成对照：builtin 用 tool 让模型显式调用 add/replace/remove；remote_semantic 用 prefetch 钩子在每轮**自动召回**——证明"prefetch 钩子做事而不是 tool"是另一条合法路径。
+
+**为什么不引入向量数据库？**V10 的目的是验证 V9 钩子的形状（prefetch 接收什么、返回什么；sync_turn 该在哪触发），不是真做语义搜索。引入 chromadb / qdrant / pgvector 会让 nano 从单进程变多服务系统，掩盖钩子的真实形态。Mock 服务用 hash-based 假 embedding（md5 → 16 维 float）就够了——同样文本得到同样向量、能跑余弦相似度，足以演示真实时序。
+
+**接入方式**——环境变量开关：
+
+```bash
+# 不设：跑 V9 的行为（只有 builtin provider）
+python agent.py
+
+# 设：加挂 RemoteSemanticProvider
+export MEMORY_SERVICE_URL=http://127.0.0.1:8765
+python agent.py
+```
+
+**启动 mock 服务**（另开终端）：
+
+```bash
+uv pip install -e ".[mock-server]"  # 装 fastapi + uvicorn
+python scripts/mock_memory_server.py
+```
+
+**V10 简化（vs 源项目）**：同步阻塞调用（无后台线程）、无熔断器、无重试、无认证。保留：完整 MemoryProvider 接口实现、HTTP 边界、生命周期钩子 1:1 映射端点。
+
+**架构验证点**：把 mock server 换成 FastAPI + sentence-transformers + Postgres/pgvector，provider 端**一行不改**——这正是 V7 抽出 ABC 的最终验证。
+
+## 项目结构（V10）
 
 ```
 nano_hermes_agent/
-├── agent.py                    # 主循环 + 生命周期时序 + /memory 命令
+├── agent.py                    # 主循环 + 生命周期时序 + 按 env 注册外部 provider
 ├── model_tools.py              # 外层缓存 + MCP 工具自动包含
 ├── toolsets.py                 # 工具组定义（不含 memory，由 provider 管）
-├── memory/                     # V7 引入，V8/V9 扩展
-│   ├── __init__.py             # 导出 Manager / Provider / 围栏辅助
+├── memory/                     # V7 引入，V8/V9/V10 扩展
+│   ├── __init__.py             # 导出 Manager / Provider / 围栏辅助 / RemoteSemanticProvider
 │   ├── provider.py             # MemoryProvider ABC（V9 加生命周期钩子）
-│   ├── builtin.py              # BuiltinMemoryProvider 实现
-│   └── manager.py              # MemoryManager 编排 + 围栏
+│   ├── builtin.py              # BuiltinMemoryProvider（文件后端）
+│   ├── manager.py              # MemoryManager 编排 + 围栏
+│   └── remote_semantic.py      # V10 RemoteSemanticProvider（HTTP 客户端）
+├── scripts/
+│   └── mock_memory_server.py   # V10 FastAPI mock 服务（dict + hash 假向量）
 ├── tools/
 │   ├── __init__.py             # 自动发现 + load/unload 生命周期
 │   ├── registry.py             # dispatch: coerce + async + hooks
@@ -188,5 +242,5 @@ You > /memory
 | V7 | 完成 | 记忆逻辑写死，无法替换后端 | MemoryProvider ABC 接口抽象 |
 | V8 | 完成 | 多 provider 无编排，无错误隔离 | MemoryManager 路由 + 围栏 |
 | V9 | 完成 | 没有"何时召回 / 何时持久化"的时序 | prefetch/sync 生命周期钩子 |
-| V10 | 待实现 | V9 钩子无外部消费者，架构未验证 | MockSemanticProvider 插件 |
+| V10 | 完成 | V9 钩子无外部消费者，架构未验证 | RemoteSemanticProvider + Mock 服务 |
 
