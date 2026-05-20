@@ -1,19 +1,22 @@
 """
-Nano Hermes Agent — V10: 外部 Provider（HTTP 服务）
+Nano Hermes Agent — V10.1: 外部 Provider（HTTP 服务 + pgvector + OpenAI embedding）
 
-架构变化（相比 V9）：
-- 引入 RemoteSemanticProvider — 通过 HTTP 调用远端语义记忆服务
-- 按环境变量 MEMORY_SERVICE_URL 条件注册（不设则只跑 builtin，行为同 V9）
-- V9 钩子在这里第一次有真正消费者：
-    prefetch  → POST /recall  → 召回内容拼到 user message 前
-    sync_turn → POST /sync    → 持久化完成的对话
-- Provider 端不暴露 tool — 与 builtin 形成对照（"prefetch 钩子做事"vs"tool 显式调用"）
+架构变化（相比 V10）：
+- HTTP 时序 0 改动 — Provider 端与 V10 完全一致的钩子触发顺序
+- 配置面演进（同步 Hindsight 路线）：从 .env 读取 budget / min_score / auto_retain
+- 服务端：dict + md5 假向量 → pgvector + OpenAI embedding（真正能做语义检索）
 
-启动 mock 服务（另开终端）：
-    pip install fastapi uvicorn
-    python scripts/mock_memory_server.py
+env 开关（不设则只挂 builtin，行为同 V9）：
+    MEMORY_SERVICE_URL          外部记忆服务 URL（设了才挂 remote_semantic）
+    MEMORY_SESSION_ID           会话隔离 id（默认 default）
+    MEMORY_RECALL_BUDGET        low / mid / high（默认 mid → k=5）
+    MEMORY_MIN_SCORE            0.0-1.0 相似度阈值（默认 0.0）
+    MEMORY_AUTO_RETAIN          1/0（默认 1，关掉 sync_turn）
 
-启用外部 provider：
+启动顺序（另开终端）：
+    docker compose up -d                                 # pgvector
+    uv pip install -e ".[mock-server]"
+    python scripts/mock_memory_server.py                 # FastAPI + OpenAI embedding
     export MEMORY_SERVICE_URL=http://127.0.0.1:8765
     python agent.py
 """
@@ -44,11 +47,17 @@ Respond in the same language as the user.
 memory_manager = MemoryManager()
 memory_manager.add_provider(BuiltinMemoryProvider())
 
-# V10: 按需注册远端语义记忆 provider（mock 服务见 scripts/mock_memory_server.py）
-# 没设环境变量就不挂 — 零额外配置时行为完全等同 V9
+# V10/V10.1: 按需注册远端语义记忆 provider（mock 服务见 scripts/mock_memory_server.py）
+# 没设环境变量就不挂 — 零额外配置时行为完全等同 V9。
+# V10.1 新增 budget/min_score/auto_retain 三项配置（同步 Hindsight 路线）。
 _remote_url = os.environ.get("MEMORY_SERVICE_URL", "").strip()
 if _remote_url:
-    _remote = RemoteSemanticProvider(base_url=_remote_url)
+    _remote = RemoteSemanticProvider(
+        base_url=_remote_url,
+        budget=os.environ.get("MEMORY_RECALL_BUDGET", "mid"),
+        min_score=float(os.environ.get("MEMORY_MIN_SCORE", "0.0")),
+        auto_retain=os.environ.get("MEMORY_AUTO_RETAIN", "1") not in ("0", "false", "False", ""),
+    )
     if _remote.is_available():
         memory_manager.add_provider(_remote)
     else:
@@ -85,7 +94,7 @@ def run_agent():
     builtin_provider = memory_manager.get_provider("builtin")
 
     print("=" * 60)
-    print("  Nano Hermes Agent v10 — External Memory Provider (HTTP)")
+    print("  Nano Hermes Agent v10.1 — Remote Memory (pgvector + OpenAI embedding)")
     print(f"  Model: {model}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
     print(f"  Memory providers: {[p.name for p in memory_manager.providers]}")

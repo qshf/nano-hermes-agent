@@ -1,0 +1,36 @@
+# V10.1 — 一键起一个带 pgvector 的 Postgres
+#
+# 用法：
+#   docker compose up -d        # 启动
+#   docker compose logs -f db   # 看日志
+#   docker compose down         # 停（保留数据）
+#   docker compose down -v      # 停 + 删数据卷（彻底重置）
+#
+# 默认监听 127.0.0.1:5432，DSN：postgresql://nano:nano@127.0.0.1:5432/nano_memory
+# 与 .env.example 里的 DATABASE_URL 对齐。
+#
+# 镜像 pgvector/pgvector:pg16 自带 pgvector 扩展，scripts/init.sql 在首次
+# 启动时通过 /docker-entrypoint-initdb.d/ 自动执行（仅在数据卷为空时跑）。
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: nano-memory-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: nano
+      POSTGRES_PASSWORD: nano
+      POSTGRES_DB: nano_memory
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - nano_memory_data:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nano -d nano_memory"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  nano_memory_data:

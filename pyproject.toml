@@ -11,12 +11,23 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# V10 mock 服务依赖 — agent 主进程不需要，运行 scripts/mock_memory_server.py 才装
+# V10 / V10.1 mock 服务依赖 — agent 主进程不需要，运行 scripts/mock_memory_server.py 才装
+# V10.1 新增：psycopg + pgvector + python-dotenv（embedding 用主 deps 里的 openai 客户端）
 mock-server = [
     "fastapi>=0.110",
     "uvicorn>=0.29",
     "pydantic>=2.5",
+    "psycopg[binary]>=3.1",
+    "psycopg-pool>=3.2",
+    "pgvector>=0.3.0",
+    "python-dotenv>=1.0",
 ]
 
 [project.scripts]
 nano-hermes = "agent:run_agent"
+
+# V10.1: 多个顶层包（memory / tools / plugins）让 setuptools flat-layout 自动发现冲突，
+# 显式列出来 — 这样 `uv pip install -e` 不再报 multiple top-level packages 错误。
+[tool.setuptools]
+packages = ["memory", "tools", "plugins"]
+py-modules = ["agent", "model_tools", "toolsets"]

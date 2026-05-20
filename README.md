@@ -16,6 +16,7 @@
 | `v8` | MemoryManager 编排器 | 路由 + 上下文围栏 + 错误隔离 |
 | `v9` | 生命周期集成 | prefetch/sync 接入 agent loop |
 | `v10` | 外部 Provider（HTTP） | RemoteSemanticProvider + Mock 服务（FastAPI） |
+| `v10.1` | pgvector + OpenAI embedding | Mock 服务真后端化（dict→pgvector, md5→OpenAI），Provider 端 0 改请求时序 |
 
 ## 快速开始
 
@@ -172,23 +173,70 @@ python scripts/mock_memory_server.py
 
 **V10 简化（vs 源项目）**：同步阻塞调用（无后台线程）、无熔断器、无重试、无认证。保留：完整 MemoryProvider 接口实现、HTTP 边界、生命周期钩子 1:1 映射端点。
 
-**架构验证点**：把 mock server 换成 FastAPI + sentence-transformers + Postgres/pgvector，provider 端**一行不改**——这正是 V7 抽出 ABC 的最终验证。
+**架构验证点**：把 mock server 换成 FastAPI + sentence-transformers + Postgres/pgvector，provider 端**一行不改**——这正是 V7 抽出 ABC 的最终验证。**V10.1 兑现了这个承诺**（见下文）。
 
-## 项目结构（V10）
+### V10.1 — Mock 服务真后端化（pgvector + OpenAI embedding）
+
+**问题**：V10 的 mock server 用 `dict + md5 假向量`，召回结果纯随机噪声，无法演示真正的语义记忆 ——"V7 抽出 ABC 时承诺的两端独立演化"还停留在 PPT 上。
+
+**解法**：服务端整体替换为生产级组件，**Provider 端 HTTP 请求时序 0 改动**。
+
+| 维度 | V10 | V10.1 |
+|------|-----|-------|
+| 存储 | 进程内 `dict[session, list[(text, vec)]]` | PostgreSQL + pgvector，`vector(1536)` 列 + ivfflat 索引 |
+| 向量 | `md5(text) → 16 维归一化 float` | OpenAI 兼容 embedding（任意端点）默认 `text-embedding-3-small` |
+| 召回 SQL | Python 列表推导算余弦 | `ORDER BY embedding <=> $1` 下推到 DB |
+| 召回档位 | 写死 `top_k=3` | Hindsight 路线 `budget=low/mid/high` → k=2/5/10 |
+| 召回阈值 | 无 | `min_score` 在应用层过滤低质量 hit |
+| 部署 | 0 依赖（FastAPI 单文件） | `docker compose up -d` 起 pgvector/pg16 |
+| Provider 请求时序 | 不变 | **不变**（仅请求体多 budget / min_score 两个可选字段） |
+
+**架构验证点兑现**：`git diff v10..v10.1 -- memory/remote_semantic.py` 只有"新增可选配置项"和"日志/注释更新"，**HTTP 调用代码 0 改动**。
+
+**接入方式**：
+
+```bash
+# 1) 起 pgvector（首次自动初始化 schema）
+docker compose up -d
+
+# 2) 装 V10.1 mock-server 依赖（多了 psycopg + pgvector）
+uv pip install -e ".[mock-server]"
+
+# 3) 配 embedding 端点（任何 OpenAI 兼容 endpoint）
+cp .env.example .env  &&  vim .env
+# 关键三项：DATABASE_URL / EMBEDDING_API_KEY / EMBEDDING_BASE_URL
+
+# 4) 启动服务
+python scripts/mock_memory_server.py
+
+# 5) 启用外部 Provider（另开终端）
+export MEMORY_SERVICE_URL=http://127.0.0.1:8765
+export MEMORY_RECALL_BUDGET=mid     # low / mid / high
+export MEMORY_MIN_SCORE=0.3         # 过滤低相似度噪声
+python agent.py
+```
+
+**V10.1 简化（vs 源项目 Hindsight）**：单文件 mock 而非完整守护进程、无实体抽取/事实图、无 reflect 综合、同步阻塞 sync、无 retain_async 后台批写。保留：pgvector 真后端、SQL 下推余弦排序、budget 语义档位、OpenAI 范式 embedding 端点。
+
+**为什么 DeepSeek + OpenAI 端点能混用**：本项目所有 OpenAI 兼容客户端都以 `base_url` 切换端点。Chat 走 DeepSeek（`OPENAI_*`），Embedding 走 OpenAI / SiliconFlow / 本地 Ollama（`EMBEDDING_*`），互不干扰。这是 OpenAI 范式 SDK 的最大价值之一 —— 不同模型职责对应不同端点，没有锁定。
+
+## 项目结构（V10.1）
 
 ```
 nano_hermes_agent/
 ├── agent.py                    # 主循环 + 生命周期时序 + 按 env 注册外部 provider
 ├── model_tools.py              # 外层缓存 + MCP 工具自动包含
 ├── toolsets.py                 # 工具组定义（不含 memory，由 provider 管）
-├── memory/                     # V7 引入，V8/V9/V10 扩展
+├── docker-compose.yml          # V10.1 pgvector/pg16 一键起
+├── memory/                     # V7 引入，V8/V9/V10/V10.1 扩展
 │   ├── __init__.py             # 导出 Manager / Provider / 围栏辅助 / RemoteSemanticProvider
 │   ├── provider.py             # MemoryProvider ABC（V9 加生命周期钩子）
 │   ├── builtin.py              # BuiltinMemoryProvider（文件后端）
 │   ├── manager.py              # MemoryManager 编排 + 围栏
-│   └── remote_semantic.py      # V10 RemoteSemanticProvider（HTTP 客户端）
+│   └── remote_semantic.py      # V10 HTTP 客户端；V10.1 新增 budget/min_score/auto_retain
 ├── scripts/
-│   └── mock_memory_server.py   # V10 FastAPI mock 服务（dict + hash 假向量）
+│   ├── init.sql                # V10.1 pgvector schema（首次启动自动跑）
+│   └── mock_memory_server.py   # V10.1 FastAPI + psycopg + pgvector + OpenAI embedding
 ├── tools/
 │   ├── __init__.py             # 自动发现 + load/unload 生命周期
 │   ├── registry.py             # dispatch: coerce + async + hooks
@@ -243,4 +291,5 @@ You > /memory
 | V8 | 完成 | 多 provider 无编排，无错误隔离 | MemoryManager 路由 + 围栏 |
 | V9 | 完成 | 没有"何时召回 / 何时持久化"的时序 | prefetch/sync 生命周期钩子 |
 | V10 | 完成 | V9 钩子无外部消费者，架构未验证 | RemoteSemanticProvider + Mock 服务 |
+| V10.1 | 完成 | Mock 用假向量+dict，ABC"两端独立演化"未兑现 | pgvector + OpenAI embedding，Provider 0 改 |
 
