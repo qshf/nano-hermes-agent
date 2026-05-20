@@ -4,8 +4,19 @@
 -- 教学项目：手动改完之后只能 `docker compose down -v` 重置，
 -- 不引入 migration 工具（alembic）以保持单进程可读。
 --
--- 维度通过 ALTER 时改 — 默认 1536（text-embedding-3-small），
--- 切大模型时 `docker compose down -v` 重建即可。
+-- ⚠️ 维度必须与 .env 里的 EMBEDDING_DIM 一致 ⚠️
+-- 常见模型默认维度（写在这里方便对照修改）：
+--   text-embedding-3-small      → 1536（也支持 dimensions 截断到 512/256）
+--   text-embedding-3-large      → 3072（也支持截断到 1024/512/256）
+--   DashScope text-embedding-v3 → 1024
+--   BGE / bge-large-zh-v1.5     → 1024
+--   Ollama nomic-embed-text     → 768
+--
+-- 改维度的步骤：
+--   1) 改下方 VECTOR(N) 与 .env 的 EMBEDDING_DIM 同步
+--   2) docker compose down -v   # 删卷，让 init.sql 下次重跑
+--   3) docker compose up -d
+-- mock server 启动时会自检维度，不一致直接 fail-fast。
 
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -13,7 +24,7 @@ CREATE TABLE IF NOT EXISTS memories (
     id          BIGSERIAL PRIMARY KEY,
     session_id  TEXT        NOT NULL DEFAULT '',
     text        TEXT        NOT NULL,
-    embedding   VECTOR(1536) NOT NULL,
+    embedding   VECTOR(1024) NOT NULL,  -- 与 .env 的 EMBEDDING_DIM 一致
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

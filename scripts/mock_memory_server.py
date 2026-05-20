@@ -92,14 +92,59 @@ def _make_pool() -> ConnectionPool:
     )
 
 
+def _probe_embedding_dim() -> int | None:
+    """读取 memories.embedding 列的 vector 维度。
+
+    pgvector 把维度存在 atttypmod 里（实际是 atttypmod，pg_attribute），但更稳的
+    路径是 information_schema.columns.udt_name + format_type，或者直接执行
+    `SELECT typmod_to_vector_dim(atttypmod)` 这种内部函数。我们用最朴素的：
+    pg_attribute.atttypmod 对 vector 类型直接就是维度。
+
+    返回 None 表示表不存在 — 让上层报"DB 没初始化"而不是"维度不一致"。
+    """
+    if _pool is None:
+        return None
+    try:
+        with _pool.connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT a.atttypmod
+                FROM pg_attribute a
+                JOIN pg_class c ON c.oid = a.attrelid
+                WHERE c.relname = 'memories' AND a.attname = 'embedding';
+                """
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return int(row[0])
+    except Exception as e:
+        logger.warning("probe embedding dim failed: %s", e)
+        return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """启动时建池 + 嗅探 OpenAI，关闭时干净释放。"""
+    """启动时建池 + 嗅探 OpenAI + 校验 DB 列维度，关闭时干净释放。"""
     global _pool, _embedding_client
     logger.info("connecting to db: %s", DATABASE_URL.split("@")[-1])
     _pool = _make_pool()
     _pool.open()
     _pool.wait()  # 阻塞到至少一条连接就绪 — 失败时这里就抛
+
+    # 维度自检 — 把"运行时第 N 条 INSERT 时才崩"提前到启动失败。
+    # init.sql 里的 VECTOR(1536) 与 EMBEDDING_DIM 必须一致，否则换 embedding 模型
+    # 时（如 DashScope text-embedding-v3 是 1024、BGE 是 1024）就会 500。
+    db_dim = _probe_embedding_dim()
+    if db_dim is not None and db_dim != EMBEDDING_DIM:
+        raise RuntimeError(
+            f"Embedding dim mismatch: DB column is VECTOR({db_dim}) but "
+            f"EMBEDDING_DIM={EMBEDDING_DIM}. Either change EMBEDDING_DIM in .env "
+            f"or rebuild the table:\n"
+            f"  docker compose down -v   # wipes data + reruns init.sql\n"
+            f"  # then edit scripts/init.sql to VECTOR({EMBEDDING_DIM}) before:\n"
+            f"  docker compose up -d"
+        )
 
     logger.info(
         "embedding endpoint: %s (model=%s, dim=%d)",
