@@ -1,6 +1,6 @@
 # 记忆系统 — nano 版本与源项目全面差异对比
 
-> 覆盖 V6-V11 全部 7 个迭代版本（builtin 文件记忆 → ABC → Manager → 生命周期 → HTTP 边界 → pgvector → 知识图谱），对照源项目 [hermes-agent](https://github.com/qshf/hermes-agent) 的对应模块。
+> 覆盖 V6-V13 全部迭代版本（builtin 文件记忆 → ABC → Manager → 生命周期 → HTTP 边界 → pgvector → 知识图谱 → 异步写入 → 后台预热），对照源项目 [hermes-agent](https://github.com/qshf/hermes-agent) 的对应模块。
 >
 > 目的：让读者清楚知道**学到了哪几个核心设计模式**、**还差什么生产化关注点**、**生产化时该读源项目哪些文件**。
 
@@ -11,13 +11,13 @@
 | 维度 | nano (V6-V11) | 源项目 (hermes-agent) |
 |------|------|--------|
 | 内置记忆工具 | [tools/memory_store.py](../tools/memory_store.py) ~110 行 + [memory/builtin.py](../memory/builtin.py) ~99 行 | [tools/memory_tool.py](/Users/qshf/my-project/hermes-agent/tools/memory_tool.py) **586 行** |
-| Provider ABC | [memory/provider.py](../memory/provider.py) **105 行**（7 个核心方法 + 3 个 V9 钩子） | [agent/memory_provider.py](/Users/qshf/my-project/hermes-agent/agent/memory_provider.py) **279 行**（7 个核心 + 11 个可选钩子） |
-| Manager | [memory/manager.py](../memory/manager.py) **332 行** | [agent/memory_manager.py](/Users/qshf/my-project/hermes-agent/agent/memory_manager.py) **555 行** |
-| 远端 Provider | [memory/remote_semantic.py](../memory/remote_semantic.py) **329 行**（V11 含 memory_mode + 三工具） | [plugins/memory/hindsight/__init__.py](/Users/qshf/my-project/hermes-agent/plugins/memory/hindsight/__init__.py) **1747 行**（最大的 plugin） |
+| Provider ABC | [memory/provider.py](../memory/provider.py) **114 行**（7 个核心方法 + 4 个生命周期钩子） | [agent/memory_provider.py](/Users/qshf/my-project/hermes-agent/agent/memory_provider.py) **279 行**（7 个核心 + 11 个可选钩子） |
+| Manager | [memory/manager.py](../memory/manager.py) **348 行** | [agent/memory_manager.py](/Users/qshf/my-project/hermes-agent/agent/memory_manager.py) **555 行** |
+| 远端 Provider | [memory/remote_semantic.py](../memory/remote_semantic.py) **510 行**（V13 含 memory_mode + 三工具 + 异步写入 + 后台预热） | [plugins/memory/hindsight/__init__.py](/Users/qshf/my-project/hermes-agent/plugins/memory/hindsight/__init__.py) **1747 行**（最大的 plugin） |
 | 服务端 | [scripts/mock_memory_server.py](../scripts/mock_memory_server.py) **666 行**（V11 知识图谱版） | hindsight-embed 守护进程 + Postgres + 多模块 |
 | DB Schema | [scripts/init.sql](../scripts/init.sql) **98 行**（5 表 + 索引） | hindsight 内置 migration（entities/relations/events/banks/documents + 更多索引） |
 | Provider 插件总数 | 1（remote_semantic）+ 1（builtin）= 2 | **8** 个外部 plugin（byterover/hindsight/holographic/honcho/mem0/openviking/retaindb/supermemory）+ 1 个 builtin |
-| Agent loop 集成 | [agent.py](../agent.py) **346 行**总（含工具系统全部） | [run_agent.py](/Users/qshf/my-project/hermes-agent/run_agent.py) **15439 行**（含全部子系统） |
+| Agent loop 集成 | [agent.py](../agent.py) **359 行**总（含工具系统全部） | [run_agent.py](/Users/qshf/my-project/hermes-agent/run_agent.py) **15439 行**（含全部子系统） |
 
 **比例**：nano 记忆系统 ~1500 行（V11 含服务端）vs 源项目记忆相关 ≈ 8000+ 行（含 hindsight 单插件）。压缩比约 **5-6 倍**。
 
@@ -131,7 +131,7 @@
 | 时机 | nano（agent.py） | 源项目（run_agent.py） |
 |------|--------------------|--------------------|
 | 每轮开始 | `memory_manager.on_turn_start_all(turn_count, user_input)` | 同 + 传 `remaining_tokens` / `model` / `platform` / `tool_count` |
-| 每轮 prefetch | `recalled = memory_manager.prefetch_all(user_input)`（同步阻塞） | `prefetch_all`（同步读已 ready 的缓存）+ 后台 `queue_prefetch_all` 预热下一轮 |
+| 每轮 prefetch | `recalled = memory_manager.prefetch_all(user_input)`（V13: 消费后台预热缓存，冷启动 fallback） | `prefetch_all`（同步读已 ready 的缓存）+ 后台 `queue_prefetch_all` 预热下一轮 |
 | 注入位置 | user message 文本前置（不是 system prompt） | 同（保前缀缓存稳定的关键设计） |
 | 每轮结束 sync | `memory_manager.sync_all(user_input, final_assistant_text)` | 同 + `_sync_external_memory_for_turn` 用中断保护 + 缓存键去重 |
 | 会话结束 | `memory_manager.shutdown_all()` | `on_session_end(messages)` → `shutdown_all()` 两步（先抽取再释放） |
@@ -144,7 +144,7 @@
 
 ### 简化掉的关注点
 
-- **后台预热（`queue_prefetch`）**：源项目"上一轮结束就启动下一轮的 recall"，prefetch 时直接读已 ready 的结果，把 embedding 往返延迟挪到 idle 时间。nano 同步阻塞 — 显式可见，但每轮多 200-500ms。
+- ✅ **后台预热（`queue_prefetch`）**（V13 已实现）：源项目"上一轮结束就启动下一轮的 recall"，prefetch 时直接读已 ready 的结果。nano V13 已复现该模式 — `queue_prefetch_all` 在 `sync_all` 之后调用，daemon 线程预热，下一轮 `prefetch` 消费缓存。
 - **中断轮次保护**：源项目记录 `original_user_message`，对话被打断（Ctrl+C / 网络中断）时不 sync，避免半截状态污染长期记忆。nano 简化为"只要主循环跑到 sync 那行就 sync"。
 - **`_ext_prefetch_cache`**：源项目对相同 query 的 prefetch 做去重，连续两轮问相似问题不重复打 embedding API。nano 不缓存。
 - **`on_pre_compress` 钩子**：上下文压缩前给 provider 一次抢救机会。nano 不压缩。
@@ -159,8 +159,8 @@
 |------|----------------------------|----------------------------|
 | 行数 | 207 | 1747 |
 | HTTP 客户端 | `httpx.Client`（同步） | `hindsight` SDK（含连接池、`asyncio` 事件循环、`_run_sync` 桥接） |
-| Prefetch 路径 | `POST /recall` 同步阻塞 | 后台 `threading.Thread` + `_prefetch_lock` + `_prefetch_result` 缓存 |
-| Sync 路径 | `POST /sync` 同步阻塞 | **单写者线程模型**：`_retain_queue: queue.Queue` + `_writer_thread` + `_WRITER_SENTINEL` 优雅关闭，避免解释器关闭时的 race（"Unclosed client session"） |
+| Prefetch 路径 | ✅ V13: 后台 daemon 线程预热 + `_prefetch_lock` + 缓存 + 冷启动 fallback | 后台 `threading.Thread` + `_prefetch_lock` + `_prefetch_result` 缓存 |
+| Sync 路径 | ✅ V12: **单写者线程模型**：`_retain_queue: queue.Queue` + `_writer_thread` + `_WRITER_SENTINEL` 优雅关闭 | 同（nano 1:1 复现） |
 | 召回质量控制 | `budget` (low/mid/high) + `min_score` | 同 + `tags` / `tags_match` / `types` / `recall_max_tokens` / `recall_max_input_chars` |
 | 配置项 | 5 个：`base_url` / `top_k` / `budget` / `min_score` / `auto_retain` | **30+ 个**：bank_id / mode / cloud or local / `_memory_mode` (context/tools/hybrid) / `_prefetch_method` (recall/reflect) / `retain_user_prefix` / `agent_identity` / `agent_workspace` / `_user_id` / `_chat_id` / `_thread_id` / `_retain_every_n_turns` / `_retain_async` / `_recall_max_input_chars` / ... |
 | Bank 模板 | 无（session_id 直接当 partition key） | `_bank_id_template`：可用占位符渲染（`{user_id}` / `{chat_id}` / `{platform}` / `{agent_identity}`），实现"按聊天 / 按用户 / 按 profile"的多维隔离 |
@@ -217,7 +217,7 @@ V10 → V10.1 的变更范围验证了 V7 抽 ABC 时的承诺：
 | prefetch 策略 | `recall`（hit 列表）/ `reflect`（LLM 合成）二选一 | 同 + `recall_budget` 精细控制 |
 | auto_retain | 每轮结束自动 `/retain`（可关） | 同 + `retain_every_n_turns` 批量 + `retain_async` 服务端异步 |
 | 写入方式 | ✅ V12: 单写者线程 + `queue.Queue` + `_WRITER_SENTINEL` + lazy 启动 + atexit 兜底 | 同（nano 1:1 复现该模式） |
-| prefetch 方式 | 同步阻塞 | 后台 `_prefetch_thread` + `_prefetch_lock` + 缓存 |
+| prefetch 方式 | ✅ V13: 后台 daemon 线程预热 + `_prefetch_lock` + 缓存 + 冷启动 fallback | 同（nano 1:1 复现该模式） |
 | session 切换 | 不实现 | `on_session_switch()` flush buffer + 切 document_id + 清缓存 |
 | bank 模板 | 静态 `bank_id` 字符串 | `_bank_id_template` 支持 `{user_id}` / `{platform}` / `{session}` 占位符 |
 | 版本探测 | 无 | `_fetch_hindsight_api_version()` + `_check_api_supports_update_mode_append()` |
@@ -252,7 +252,7 @@ V10 → V10.1 的变更范围验证了 V7 抽 ABC 时的承诺：
 ### 简化掉的关注点
 
 - ✅ **后台写入队列**（V12 已实现）：单写者守护线程 + queue + sentinel + lazy 启动 + atexit 兜底。`sync_turn` 入队即返回（端到端测得主循环阻塞从 5103ms → 0.1ms）。
-- **后台 prefetch**：源项目上一轮结束就启动下一轮 recall 的后台线程，prefetch 时直接读缓存。nano 仍每轮同步阻塞。
+- ✅ **后台 prefetch**（V13 已实现）：`queue_prefetch()` 当轮结束启动 daemon 线程预热，`prefetch()` 消费缓存 + 冷启动 fallback。第 2 轮起 recall 近零延迟。
 - **实体消歧 / 别名合并**：源项目能识别"小明"和"XiaoMing"是同一实体。nano 纯字符串匹配。
 - **多跳图遍历**：nano 只做 1-hop，源项目可配置深度。
 - **时间衰减**：源项目对旧记忆降权，nano 不考虑时间因素。
@@ -282,7 +282,7 @@ V10 → V10.1 的变更范围验证了 V7 抽 ABC 时的承诺：
 
 ## 7. 核心流程对比（伪代码）
 
-### nano（V11 完整流程）
+### nano（V13 完整流程）
 
 ```python
 # 启动
@@ -298,11 +298,12 @@ manager.initialize_all(session_id="default")
 
 # 每轮
 manager.on_turn_start_all(turn, user_input)
-recalled = manager.prefetch_all(user_input)         # 同步阻塞（hybrid/context 模式触发）
+recalled = manager.prefetch_all(user_input)         # V13: 消费后台预热缓存，冷启动 fallback
 messages.append({"role": "user", "content": recalled + user_input})
 response = llm.chat(messages, tools=manager.get_all_tool_schemas())  # V11: 含 hindsight_* 工具
 # ... tool loop（模型可主动调 hindsight_retain/recall/reflect）...
-manager.sync_all(user_input, final_response)        # 同步阻塞 → 服务端做 KG 抽取
+manager.sync_all(user_input, final_response)        # V12: 入队后台 writer，不阻塞
+manager.queue_prefetch_all(user_input)              # V13: 预热下一轮 recall
 
 # 退出
 manager.shutdown_all()
@@ -340,11 +341,10 @@ manager.on_session_end(messages)                    # 抽取 + flush
 manager.shutdown_all()                              # 等待写者线程 drain
 ```
 
-**关键差异**：
-1. 源项目 prefetch 是"读缓存"（后台线程已提前跑完），nano 是"同步阻塞"。
-2. 源项目 sync 入队后台线程，nano 同步阻塞。
-3. 源项目有 `queue_prefetch_all` 预热下一轮，nano 没有。
-4. 源项目有中断保护（`if not interrupted`），nano 没有。
+**关键差异**（V13 后仅剩）：
+1. 源项目有中断保护（`if not interrupted`），nano 没有。
+2. 源项目有 `on_session_end(messages)` 抽取 + flush，nano 直接 `shutdown_all()`。
+3. 源项目 prefetch 缓存有 cadence 控制（N 轮刷新一次），nano 每轮都预热。
 
 ---
 
@@ -367,7 +367,7 @@ manager.shutdown_all()                              # 等待写者线程 drain
 
 ## 9. 总结
 
-### nano 提取的 9 个核心设计模式
+### nano 提取的 11 个核心设计模式
 
 1. **冻结快照**（V6）— system prompt 稳定 → 前缀缓存命中率高
 2. **ABC 接口分离**（V7）— 换后端不动 agent loop
@@ -378,6 +378,8 @@ manager.shutdown_all()                              # 等待写者线程 drain
 7. **知识图谱三层结构**（V11）— 实体去重 + 关系累加 + 事实覆盖，超越扁平向量
 8. **多策略检索融合**（V11）— 语义 + 实体 + 图遍历互补，召回质量跃升
 9. **memory_mode 三态**（V11）— context/tools/hybrid 灵活适配不同场景
+10. **单写者线程 + sentinel 优雅关闭**（V12）— 生产者/消费者 + FIFO 串行保证正确性
+11. **两阶段 prefetch 预热**（V13）— queue_prefetch 后台预热 + prefetch 消费缓存，读写双异步
 
 ### V11 兑现了什么
 
@@ -395,8 +397,10 @@ V11 是 nano 项目的"功能封顶"版本 — 从 V6 的文件记忆到 V11 的
 
 | 方向 | 对应源项目 | 痛点 | 状态 |
 |------|-----------|------|------|
-| **异步 retain** | `_retain_queue` + `_writer_thread` + sentinel | `/retain` 含 LLM+embedding 同步阻塞 2-5s，用户体感卡顿 | ✅ **V12 已实现** |
-| 后台 prefetch | `_prefetch_thread` + `_prefetch_lock` | 每轮 recall 同步阻塞 200-500ms | V13 候选 |
+| **异步 retain** | `_retain_queue` + `_writer_thread` + sentinel | `/retain` 含 LLM+embedding 同步阻塞 2-5s | ✅ **V12 已实现** |
+| **后台 prefetch** | `_prefetch_thread` + `_prefetch_lock` | 每轮 recall 同步阻塞 200-500ms | ✅ **V13 已实现** |
+| `on_session_switch` | flush buffer + 切 document_id + 清缓存 | 切 session 时 retain 可能丢失/串台 | V14 候选 |
+| 上下文压缩 | `on_pre_compress` + `context_compressor` | 长对话无法压缩，重要内容被丢弃 | V15 候选 |
 | 实体消歧 | Hindsight NER pipeline | "小明"/"XiaoMing" 无法合并 | 中 |
 | 多跳图遍历 | 可配置 hop depth | 1-hop 不够时丢失间接关联 | 小 |
 | 时间衰减 | time-decay 加权 | 旧记忆不降权，噪声累积 | 小 |
@@ -404,7 +408,6 @@ V11 是 nano 项目的"功能封顶"版本 — 从 V6 的文件记忆到 V11 的
 | Plugin 发现 | `plugins/__init__.py` + `plugin.yaml` | 硬编码注册，无法运行时切换 | 中 |
 | 流式围栏 | `StreamingContextScrubber` | 流式输出时围栏标签泄露 | 小 |
 | 注入扫描 | `_scan_memory_content` | 记忆文件可被注入 | 小 |
-| 上下文压缩集成 | `on_pre_compress` | 长对话无法压缩 | 中 |
 | Schema 迁移 | migration 工具 | 改 schema 只能 `down -v` 重建 | 中 |
 
 ---
@@ -427,17 +430,34 @@ V11 是 nano 项目的"功能封顶"版本 — 从 V6 的文件记忆到 V11 的
 - 7 项单元测试全过：入队不阻塞、FIFO 顺序、单 job 失败不杀线程、shutdown drain、幂等、关闭后丢弃、lazy 启动
 - 端到端：3 次真实 retain 主循环阻塞从 **5103ms → 0.1ms**（≈100% 减少）
 
-### V13+ 候选方向（按优先级）
+### ✅ V13 — 后台 prefetch 预热（已完成）
 
-| 优先级 | 方向 | 教学价值 | 复杂度 |
-|--------|------|---------|--------|
-| 1 | 后台 prefetch（预热下一轮） | 延迟隐藏、缓存模式（沿用 V12 的线程基础设施） | 低 |
-| 2 | 上下文压缩 + `on_pre_compress` | 长对话管理、provider 钩子协作 | 中 |
-| 3 | 实体消歧（别名合并） | NLP pipeline、模糊匹配 | 中 |
-| 4 | Plugin 发现机制 | 运行时扩展、约定优于配置 | 中 |
-| 5 | `on_session_switch` 完整实现 | 状态机、buffer flush（V12 遗留 — 切 session 可能丢入队中的 retain） | 低 |
+**解决的痛点**：V12 后剩余的读路径阻塞 — 每轮 recall/reflect HTTP 调用同步阻塞主循环 200-500ms。
 
-**建议路径**：V13 做后台 prefetch（紧跟 V12 把另一半阻塞也异步化），V14 引入上下文压缩。
+**实现**：
+- `queue_prefetch()`：当轮结束启动 daemon 线程执行 recall/reflect HTTP 调用
+- `prefetch()`：join 后台线程（timeout=3s）→ 消费 `_prefetch_result` 缓存 → 冷启动 fallback
+- `_prefetch_lock` 保护缓存读写，线程安全
+- `shutdown()` 增加 join prefetch 线程（timeout=5s）
+- ABC 新增 `queue_prefetch()` 默认 no-op；Manager 新增 `queue_prefetch_all()` 广播
+
+**验证**（`scripts/test_v13_prefetch.py`）：
+- 6 项测试全过：启动线程、消费缓存、超时 fallback、shutdown 阻止、冷启动 fallback、tools 模式跳过
+- 第 2 轮起 prefetch 近零延迟（后台线程已提前完成 HTTP 调用）
+
+### V14+ 候选方向（按优先级）
+
+| 优先级 | 方向 | 教学价值 | 复杂度 | 说明 |
+|--------|------|---------|--------|------|
+| 1 | `on_session_switch` + buffer flush | 状态机、正确性保证 | 低 | 切 session 时 drain writer + 清 prefetch 缓存，防止数据丢失/串台 |
+| 2 | 上下文压缩 + `on_pre_compress` | 长对话管理、provider 钩子协作 | 中 | 压缩前给 provider 一次"抢救重要内容"的机会 |
+| 3 | 实体消歧（别名合并） | NLP pipeline、模糊匹配 | 中 | "小明"/"XiaoMing" 合并为同一实体 |
+| 4 | retain 批量 + cadence 控制 | 成本优化、节流模式 | 低 | `retain_every_n_turns` 攒多轮再一次性抽取 |
+| 5 | Plugin 发现机制 | 运行时扩展、约定优于配置 | 中 | 扫描 `plugins/memory/*/plugin.yaml` 动态加载 |
+| 6 | 多跳图遍历 | 图算法、可配置深度 | 小 | 2-hop 找间接关联 |
+| 7 | 时间衰减 | 信息论、噪声控制 | 小 | 旧记忆降权，避免噪声累积 |
+
+**建议路径**：V14 做 `on_session_switch`（正确性修复，复杂度低），V15 引入上下文压缩（打开长对话场景）。
 
 ### 读源项目的索引
 
