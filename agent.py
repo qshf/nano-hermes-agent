@@ -347,6 +347,9 @@ def run_agent():
             # V9 生命周期：tool loop 结束后持久化对话
             # sync 用原始 user 输入（不含围栏），保持后端记录干净
             memory_manager.sync_all(user_input, final_assistant_text)
+
+            # V13: 预热下一轮的 recall — 用当轮 user input 作为 query
+            memory_manager.queue_prefetch_all(user_input)
     finally:
         # V10: 释放外部 provider 的 httpx client；builtin 的 shutdown 是 no-op
         memory_manager.shutdown_all()

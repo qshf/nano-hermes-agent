@@ -9,8 +9,8 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到能挂载长期记忆。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级 AI Agent，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v12 已完成 — RemoteSemanticProvider 引入单写者线程 + queue + sentinel，retain 入队即返回，主循环不再被 LLM 抽取 + embedding 阻塞 2-5s。
-- **核心叙事**：通过 V0→V12 的 13 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 异步写入。
+- **当前阶段**：v13 已完成 — RemoteSemanticProvider 引入两阶段 prefetch（queue_prefetch 后台预热 + prefetch 消费缓存），第 2 轮起 recall 不再阻塞主循环。
+- **核心叙事**：通过 V0→V13 的 14 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步。
 
 ---
 
@@ -45,9 +45,10 @@
 | v10 | RemoteSemanticProvider | HTTP 边界（mock dict） | ✅ |
 | v10.1 | pgvector + OpenAI embedding | 真实向量存储 + 范式 embedding | ✅ |
 | v11 | 知识图谱记忆（Hindsight 1:1） | 实体/关系/事实抽取 + 多策略检索 + reflect 合成 + memory mode | ✅ |
-| **v12** | **异步 retain（后台 writer 线程）** | **queue + sentinel 优雅关闭 + lazy 启动 + atexit 兜底** | **✅ 已完成** |
+| v12 | 异步 retain（后台 writer 线程） | queue + sentinel 优雅关闭 + lazy 启动 + atexit 兜底 | ✅ |
+| **v13** | **后台 prefetch 预热** | **queue_prefetch + 两阶段消费 + 冷启动 fallback + join timeout** | **✅ 已完成** |
 
-**下一档候选**（未启动）：v13 后台 prefetch（预热下一轮 recall）/ 上下文压缩 `on_pre_compress` 钩子。
+**下一档候选**（未启动）：v14 `on_session_switch`（切 session 时 drain buffer）/ 上下文压缩 `on_pre_compress` 钩子。
 
 ---
 
@@ -174,6 +175,19 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 - **原因**：写者必须始终活着直到 sentinel — 一次 HTTP 失败不能让后续 N 次入队的 retain 全部丢失。
 - **验证**：`scripts/test_v12_writer.py` 7 项单元测试覆盖（入队不阻塞、FIFO 顺序、单 job 失败不杀线程、shutdown drain、幂等、shutdown 后丢弃、lazy 启动）；`scripts/test_v12_e2e.py` 真实 mock server 端到端验证：3 次 retain 主循环阻塞从 5103ms 降到 0.1ms（100% 减少）。
 
+### v13 — 后台 prefetch 预热（两阶段 recall）
+- **选 1**：`queue_prefetch()` + `prefetch()` 两阶段模式 — 当轮结束启动 daemon 线程预热，下一轮消费缓存。
+- **没选**：持久线程池 / asyncio / 全局 prefetch 缓存。原因：每轮只有一次 recall HTTP 调用，单 daemon 线程是最小形态；匹配源项目 Hindsight 的 1:1 模式。
+- **选 2**：冷启动 fallback — 第一轮无预热结果时 `prefetch()` 内同步调用 `_do_recall`。
+- **原因**：第一轮用户仍需 recall 上下文，不能因为没有预热就跳过。从第 2 轮起预热生效，prefetch 近零延迟。
+- **选 3**：`join(timeout=3.0)` — 后台线程超时后不等待，走 sync fallback。
+- **原因**：匹配源项目；3s 是合理上限 — 超过说明服务端异常，不应让主循环无限等待。
+- **选 4**：prefetch 线程与 writer 线程独立（不同实例变量、不同关注点）。
+- **原因**：writer 管写路径（retain FIFO 串行），prefetch 管读路径（recall 单次）。两者生命周期不同，混用会增加复杂度。
+- **选 5**：`shutdown()` 增加 join prefetch 线程（timeout=5s）。
+- **原因**：确保关闭时不留悬挂线程；daemon 线程虽然不阻塞进程退出，但显式 join 更干净。
+- **验证**：`scripts/test_v13_prefetch.py` 6 项测试覆盖（启动线程、消费缓存、超时 fallback、shutdown 阻止、冷启动 fallback、tools 模式跳过）。
+
 ---
 
 ## 7. 待办 / 已知问题
@@ -185,8 +199,8 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 - [ ] V11 事实去重阈值 `FACT_DEDUP_THRESHOLD=0.92` 需要实测验证。
 - [x] ~~V11 `/retain` 含 LLM 调用 + 多次 embedding，单次约 2-5s~~ — V12 已通过后台 writer 解决（主循环 0 阻塞）。
 - [ ] V11 图遍历目前只做 1-hop，复杂场景可能需要 2-hop。
-- [ ] V12 后只剩 prefetch 同步阻塞（200-500ms/轮）— V13 候选：后台 prefetch 预热下一轮。
-- [ ] V12 仍未实现 `on_session_switch`：切 session 时 buffer 没 flush，可能丢入队中的 retain。
+- [x] ~~V12 后只剩 prefetch 同步阻塞（200-500ms/轮）~~ — V13 已通过后台 prefetch 预热解决（第 2 轮起近零阻塞）。
+- [ ] 仍未实现 `on_session_switch`：切 session 时 buffer 没 flush，可能丢入队中的 retain — V14 候选。
 
 ---
 

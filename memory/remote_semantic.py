@@ -1,11 +1,15 @@
 """
-RemoteSemanticProvider — V12 异步写入版（V11 + 后台 writer 线程）。
+RemoteSemanticProvider — V13 后台 prefetch 预热版（V12 + 两阶段 recall）。
 
-V12 变化（相对 V11）：
-- 引入单写者线程 + queue.Queue + sentinel 模式
-- sync_turn / hindsight_retain 入队即返回，不再阻塞主循环
-- shutdown 优雅 drain：发送 sentinel + bounded join
-- 注册 atexit 钩子，避免 CLI 直接退出时 retain job 与解释器 teardown 竞态
+V13 变化（相对 V12）：
+- 新增 queue_prefetch()：当轮结束后启动 daemon 线程预热下一轮 recall/reflect
+- 重写 prefetch()：先消费预热缓存，冷启动时 fallback 到同步调用
+- 新增 _prefetch_thread / _prefetch_result / _prefetch_lock 三个实例变量
+- shutdown 增加 join prefetch 线程
+
+V12 保留（不变）：
+- 单写者线程 + queue.Queue + sentinel 模式（retain 异步写入）
+- sync_turn 入队即返回，不阻塞主循环
 
 V11 保留（不变）：
 - memory_mode: context / tools / hybrid
@@ -13,9 +17,9 @@ V11 保留（不变）：
 - prefetch 支持 recall / reflect 两种方式
 
 设计依据（对应源项目 plugins/memory/hindsight/__init__.py）：
-- _ensure_writer：lazy 启动，不在 initialize 启动 — 纯 tools 模式且模型从不显式 retain 时不开线程
-- _writer_loop：get(timeout=1.0) 让线程能周期检查 shutdown 标志；单 job 异常不杀线程
-- shutdown：先 set _shutting_down 拒绝新入队，再 put sentinel 让 writer 退出，bounded join 兜底
+- queue_prefetch：daemon 线程 + lock 保护缓存写入，匹配源项目 1:1
+- prefetch：join(timeout=3.0) + 消费缓存 + 冷启动 fallback
+- 两阶段模式让第 2 轮起 prefetch 近零延迟（后台线程已提前完成 HTTP 调用）
 """
 
 from __future__ import annotations
@@ -152,6 +156,11 @@ class RemoteSemanticProvider(MemoryProvider):
         self._atexit_registered = False
         self._writer_join_timeout = writer_join_timeout
 
+        # V13: 后台 prefetch 预热相关状态
+        self._prefetch_thread: threading.Thread | None = None
+        self._prefetch_result: str = ""
+        self._prefetch_lock = threading.Lock()
+
     @property
     def name(self) -> str:
         return "remote_semantic"
@@ -170,12 +179,13 @@ class RemoteSemanticProvider(MemoryProvider):
         self._session_id = session_id
 
     def shutdown(self) -> None:
-        """优雅关闭：先停收，再 drain writer，最后关 client。
+        """优雅关闭：先停收，再 drain writer，join prefetch，最后关 client。
 
         步骤：
-        1. set _shutting_down — 后续 sync_turn / _tool_retain 直接丢弃
+        1. set _shutting_down — 后续 sync_turn / queue_prefetch 直接丢弃
         2. put sentinel + bounded join — writer drain 完已入队的 job 后退出
-        3. 关 httpx client
+        3. join prefetch 线程（如果在跑）
+        4. 关 httpx client
         """
         if self._shutting_down.is_set():
             return
@@ -194,6 +204,10 @@ class RemoteSemanticProvider(MemoryProvider):
                     self._writer_join_timeout,
                     self._retain_queue.qsize(),
                 )
+
+        prefetch_thread = self._prefetch_thread
+        if prefetch_thread is not None and prefetch_thread.is_alive():
+            prefetch_thread.join(timeout=5.0)
 
         try:
             self._client.close()
@@ -231,18 +245,68 @@ class RemoteSemanticProvider(MemoryProvider):
             return self._tool_reflect(args)
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
-    # ─── V9 生命周期钩子 ─────────────────────────────────────────────────
+    # ─── V9/V13 生命周期钩子 ────────────────────────────────────────────────
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """每轮前自动召回（context / hybrid 模式生效）。"""
+        """每轮前消费预热结果；冷启动时 fallback 到同步调用。
+
+        V13 两阶段模式：
+        1. join 后台 prefetch 线程（timeout=3s）
+        2. 取 _prefetch_result 缓存并清空
+        3. 缓存为空（冷启动 / 线程超时）→ 同步 fallback
+        """
         if self._memory_mode == "tools":
             return ""
         if not self._auto_recall:
             return ""
 
-        if self._prefetch_method == "reflect":
-            return self._do_reflect(query)
-        return self._do_recall(query)
+        thread = self._prefetch_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3.0)
+
+        with self._prefetch_lock:
+            result = self._prefetch_result
+            self._prefetch_result = ""
+
+        if not result:
+            if self._prefetch_method == "reflect":
+                result = self._do_reflect(query)
+            else:
+                result = self._do_recall(query)
+
+        return result
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """当轮结束后启动后台线程预热下一轮的 recall/reflect。
+
+        守卫条件（对齐源项目）：
+        - tools 模式不做隐式 prefetch
+        - auto_recall 关闭时跳过
+        - shutting_down 时跳过
+        """
+        if self._memory_mode == "tools":
+            return
+        if not self._auto_recall:
+            return
+        if self._shutting_down.is_set():
+            return
+
+        def _run():
+            try:
+                if self._prefetch_method == "reflect":
+                    text = self._do_reflect(query)
+                else:
+                    text = self._do_recall(query)
+                if text:
+                    with self._prefetch_lock:
+                        self._prefetch_result = text
+            except Exception as e:
+                logger.debug("RemoteSemantic queue_prefetch failed: %s", e)
+
+        self._prefetch_thread = threading.Thread(
+            target=_run, daemon=True, name="remote-semantic-prefetch"
+        )
+        self._prefetch_thread.start()
 
     def sync_turn(
         self,

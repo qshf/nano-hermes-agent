@@ -2,8 +2,8 @@
 MemoryProvider ABC — 记忆后端的统一契约。
 
 V7 核心：定义任何记忆后端必须满足的接口。
-V9 扩展：新增三个默认 no-op 的生命周期方法，让 manager 能在
-agent loop 的正确时机广播事件，而无需 provider 强制实现。
+V9 扩展：新增生命周期方法，让 manager 能在 agent loop 的正确时机广播事件。
+V13 扩展：新增 queue_prefetch()，实现两阶段预热模式。
 
 核心方法（必须实现）：
 - name: 短标识符
@@ -18,6 +18,7 @@ V9 生命周期钩子（默认 no-op，按需 override）：
 - on_turn_start(): 每轮开始时通知（轮数计数、定期维护）
 - prefetch(): 每轮前根据用户查询召回相关上下文
 - sync_turn(): 每轮结束后持久化完成的对话
+- queue_prefetch(): 每轮结束后启动后台预热，供下一轮 prefetch() 消费（V13）
 
 为什么 prefetch/sync_turn 是默认实现而不是 abstractmethod：
 内置 provider（文件存储）通过 system_prompt_block 一次性注入全部记忆，
@@ -85,8 +86,8 @@ class MemoryProvider(ABC):
         在每次 API 调用前被调用。返回格式化文本注入 user message，
         或空字符串表示无相关内容。
 
-        nano 版是同步实现 — 源项目用后台线程 + queue_prefetch 预热下一轮，
-        这里简化为同步阻塞调用，足以演示生命周期模式。
+        V13 两阶段模式：如果上一轮 queue_prefetch 已预热，这里只需
+        消费缓存结果（近零延迟）；冷启动时 fallback 到同步 HTTP 调用。
         """
         return ""
 
@@ -100,6 +101,14 @@ class MemoryProvider(ABC):
         """持久化完成的一轮对话到后端。
 
         在每轮 tool loop 结束、最终文本响应到达后被调用。
-        实现应该非阻塞 — 有延迟的后端用后台线程入队（nano 简化为同步）。
+        V12 起非阻塞 — 通过后台 writer 线程入队。
+        """
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """在当轮结束后启动后台预热，供下一轮 prefetch() 消费。
+
+        在 sync_turn 之后调用。实现应启动后台线程执行 recall/reflect，
+        将结果缓存到实例变量，下一轮 prefetch() 直接取用。
+        默认 no-op — 只有需要后台预热的 provider 才 override。
         """
 

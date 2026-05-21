@@ -7,6 +7,7 @@ V9 新增：广播生命周期事件到所有 provider，并提供上下文围�
 - on_turn_start_all() — 每轮开始通知
 - prefetch_all() — 收集召回内容，sanitize → 围栏 → 注入 user message
 - sync_all() — 持久化完成的对话到所有 provider
+- queue_prefetch_all() — 预热下一轮的 recall（V13）
 - 围栏辅助：sanitize_context / build_memory_context_block
 
 为什么前缀缓存敏感：召回结果每轮都不同，绝不能放进 system prompt
@@ -14,7 +15,6 @@ V9 新增：广播生命周期事件到所有 provider，并提供上下文围�
 保 system prompt 稳定，缓存命中率高。
 
 简化（相比源项目）：
-- 同步 prefetch（无后台线程，无 queue_prefetch 预热下一轮）
 - 无 _ext_prefetch_cache 优化
 - 无 on_session_end / on_pre_compress / on_memory_write 等钩子
 
@@ -327,6 +327,22 @@ class MemoryManager:
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' sync_turn() failed: %s",
+                    provider.name,
+                    e,
+                )
+
+    def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
+        """广播 queue_prefetch 到所有 provider — 预热下一轮的 recall。
+
+        在 sync_all 之后调用。每个 provider 的 queue_prefetch 应该是
+        非阻塞的（启动后台线程即返回）。单个 provider 失败不阻塞其他。
+        """
+        for provider in self._providers:
+            try:
+                provider.queue_prefetch(query, session_id=session_id)
+            except Exception as e:
+                logger.warning(
+                    "Memory provider '%s' queue_prefetch() failed: %s",
                     provider.name,
                     e,
                 )
