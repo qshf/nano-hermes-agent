@@ -1,23 +1,31 @@
 """
-RemoteSemanticProvider — V11 知识图谱版（Hindsight 1:1 复现）。
+RemoteSemanticProvider — V12 异步写入版（V11 + 后台 writer 线程）。
 
-V11 变化（相对 V10.1）：
-- 支持 memory_mode: context / tools / hybrid
-- 暴露 hindsight_retain / hindsight_recall / hindsight_reflect 三个工具
-- sync_turn 调 /retain（服务端做实体/关系/事实抽取）
+V12 变化（相对 V11）：
+- 引入单写者线程 + queue.Queue + sentinel 模式
+- sync_turn / hindsight_retain 入队即返回，不再阻塞主循环
+- shutdown 优雅 drain：发送 sentinel + bounded join
+- 注册 atexit 钩子，避免 CLI 直接退出时 retain job 与解释器 teardown 竞态
+
+V11 保留（不变）：
+- memory_mode: context / tools / hybrid
+- 三个工具：hindsight_retain / hindsight_recall / hindsight_reflect
 - prefetch 支持 recall / reflect 两种方式
 
-对应源项目：plugins/memory/hindsight/__init__.py
-- context 模式 = 纯 prefetch 注入（模型不感知记忆工具）
-- tools 模式 = 暴露工具让模型主动调用（不自动 prefetch）
-- hybrid 模式 = 两者并存（自动 prefetch + 模型可主动调用）
+设计依据（对应源项目 plugins/memory/hindsight/__init__.py）：
+- _ensure_writer：lazy 启动，不在 initialize 启动 — 纯 tools 模式且模型从不显式 retain 时不开线程
+- _writer_loop：get(timeout=1.0) 让线程能周期检查 shutdown 标志；单 job 异常不杀线程
+- shutdown：先 set _shutting_down 拒绝新入队，再 put sentinel 让 writer 退出，bounded join 兜底
 """
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
-from typing import Any
+import queue
+import threading
+from typing import Any, Callable
 
 import httpx
 
@@ -27,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 _VALID_BUDGETS = {"low", "mid", "high"}
 _VALID_MODES = {"context", "tools", "hybrid"}
+
+_WRITER_SENTINEL = object()
 
 
 # ─── Tool Schemas（对齐源项目 Hindsight 命名）────────────────────────────────
@@ -116,6 +126,7 @@ class RemoteSemanticProvider(MemoryProvider):
         auto_recall: bool = True,
         retain_tags: list[str] | None = None,
         timeout: float = 360.0,
+        writer_join_timeout: float = 10.0,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._bank_id = bank_id
@@ -133,6 +144,13 @@ class RemoteSemanticProvider(MemoryProvider):
         self._retain_tags = retain_tags or []
         self._session_id: str = ""
         self._client = httpx.Client(timeout=timeout)
+
+        # V12: 后台写者线程相关状态
+        self._retain_queue: queue.Queue = queue.Queue()
+        self._writer_thread: threading.Thread | None = None
+        self._shutting_down = threading.Event()
+        self._atexit_registered = False
+        self._writer_join_timeout = writer_join_timeout
 
     @property
     def name(self) -> str:
@@ -152,6 +170,31 @@ class RemoteSemanticProvider(MemoryProvider):
         self._session_id = session_id
 
     def shutdown(self) -> None:
+        """优雅关闭：先停收，再 drain writer，最后关 client。
+
+        步骤：
+        1. set _shutting_down — 后续 sync_turn / _tool_retain 直接丢弃
+        2. put sentinel + bounded join — writer drain 完已入队的 job 后退出
+        3. 关 httpx client
+        """
+        if self._shutting_down.is_set():
+            return
+        self._shutting_down.set()
+
+        writer = self._writer_thread
+        if writer is not None and writer.is_alive():
+            try:
+                self._retain_queue.put(_WRITER_SENTINEL)
+            except Exception:
+                pass
+            writer.join(timeout=self._writer_join_timeout)
+            if writer.is_alive():
+                logger.warning(
+                    "RemoteSemantic writer did not stop within %.1fs; abandoning %d pending retain(s)",
+                    self._writer_join_timeout,
+                    self._retain_queue.qsize(),
+                )
+
         try:
             self._client.close()
         except Exception:
@@ -208,8 +251,13 @@ class RemoteSemanticProvider(MemoryProvider):
         *,
         session_id: str = "",
     ) -> None:
-        """每轮结束后调 /retain — 服务端做知识图谱抽取。"""
+        """每轮结束后入队一个 retain job — 立即返回，不阻塞主循环。
+
+        实际 HTTP 调用在 _writer_loop 里串行执行；服务端做知识图谱抽取。
+        """
         if not self._auto_retain:
+            return
+        if self._shutting_down.is_set():
             return
 
         content = f"User: {user_content}\nAssistant: {assistant_content}"
@@ -220,11 +268,7 @@ class RemoteSemanticProvider(MemoryProvider):
             "tags": self._retain_tags,
             "update_mode": "append",
         }
-        try:
-            resp = self._client.post(f"{self._base_url}/retain", json=payload)
-            resp.raise_for_status()
-        except Exception as e:
-            logger.warning("RemoteSemantic /retain failed: %s", e)
+        self._enqueue_retain(payload)
 
     # ─── 内部方法 ────────────────────────────────────────────────────────
 
@@ -326,3 +370,77 @@ class RemoteSemanticProvider(MemoryProvider):
             return json.dumps(resp.json(), ensure_ascii=False)
         except Exception as e:
             return json.dumps({"error": str(e)})
+
+    # ─── V12 异步 writer ─────────────────────────────────────────────────
+
+    def _enqueue_retain(self, payload: dict[str, Any]) -> None:
+        """把一次 retain HTTP 调用包成 job 入队。"""
+        def _do_retain() -> None:
+            resp = self._client.post(f"{self._base_url}/retain", json=payload)
+            resp.raise_for_status()
+
+        self._ensure_writer()
+        self._register_atexit()
+        self._retain_queue.put(_do_retain)
+
+    def _ensure_writer(self) -> None:
+        """Lazy 启动单写者线程。
+
+        不在 initialize() 里启动，避免纯 tools 模式且模型从不显式 retain 的场景
+        白白挂一个空闲线程。
+        """
+        thread = self._writer_thread
+        if thread is not None and thread.is_alive():
+            return
+        # 上一次 shutdown 后允许新写者再次运行（重新 initialize 的场景）
+        self._shutting_down.clear()
+        thread = threading.Thread(
+            target=self._writer_loop,
+            daemon=True,
+            name="remote-semantic-writer",
+        )
+        self._writer_thread = thread
+        thread.start()
+
+    def _writer_loop(self) -> None:
+        """串行 drain retain 队列；sentinel 触发退出。
+
+        - get(timeout=1.0)：让线程能周期性检查 _shutting_down，避免死等
+        - 单个 job 异常不杀线程 — 写者必须始终活着直到 sentinel
+        - task_done 始终触发 — 让外部 queue.join() 等待可用（测试中要用）
+        """
+        while True:
+            try:
+                job: Callable[[], None] | object = self._retain_queue.get(timeout=1.0)
+            except queue.Empty:
+                if self._shutting_down.is_set():
+                    return
+                continue
+            try:
+                if job is _WRITER_SENTINEL:
+                    return
+                try:
+                    job()  # type: ignore[operator]
+                except Exception as exc:
+                    logger.warning("RemoteSemantic retain failed: %s", exc, exc_info=True)
+            finally:
+                self._retain_queue.task_done()
+
+    def _register_atexit(self) -> None:
+        """注册幂等的 atexit 钩子 drain writer。
+
+        没有这个钩子，CLI 不走 MemoryManager.shutdown_all() 直接退出时，
+        in-flight retain job 会与解释器 teardown 竞态。
+        """
+        if self._atexit_registered:
+            return
+        self._atexit_registered = True
+        atexit.register(self._atexit_shutdown)
+
+    def _atexit_shutdown(self) -> None:
+        if self._shutting_down.is_set():
+            return
+        try:
+            self.shutdown()
+        except Exception as exc:
+            logger.debug("RemoteSemantic atexit shutdown failed: %s", exc)

@@ -9,8 +9,8 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到能挂载长期记忆。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级 AI Agent，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v11 已完成 — 知识图谱记忆（Hindsight 1:1 复现）。服务端做实体/关系/事实抽取，多策略检索（语义+图遍历），LLM reflect 合成，Provider 支持 context/tools/hybrid 三种模式。
-- **核心叙事**：通过 V0→V11 的 12 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱。
+- **当前阶段**：v12 已完成 — RemoteSemanticProvider 引入单写者线程 + queue + sentinel，retain 入队即返回，主循环不再被 LLM 抽取 + embedding 阻塞 2-5s。
+- **核心叙事**：通过 V0→V12 的 13 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 异步写入。
 
 ---
 
@@ -44,9 +44,10 @@
 | v9 | Agent Loop 生命周期 | prefetch / sync_turn 钩子 | ✅ |
 | v10 | RemoteSemanticProvider | HTTP 边界（mock dict） | ✅ |
 | v10.1 | pgvector + OpenAI embedding | 真实向量存储 + 范式 embedding | ✅ |
-| **v11** | **知识图谱记忆（Hindsight 1:1）** | **实体/关系/事实抽取 + 多策略检索 + reflect 合成 + memory mode** | **✅ 已完成** |
+| v11 | 知识图谱记忆（Hindsight 1:1） | 实体/关系/事实抽取 + 多策略检索 + reflect 合成 + memory mode | ✅ |
+| **v12** | **异步 retain（后台 writer 线程）** | **queue + sentinel 优雅关闭 + lazy 启动 + atexit 兜底** | **✅ 已完成** |
 
-**下一档候选**（未启动）：v12 异步 retain（后台线程 + 队列）。
+**下一档候选**（未启动）：v13 后台 prefetch（预热下一轮 recall）/ 上下文压缩 `on_pre_compress` 钩子。
 
 ---
 
@@ -158,6 +159,21 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 - **原因**：对齐源项目命名，让模型能主动存储重要信息、搜索记忆、请求合成回答。
 - **DB schema**：banks + documents + entities + relations + facts 五表，对应 Hindsight 的数据模型。实体用 `UNIQUE(bank_id, name)` 做去重，关系用三元组唯一约束，facts 用同实体+高相似度做覆盖更新。
 
+### v12 — 异步 retain（后台 writer 线程）
+- **选 1**：`queue.Queue` + 单写者守护线程 + sentinel 对象关闭。
+- **没选**：`asyncio.create_task` / `concurrent.futures.ThreadPoolExecutor` / `multiprocessing`。原因：(a) 主循环是同步的，引入 asyncio 要改太多上游；(b) 池没必要 — retain 必须 FIFO 串行（向量去重要看已有 fact，并发会写出重复）；(c) 进程隔离对教学场景过重。Queue + 单线程 + sentinel 是 stdlib 内置且能完整演示"生产者/消费者 + 优雅关闭"的最小形态。
+- **选 2**：lazy 启动 writer（首次 enqueue 才起线程），不在 `initialize()` 启动。
+- **原因**：纯 `tools` 模式且模型从不主动 retain 时，挂一个空闲线程是浪费。源项目同样 lazy。
+- **选 3**：`shutdown` 三步走 — set `_shutting_down` → put sentinel → bounded `join(timeout=10)`。
+- **原因**：先停收避免新 job 永远 drain 不完；sentinel 让 writer 自然退出（比设标志更显式）；bounded join 兜底守护线程被 wedge 的极端情况，不让进程卡死。
+- **选 4**：`atexit` 注册幂等钩子。
+- **原因**：CLI 不走 `MemoryManager.shutdown_all()` 直接 ctrl-C 退出时，in-flight job 会和解释器 teardown 竞态（aiohttp/asyncio 资源未关闭警告）。atexit 兜底，且与显式 shutdown 之间用 `_shutting_down` 标志互斥。
+- **选 5**：`sync_turn` 入队、`hindsight_retain` 工具仍同步。
+- **原因**：模型显式 call retain 时期待立即拿到 "stored successfully" 反馈做下一步推理；隐式 sync_turn 没有调用方等返回，正是异步化的最佳目标。源项目同样区分对待。
+- **选 6**：单 job 异常被 `try/except` 吞下并 `logger.warning`，writer 不退出。
+- **原因**：写者必须始终活着直到 sentinel — 一次 HTTP 失败不能让后续 N 次入队的 retain 全部丢失。
+- **验证**：`scripts/test_v12_writer.py` 7 项单元测试覆盖（入队不阻塞、FIFO 顺序、单 job 失败不杀线程、shutdown drain、幂等、shutdown 后丢弃、lazy 启动）；`scripts/test_v12_e2e.py` 真实 mock server 端到端验证：3 次 retain 主循环阻塞从 5103ms 降到 0.1ms（100% 减少）。
+
 ---
 
 ## 7. 待办 / 已知问题
@@ -167,9 +183,10 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 - [x] `docs/memory-nano-vs-source.md` 已完成（记忆系统全景对比）。
 - [ ] V11 知识图谱抽取 prompt 需要根据实际使用效果调优（当前是通用版）。
 - [ ] V11 事实去重阈值 `FACT_DEDUP_THRESHOLD=0.92` 需要实测验证。
-- [ ] V11 `/retain` 含 LLM 调用 + 多次 embedding，单次约 2-5s — 仍是 v12 异步化的入口痛点。
+- [x] ~~V11 `/retain` 含 LLM 调用 + 多次 embedding，单次约 2-5s~~ — V12 已通过后台 writer 解决（主循环 0 阻塞）。
 - [ ] V11 图遍历目前只做 1-hop，复杂场景可能需要 2-hop。
-- [ ] V11 `docs/memory-nano-vs-source.md` 需要更新以反映 V11 的变化。
+- [ ] V12 后只剩 prefetch 同步阻塞（200-500ms/轮）— V13 候选：后台 prefetch 预热下一轮。
+- [ ] V12 仍未实现 `on_session_switch`：切 session 时 buffer 没 flush，可能丢入队中的 retain。
 
 ---
 
