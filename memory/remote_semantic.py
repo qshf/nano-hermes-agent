@@ -1,28 +1,21 @@
 """
-RemoteSemanticProvider — V10 引入，V10.1 同步演进出 Hindsight 路线配置。
+RemoteSemanticProvider — V11 知识图谱版（Hindsight 1:1 复现）。
 
-V10.1 变化（相对 V10）：
-- 仅"配置项"层面演进，**HTTP 请求时序 0 改动**——这正是 V7 抽 ABC 的最终验证点。
-- 新增 budget（low/mid/high）/ min_score / auto_retain，对齐 Hindsight 的
-  recall_budget / recall_min_score / auto_retain 三个核心配置。
-- 服务端把假向量换成 OpenAI embedding、把 dict 换成 pgvector，
-  Provider 端**一行业务逻辑不改**，只是请求体多带了几个可选字段。
+V11 变化（相对 V10.1）：
+- 支持 memory_mode: context / tools / hybrid
+- 暴露 hindsight_retain / hindsight_recall / hindsight_reflect 三个工具
+- sync_turn 调 /retain（服务端做实体/关系/事实抽取）
+- prefetch 支持 recall / reflect 两种方式
 
-钩子到端点的 1:1 映射（保持不变）：
-    is_available()       GET  /healthz
-    initialize()         (无网络，仅缓存 base_url 和 session_id)
-    prefetch(query)      POST /recall   {query, session_id, k, budget, min_score}
-    sync_turn(u, a)      POST /sync     {user, assistant, session_id}
-    system_prompt_block  (无网络，固定一行文本)
-    get_tool_schemas     (返回空列表)
-    shutdown()           关闭 httpx client
-
-对应源项目：plugins/memory/hindsight/__init__.py 的 `local_external` 模式
-（指向已有 Hindsight 实例的 HTTP 调用形态）。
+对应源项目：plugins/memory/hindsight/__init__.py
+- context 模式 = 纯 prefetch 注入（模型不感知记忆工具）
+- tools 模式 = 暴露工具让模型主动调用（不自动 prefetch）
+- hybrid 模式 = 两者并存（自动 prefetch + 模型可主动调用）
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -32,68 +25,122 @@ from memory.provider import MemoryProvider
 
 logger = logging.getLogger(__name__)
 
-
-# Hindsight 路线：budget 是召回广度的语义档位。
-# Provider 端不解析（服务端把 budget → k 的映射兜底），但保留这个抽象层，
-# 让运维同学按"质量"而不是"数量"思考召回 — 这是源项目的设计意图。
 _VALID_BUDGETS = {"low", "mid", "high"}
+_VALID_MODES = {"context", "tools", "hybrid"}
+
+
+# ─── Tool Schemas（对齐源项目 Hindsight 命名）────────────────────────────────
+
+RETAIN_SCHEMA = {
+    "name": "hindsight_retain",
+    "description": (
+        "Store information to long-term memory. The server automatically "
+        "extracts entities, relations, and facts for knowledge graph storage."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "The information to store in long-term memory.",
+            },
+            "context": {
+                "type": "string",
+                "description": "Short label for categorization (e.g. 'user preference', 'project decision').",
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional tags for filtering during recall.",
+            },
+        },
+        "required": ["content"],
+    },
+}
+
+RECALL_SCHEMA = {
+    "name": "hindsight_recall",
+    "description": (
+        "Search long-term memory using semantic search, entity matching, "
+        "and knowledge graph traversal. Returns ranked results."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "What to search for in long-term memory.",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+REFLECT_SCHEMA = {
+    "name": "hindsight_reflect",
+    "description": (
+        "Synthesize a reasoned answer from long-term memories. Unlike recall, "
+        "this reasons across all stored knowledge to produce a coherent response."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The question to reflect on using long-term memory.",
+            },
+        },
+        "required": ["query"],
+    },
+}
 
 
 class RemoteSemanticProvider(MemoryProvider):
-    """通过 HTTP 调用远端语义记忆服务。
+    """通过 HTTP 调用远端知识图谱记忆服务（Hindsight 模式）。
 
-    base_url 通过环境变量 MEMORY_SERVICE_URL 传入（详见 agent.py）。
-    V10.1 服务端实现见 scripts/mock_memory_server.py（pgvector + OpenAI embedding）。
+    支持三种 memory_mode：
+    - context: 纯 prefetch 注入，模型不感知记忆工具
+    - tools: 暴露 retain/recall/reflect 工具，模型主动调用
+    - hybrid: 两者并存（自动 prefetch + 模型可主动调用）
     """
 
     def __init__(
         self,
         base_url: str,
         *,
-        top_k: int | None = None,
+        bank_id: str = "hermes",
         budget: str = "mid",
-        min_score: float = 0.0,
+        memory_mode: str = "hybrid",
+        prefetch_method: str = "recall",
         auto_retain: bool = True,
-        timeout: float = 15.0,
+        auto_recall: bool = True,
+        retain_tags: list[str] | None = None,
+        timeout: float = 360.0,
     ) -> None:
-        """
-        参数：
-            base_url:    远端服务根 URL（不带尾斜杠）
-            top_k:       显式召回数。设了就忽略 budget（服务端约定）
-            budget:      Hindsight 风格的召回档位 low/mid/high；服务端映射为 k=2/5/10
-            min_score:   余弦相似度阈值（0.0-1.0），服务端在 SQL 之后过滤
-            auto_retain: False 时 sync_turn 跳过 — 不持久化对话
-            timeout:     httpx 超时（V10.1 调到 15s，embedding API 可能比假向量慢一档）
-        """
         self._base_url = base_url.rstrip("/")
-        self._top_k = top_k
+        self._bank_id = bank_id
         self._budget = budget.lower() if budget else "mid"
         if self._budget not in _VALID_BUDGETS:
-            logger.warning(
-                "Invalid budget %r, falling back to 'mid' (valid: %s)",
-                budget, sorted(_VALID_BUDGETS),
-            )
+            logger.warning("Invalid budget %r, falling back to 'mid'", budget)
             self._budget = "mid"
-        self._min_score = max(0.0, min(1.0, min_score))
+        self._memory_mode = memory_mode.lower() if memory_mode else "hybrid"
+        if self._memory_mode not in _VALID_MODES:
+            logger.warning("Invalid memory_mode %r, falling back to 'hybrid'", memory_mode)
+            self._memory_mode = "hybrid"
+        self._prefetch_method = prefetch_method.lower()
         self._auto_retain = auto_retain
+        self._auto_recall = auto_recall
+        self._retain_tags = retain_tags or []
         self._session_id: str = ""
         self._client = httpx.Client(timeout=timeout)
-
-    # -- 标识 ------------------------------------------------------------
 
     @property
     def name(self) -> str:
         return "remote_semantic"
 
-    # -- 生命周期 --------------------------------------------------------
+    # ─── 生命周期 ────────────────────────────────────────────────────────
 
     def is_available(self) -> bool:
-        """探活 — 检查远端 /healthz 端点。
-
-        V10.1 服务端 /healthz 会顺手检测 DB 连通性并返回 ok=True/False，
-        但这里只看 HTTP 200 即可（is_available 的语义是"能不能调"，
-        不是"能不能产出有效结果"）。manager 失败时跳过本 provider。
-        """
         try:
             resp = self._client.get(f"{self._base_url}/healthz")
             return resp.status_code == 200
@@ -102,7 +149,6 @@ class RemoteSemanticProvider(MemoryProvider):
             return False
 
     def initialize(self, session_id: str = "", **kwargs) -> None:
-        """缓存 session_id — 后续 recall/sync 都带上它做隔离。"""
         self._session_id = session_id
 
     def shutdown(self) -> None:
@@ -111,70 +157,49 @@ class RemoteSemanticProvider(MemoryProvider):
         except Exception:
             pass
 
-    # -- prompt / 工具 ---------------------------------------------------
+    # ─── prompt / 工具 ───────────────────────────────────────────────────
 
     def system_prompt_block(self) -> str:
-        """固定一行 — 告诉模型有外部长期记忆可用。
-
-        实际召回内容走 prefetch 注入 user message，不在这里展开
-        （静态 system prompt 不能含每轮变化的内容，否则破坏前缀缓存）。
-        """
+        if self._memory_mode == "tools":
+            return (
+                "You have access to long-term memory tools (hindsight_retain, "
+                "hindsight_recall, hindsight_reflect). Use them to store and "
+                "retrieve important information across sessions."
+            )
         return "Long-term semantic memory is available; relevant context will be recalled per turn."
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        """无工具 — 召回是隐式的（prefetch 钩子触发）。
+        """根据 memory_mode 返回工具 schema。
 
-        与 BuiltinMemoryProvider 形成对照：
-        - builtin 用 tool 让模型显式调用 add/replace/remove
-        - remote_semantic 用 prefetch 钩子在每轮自动召回
+        - context 模式：不暴露工具（纯隐式 prefetch）
+        - tools / hybrid 模式：暴露 retain/recall/reflect 三个工具
         """
-        return []
+        if self._memory_mode == "context":
+            return []
+        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
 
-    # -- V9 生命周期钩子 -------------------------------------------------
+    def handle_tool_call(self, tool_name: str, args: dict[str, Any]) -> str:
+        """路由工具调用到对应 HTTP 端点。"""
+        if tool_name == "hindsight_retain":
+            return self._tool_retain(args)
+        elif tool_name == "hindsight_recall":
+            return self._tool_recall(args)
+        elif tool_name == "hindsight_reflect":
+            return self._tool_reflect(args)
+        return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+    # ─── V9 生命周期钩子 ─────────────────────────────────────────────────
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """每轮前调用远端 /recall 端点，返回拼接好的召回文本。
-
-        V10.1 请求体增量字段（全可选，老服务端会忽略）：
-            budget=low/mid/high  → 服务端语义档位
-            min_score=0.3        → 服务端 SQL 后过滤
-
-        失败返回空串 — manager 的 prefetch_all 会跳过空结果，
-        不会把空围栏注入 user message。
-        """
-        payload: dict[str, Any] = {
-            "query": query,
-            "session_id": session_id or self._session_id,
-            "budget": self._budget,
-            "min_score": self._min_score,
-        }
-        # 显式 top_k 优先（服务端约定 k 存在则忽略 budget）
-        if self._top_k is not None:
-            payload["k"] = self._top_k
-
-        try:
-            resp = self._client.post(f"{self._base_url}/recall", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logger.warning("RemoteSemantic /recall failed: %s", e)
+        """每轮前自动召回（context / hybrid 模式生效）。"""
+        if self._memory_mode == "tools":
+            return ""
+        if not self._auto_recall:
             return ""
 
-        hits = data.get("hits") or []
-        if not hits:
-            return ""
-
-        lines = []
-        for i, hit in enumerate(hits, 1):
-            text = (hit.get("text") or "").strip()
-            score = hit.get("score")
-            if not text:
-                continue
-            if isinstance(score, (int, float)):
-                lines.append(f"[{i}] (score={score:.3f}) {text}")
-            else:
-                lines.append(f"[{i}] {text}")
-        return "\n".join(lines)
+        if self._prefetch_method == "reflect":
+            return self._do_reflect(query)
+        return self._do_recall(query)
 
     def sync_turn(
         self,
@@ -183,25 +208,121 @@ class RemoteSemanticProvider(MemoryProvider):
         *,
         session_id: str = "",
     ) -> None:
-        """每轮 tool loop 结束后，把对话推到 /sync 端点持久化。
-
-        V10.1 仍是同步阻塞 — embedding API 让单次 sync 涨到约 200-500ms，
-        生产实现该走后台线程 + 队列（Hindsight 的 aretain_batch 模式）。
-        nano 保留同步，保持时序清晰可读。
-
-        auto_retain=False 时跳过 — 应用方在不需要持久化时（评估、回放、
-        debug）可关闭，免得污染长期记忆。
-        """
+        """每轮结束后调 /retain — 服务端做知识图谱抽取。"""
         if not self._auto_retain:
             return
 
+        content = f"User: {user_content}\nAssistant: {assistant_content}"
         payload = {
-            "user": user_content,
-            "assistant": assistant_content,
-            "session_id": session_id or self._session_id,
+            "bank_id": self._bank_id,
+            "content": content,
+            "document_id": session_id or self._session_id,
+            "tags": self._retain_tags,
+            "update_mode": "append",
         }
         try:
-            resp = self._client.post(f"{self._base_url}/sync", json=payload)
+            resp = self._client.post(f"{self._base_url}/retain", json=payload)
             resp.raise_for_status()
         except Exception as e:
-            logger.warning("RemoteSemantic /sync failed: %s", e)
+            logger.warning("RemoteSemantic /retain failed: %s", e)
+
+    # ─── 内部方法 ────────────────────────────────────────────────────────
+
+    def _do_recall(self, query: str) -> str:
+        """调 /recall 端点，格式化返回。"""
+        payload = {
+            "bank_id": self._bank_id,
+            "query": query,
+            "budget": self._budget,
+        }
+        try:
+            resp = self._client.post(f"{self._base_url}/recall", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.warning("RemoteSemantic /recall failed: %s", e)
+            return ""
+
+        results = data.get("results") or []
+        if not results:
+            return ""
+
+        lines = []
+        for i, hit in enumerate(results, 1):
+            text = (hit.get("text") or "").strip()
+            score = hit.get("score")
+            source = hit.get("source", "")
+            if not text:
+                continue
+            prefix = f"[{i}]"
+            if isinstance(score, (int, float)):
+                prefix += f" (score={score:.3f}"
+                if source:
+                    prefix += f", {source}"
+                prefix += ")"
+            lines.append(f"{prefix} {text}")
+        return "\n".join(lines)
+
+    def _do_reflect(self, query: str) -> str:
+        """调 /reflect 端点，返回合成文本。"""
+        payload = {
+            "bank_id": self._bank_id,
+            "query": query,
+            "budget": self._budget,
+        }
+        try:
+            resp = self._client.post(f"{self._base_url}/reflect", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.warning("RemoteSemantic /reflect failed: %s", e)
+            return ""
+        return data.get("text", "")
+
+    def _tool_retain(self, args: dict[str, Any]) -> str:
+        """hindsight_retain 工具实现。"""
+        payload = {
+            "bank_id": self._bank_id,
+            "content": args.get("content", ""),
+            "context": args.get("context", ""),
+            "document_id": self._session_id,
+            "tags": args.get("tags", []) + self._retain_tags,
+        }
+        try:
+            resp = self._client.post(f"{self._base_url}/retain", json=payload)
+            resp.raise_for_status()
+            return json.dumps(resp.json(), ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    def _tool_recall(self, args: dict[str, Any]) -> str:
+        """hindsight_recall 工具实现。"""
+        payload = {
+            "bank_id": self._bank_id,
+            "query": args.get("query", ""),
+            "budget": self._budget,
+        }
+        try:
+            resp = self._client.post(f"{self._base_url}/recall", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            results = data.get("results", [])
+            if not results:
+                return json.dumps({"results": [], "message": "No relevant memories found."})
+            return json.dumps(data, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    def _tool_reflect(self, args: dict[str, Any]) -> str:
+        """hindsight_reflect 工具实现。"""
+        payload = {
+            "bank_id": self._bank_id,
+            "query": args.get("query", ""),
+            "budget": self._budget,
+        }
+        try:
+            resp = self._client.post(f"{self._base_url}/reflect", json=payload)
+            resp.raise_for_status()
+            return json.dumps(resp.json(), ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"error": str(e)})

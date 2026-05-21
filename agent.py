@@ -1,22 +1,26 @@
 """
-Nano Hermes Agent — V10.1: 外部 Provider（HTTP 服务 + pgvector + OpenAI embedding）
+Nano Hermes Agent — V11: 知识图谱记忆（Hindsight 1:1 复现）
 
-架构变化（相比 V10）：
-- HTTP 时序 0 改动 — Provider 端与 V10 完全一致的钩子触发顺序
-- 配置面演进（同步 Hindsight 路线）：从 .env 读取 budget / min_score / auto_retain
-- 服务端：dict + md5 假向量 → pgvector + OpenAI embedding（真正能做语义检索）
+架构变化（相比 V10.1）：
+- Provider 支持 memory_mode: context / tools / hybrid
+- 暴露 hindsight_retain / hindsight_recall / hindsight_reflect 三个工具
+- 服务端从扁平存储升级为知识图谱（entities + relations + facts）
+- sync_turn 调 /retain（服务端做实体/关系/事实抽取）
 
-env 开关（不设则只挂 builtin，行为同 V9）：
+env 开关：
     MEMORY_SERVICE_URL          外部记忆服务 URL（设了才挂 remote_semantic）
     MEMORY_SESSION_ID           会话隔离 id（默认 default）
+    MEMORY_BANK_ID              bank 命名空间（默认 hermes）
+    MEMORY_MODE                 context / tools / hybrid（默认 hybrid）
+    MEMORY_PREFETCH_METHOD      recall / reflect（默认 recall）
     MEMORY_RECALL_BUDGET        low / mid / high（默认 mid → k=5）
-    MEMORY_MIN_SCORE            0.0-1.0 相似度阈值（默认 0.0）
-    MEMORY_AUTO_RETAIN          1/0（默认 1，关掉 sync_turn）
+    MEMORY_AUTO_RETAIN          1/0（默认 1）
+    MEMORY_AUTO_RECALL          1/0（默认 1）
+    MEMORY_RETAIN_TAGS          逗号分隔的 tags（默认空）
 
 启动顺序（另开终端）：
-    docker compose up -d                                 # pgvector
-    uv pip install -e ".[mock-server]"
-    python scripts/mock_memory_server.py                 # FastAPI + OpenAI embedding
+    docker compose down -v && docker compose up -d   # 重建 DB（schema 变了）
+    python scripts/mock_memory_server.py
     export MEMORY_SERVICE_URL=http://127.0.0.1:8765
     python agent.py
 """
@@ -48,15 +52,21 @@ memory_manager = MemoryManager()
 memory_manager.add_provider(BuiltinMemoryProvider())
 
 # V10/V10.1: 按需注册远端语义记忆 provider（mock 服务见 scripts/mock_memory_server.py）
-# 没设环境变量就不挂 — 零额外配置时行为完全等同 V9。
-# V10.1 新增 budget/min_score/auto_retain 三项配置（同步 Hindsight 路线）。
+# V11: 支持 memory_mode / prefetch_method / bank_id / retain_tags 配置
 _remote_url = os.environ.get("MEMORY_SERVICE_URL", "").strip()
 if _remote_url:
+    _tags_raw = os.environ.get("MEMORY_RETAIN_TAGS", "").strip()
+    _retain_tags = [t.strip() for t in _tags_raw.split(",") if t.strip()] if _tags_raw else []
+
     _remote = RemoteSemanticProvider(
         base_url=_remote_url,
+        bank_id=os.environ.get("MEMORY_BANK_ID", "hermes"),
         budget=os.environ.get("MEMORY_RECALL_BUDGET", "mid"),
-        min_score=float(os.environ.get("MEMORY_MIN_SCORE", "0.0")),
+        memory_mode=os.environ.get("MEMORY_MODE", "hybrid"),
+        prefetch_method=os.environ.get("MEMORY_PREFETCH_METHOD", "recall"),
         auto_retain=os.environ.get("MEMORY_AUTO_RETAIN", "1") not in ("0", "false", "False", ""),
+        auto_recall=os.environ.get("MEMORY_AUTO_RECALL", "1") not in ("0", "false", "False", ""),
+        retain_tags=_retain_tags,
     )
     if _remote.is_available():
         memory_manager.add_provider(_remote)
@@ -94,7 +104,7 @@ def run_agent():
     builtin_provider = memory_manager.get_provider("builtin")
 
     print("=" * 60)
-    print("  Nano Hermes Agent v10.1 — Remote Memory (pgvector + OpenAI embedding)")
+    print("  Nano Hermes Agent v11 — Knowledge Graph Memory (Hindsight 1:1)")
     print(f"  Model: {model}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
     print(f"  Memory providers: {[p.name for p in memory_manager.providers]}")

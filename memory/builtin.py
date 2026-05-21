@@ -24,14 +24,16 @@ MEMORY_SCHEMA = {
     "name": "memory",
     "description": (
         "Manage your persistent memory. Use this to remember important information "
-        "across sessions: user preferences, project context, corrections, etc."
+        "across sessions: user preferences, project context, corrections, etc.\n\n"
+        "ACTIONS: add (new entry), replace (update existing), remove (delete), "
+        "read (view current live state)."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
+                "enum": ["add", "replace", "remove", "read"],
                 "description": "Action to perform on memory.",
             },
             "content": {
@@ -78,6 +80,12 @@ class BuiltinMemoryProvider(MemoryProvider):
             result = self._store.replace(old_text, content)
         elif action == "remove":
             result = self._store.remove(old_text)
+        elif action == "read":
+            result = {
+                "entries": self._store.entries,
+                "count": len(self._store.entries),
+                "usage": f"{self._store.char_count()}/{self._store.char_limit} chars",
+            }
         else:
             result = {"error": f"Unknown action: {action}"}
 

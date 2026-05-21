@@ -1,40 +1,97 @@
--- V10.1 — pgvector schema for nano_memory
+-- V11 — Knowledge Graph schema for nano_memory (Hindsight 1:1 reproduction)
 --
 -- 由 docker-compose 在数据库首次初始化时执行（仅当数据卷为空）。
--- 教学项目：手动改完之后只能 `docker compose down -v` 重置，
--- 不引入 migration 工具（alembic）以保持单进程可读。
+-- 教学项目：手动改完之后只能 `docker compose down -v` 重置。
 --
--- ⚠️ 维度必须与 .env 里的 EMBEDDING_DIM 一致 ⚠️
--- 常见模型默认维度（写在这里方便对照修改）：
---   text-embedding-3-small      → 1536（也支持 dimensions 截断到 512/256）
---   text-embedding-3-large      → 3072（也支持截断到 1024/512/256）
+-- ⚠️ VECTOR(N) 维度必须与 .env 里的 EMBEDDING_DIM 一致 ⚠️
+-- 常见模型默认维度：
+--   text-embedding-3-small      → 1536
+--   text-embedding-3-large      → 3072
 --   DashScope text-embedding-v3 → 1024
 --   BGE / bge-large-zh-v1.5     → 1024
 --   Ollama nomic-embed-text     → 768
---
--- 改维度的步骤：
---   1) 改下方 VECTOR(N) 与 .env 的 EMBEDDING_DIM 同步
---   2) docker compose down -v   # 删卷，让 init.sql 下次重跑
---   3) docker compose up -d
--- mock server 启动时会自检维度，不一致直接 fail-fast。
 
 CREATE EXTENSION IF NOT EXISTS vector;
 
-CREATE TABLE IF NOT EXISTS memories (
+-- ─── Banks: 命名空间隔离（对应 Hindsight 的 bank 概念）─────────────────────
+CREATE TABLE IF NOT EXISTS banks (
     id          BIGSERIAL PRIMARY KEY,
-    session_id  TEXT        NOT NULL DEFAULT '',
-    text        TEXT        NOT NULL,
-    embedding   VECTOR(1024) NOT NULL,  -- 与 .env 的 EMBEDDING_DIM 一致
+    bank_id     TEXT UNIQUE NOT NULL,
+    mission     TEXT NOT NULL DEFAULT '',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 按 session 过滤是热路径（recall 总要先按 session_id 过滤）
-CREATE INDEX IF NOT EXISTS memories_session_idx
-    ON memories (session_id);
+-- ─── Documents: 逻辑容器（一个 session/对话 对应一个 document）────────────────
+CREATE TABLE IF NOT EXISTS documents (
+    id          BIGSERIAL PRIMARY KEY,
+    bank_id     TEXT NOT NULL REFERENCES banks(bank_id) ON DELETE CASCADE,
+    document_id TEXT NOT NULL,
+    update_mode TEXT NOT NULL DEFAULT 'append',
+    metadata    JSONB NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(bank_id, document_id)
+);
 
--- ivfflat 是 pgvector 推荐的近似最近邻索引；lists=100 适合 <1M 行。
--- 行数大时 lists 应该 ≈ sqrt(rows)，但教学 demo 用固定值最简单。
--- vector_cosine_ops 对应 `<=>` 操作符（cosine distance）。
-CREATE INDEX IF NOT EXISTS memories_embedding_idx
-    ON memories USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
+-- ─── Entities: 抽取的命名实体（人、项目、工具、偏好等）──────────────────────
+CREATE TABLE IF NOT EXISTS entities (
+    id          BIGSERIAL PRIMARY KEY,
+    bank_id     TEXT NOT NULL REFERENCES banks(bank_id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    entity_type TEXT NOT NULL DEFAULT '',
+    embedding   VECTOR(1024) NOT NULL,
+    metadata    JSONB NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(bank_id, name)
+);
+
+-- ─── Relations: 实体间关系（uses, prefers, works_on, knows 等）───────────────
+CREATE TABLE IF NOT EXISTS relations (
+    id              BIGSERIAL PRIMARY KEY,
+    bank_id         TEXT NOT NULL REFERENCES banks(bank_id) ON DELETE CASCADE,
+    source_entity   TEXT NOT NULL,
+    relation_type   TEXT NOT NULL,
+    target_entity   TEXT NOT NULL,
+    weight          FLOAT NOT NULL DEFAULT 1.0,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(bank_id, source_entity, relation_type, target_entity)
+);
+
+-- ─── Facts: 原子知识语句，关联实体和文档 ─────────────────────────────────────
+CREATE TABLE IF NOT EXISTS facts (
+    id          BIGSERIAL PRIMARY KEY,
+    bank_id     TEXT NOT NULL REFERENCES banks(bank_id) ON DELETE CASCADE,
+    document_id TEXT NOT NULL DEFAULT '',
+    entity_name TEXT NOT NULL DEFAULT '',
+    text        TEXT NOT NULL,
+    embedding   VECTOR(1024) NOT NULL,
+    tags        TEXT[] NOT NULL DEFAULT '{}',
+    metadata    JSONB NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ─── Indexes ────────────────────────────────────────────────────────────────
+
+CREATE INDEX IF NOT EXISTS entities_bank_idx ON entities(bank_id);
+CREATE INDEX IF NOT EXISTS entities_embedding_idx
+    ON entities USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+
+CREATE INDEX IF NOT EXISTS relations_bank_idx ON relations(bank_id);
+CREATE INDEX IF NOT EXISTS relations_source_idx ON relations(bank_id, source_entity);
+CREATE INDEX IF NOT EXISTS relations_target_idx ON relations(bank_id, target_entity);
+
+CREATE INDEX IF NOT EXISTS facts_bank_idx ON facts(bank_id);
+CREATE INDEX IF NOT EXISTS facts_entity_idx ON facts(bank_id, entity_name);
+CREATE INDEX IF NOT EXISTS facts_document_idx ON facts(bank_id, document_id);
+CREATE INDEX IF NOT EXISTS facts_embedding_idx
+    ON facts USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+CREATE INDEX IF NOT EXISTS facts_tags_idx ON facts USING gin(tags);
+
+-- ─── Seed default bank ──────────────────────────────────────────────────────
+
+INSERT INTO banks (bank_id, mission)
+VALUES ('hermes', 'Default memory bank for nano hermes agent')
+ON CONFLICT (bank_id) DO NOTHING;
