@@ -8,6 +8,7 @@ V9 新增：广播生命周期事件到所有 provider，并提供上下文围�
 - prefetch_all() — 收集召回内容，sanitize → 围栏 → 注入 user message
 - sync_all() — 持久化完成的对话到所有 provider
 - queue_prefetch_all() — 预热下一轮的 recall（V13）
+- on_session_switch_all() — 切换会话时 drain + 清缓存 + 轮转 session_id（V14）
 - 围栏辅助：sanitize_context / build_memory_context_block
 
 为什么前缀缓存敏感：召回结果每轮都不同，绝不能放进 system prompt
@@ -343,6 +344,30 @@ class MemoryManager:
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' queue_prefetch() failed: %s",
+                    provider.name,
+                    e,
+                )
+
+    def on_session_switch_all(
+        self,
+        new_session_id: str,
+        *,
+        reset: bool = False,
+        **kwargs,
+    ) -> None:
+        """广播 on_session_switch 到所有 provider。
+
+        切换会话时调用。每个 provider 应在此 drain 旧会话的 pending 写入、
+        清除 prefetch 缓存、轮转 session_id。单个 provider 失败不阻塞其他。
+        """
+        for provider in self._providers:
+            try:
+                provider.on_session_switch(
+                    new_session_id, reset=reset, **kwargs
+                )
+            except Exception as e:
+                logger.warning(
+                    "Memory provider '%s' on_session_switch() failed: %s",
                     provider.name,
                     e,
                 )

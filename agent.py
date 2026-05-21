@@ -1,11 +1,12 @@
 """
-Nano Hermes Agent — V11: 知识图谱记忆（Hindsight 1:1 复现）
+Nano Hermes Agent — V14: 会话切换（on_session_switch 生命周期钩子）
 
-架构变化（相比 V10.1）：
-- Provider 支持 memory_mode: context / tools / hybrid
-- 暴露 hindsight_retain / hindsight_recall / hindsight_reflect 三个工具
-- 服务端从扁平存储升级为知识图谱（entities + relations + facts）
-- sync_turn 调 /retain（服务端做实体/关系/事实抽取）
+架构变化（相比 V13）：
+- 新增 /new 命令：创建全新会话（drain + 清缓存 + 新 session_id）
+- 新增 /resume <id> 命令：切回已有会话
+- 新增 /session 命令：查看当前 session_id
+- MemoryManager 广播 on_session_switch_all 到所有 provider
+- RemoteSemanticProvider 实现 4 步切换（drain writer → join prefetch → rotate → log）
 
 env 开关：
     MEMORY_SERVICE_URL          外部记忆服务 URL（设了才挂 remote_semantic）
@@ -27,6 +28,7 @@ env 开关：
 
 import json
 import os
+import uuid
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -103,9 +105,13 @@ def run_agent():
     # V8: 通过 manager 拿到内置 provider，用于 banner 和 /memory 命令
     builtin_provider = memory_manager.get_provider("builtin")
 
+    # V14: 跟踪当前 session_id
+    current_session_id = os.environ.get("MEMORY_SESSION_ID", "default")
+
     print("=" * 60)
-    print("  Nano Hermes Agent v11 — Knowledge Graph Memory (Hindsight 1:1)")
+    print("  Nano Hermes Agent v14 — Session Switch (on_session_switch)")
     print(f"  Model: {model}")
+    print(f"  Session: {current_session_id}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
     print(f"  Memory providers: {[p.name for p in memory_manager.providers]}")
     if builtin_provider is not None:
@@ -115,6 +121,7 @@ def run_agent():
               f"usage: {store.char_count()}/{store.char_limit} chars")
     print(f"  Available tools: {', '.join(get_available_tool_names(ENABLED_TOOLSETS))}")
     print(f"  Memory tools: {', '.join(sorted(memory_manager.get_all_tool_names()))}")
+    print("  Commands: /memory /tools /load /mcp /plugin /new /resume /session")
     print("  输入 'quit' 退出")
     print("=" * 60)
     print()
@@ -267,6 +274,35 @@ def run_agent():
                 print(f"  [toolset] {ENABLED_TOOLSETS}")
                 print(f"  [available] {', '.join(available)}")
                 print(f"  [registered] {', '.join(registry.tool_names)}")
+                continue
+
+            # /session 命令：查看当前 session_id
+            if user_input == "/session":
+                print(f"  [session] {current_session_id}")
+                continue
+
+            # /new 命令：创建全新会话
+            if user_input == "/new":
+                new_id = f"session-{uuid.uuid4().hex[:8]}"
+                memory_manager.on_session_switch_all(new_id, reset=True)
+                current_session_id = new_id
+                messages = [{"role": "system", "content": build_system_prompt()}]
+                turn_count = 0
+                print(f"  [session] New session: {current_session_id}")
+                continue
+
+            # /resume 命令：切回已有会话
+            if user_input.startswith("/resume"):
+                parts = user_input.split(maxsplit=1)
+                if len(parts) < 2 or not parts[1].strip():
+                    print("  Usage: /resume <session_id>")
+                    continue
+                target_id = parts[1].strip()
+                memory_manager.on_session_switch_all(target_id, reset=False)
+                current_session_id = target_id
+                messages = [{"role": "system", "content": build_system_prompt()}]
+                turn_count = 0
+                print(f"  [session] Resumed: {current_session_id}")
                 continue
 
             # V9 生命周期：每轮开始通知 + prefetch 召回

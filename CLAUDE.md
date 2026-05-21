@@ -9,8 +9,8 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到能挂载长期记忆。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级 AI Agent，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v13 已完成 — RemoteSemanticProvider 引入两阶段 prefetch（queue_prefetch 后台预热 + prefetch 消费缓存），第 2 轮起 recall 不再阻塞主循环。
-- **核心叙事**：通过 V0→V13 的 14 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步。
+- **当前阶段**：v14 已完成 — on_session_switch 生命周期钩子，运行期通过 /new + /resume 切换会话，切换时 drain writer queue + 清 prefetch 缓存 + 轮转 session_id。
+- **核心叙事**：通过 V0→V14 的 15 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换。
 
 ---
 
@@ -28,7 +28,7 @@
 
 ---
 
-## 3. 进度状态（12 档迭代）
+## 3. 进度状态（15 档迭代）
 
 | 版本 | 标题 | 引入概念 | 状态 |
 |------|------|---------|------|
@@ -47,8 +47,9 @@
 | v11 | 知识图谱记忆（Hindsight 1:1） | 实体/关系/事实抽取 + 多策略检索 + reflect 合成 + memory mode | ✅ |
 | v12 | 异步 retain（后台 writer 线程） | queue + sentinel 优雅关闭 + lazy 启动 + atexit 兜底 | ✅ |
 | **v13** | **后台 prefetch 预热** | **queue_prefetch + 两阶段消费 + 冷启动 fallback + join timeout** | **✅ 已完成** |
+| **v14** | **会话切换（on_session_switch）** | **/new + /resume 命令 + drain writer + 清 prefetch 缓存 + 轮转 session_id** | **✅ 已完成** |
 
-**下一档候选**（未启动）：v14 `on_session_switch`（切 session 时 drain buffer）/ 上下文压缩 `on_pre_compress` 钩子。
+**下一档候选**（未启动）：v15 上下文压缩 `on_pre_compress` 钩子 / 多 provider 优先级编排。
 
 ---
 
@@ -188,6 +189,19 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 - **原因**：确保关闭时不留悬挂线程；daemon 线程虽然不阻塞进程退出，但显式 join 更干净。
 - **验证**：`scripts/test_v13_prefetch.py` 6 项测试覆盖（启动线程、消费缓存、超时 fallback、shutdown 阻止、冷启动 fallback、tools 模式跳过）。
 
+### v14 — 会话切换（on_session_switch 生命周期钩子）
+- **选 1**：`/new` + `/resume <id>` 两个用户命令。
+- **没选**：`/branch`（从当前 session 分叉）。原因：nano 教学版不持久化对话历史，branch 语义无意义。
+- **选 2**：`queue.join()`（无 timeout）drain writer queue。
+- **原因**：旧 session 的 retain 必须全部落盘才能切换，否则数据丢失。HTTP timeout（360s）是最终兜底。
+- **选 3**：writer 线程切换后保持存活。
+- **没选**：shutdown + 重建。原因：新 session 的 sync_turn 复用同一 writer，避免线程创建开销。
+- **选 4**：不 set `_shutting_down`。
+- **原因**：那是永久关闭标志。session switch 后 provider 仍需正常工作（sync_turn、queue_prefetch 等）。
+- **选 5**：`/new` 和 `/resume` 都重置 messages + turn_count。
+- **原因**：nano 不持久化对话历史，切 session 后旧对话上下文对新 session 无意义。
+- **验证**：`scripts/test_v14_session_switch.py` 7 项测试覆盖（更新 session_id、drain writer、清 prefetch 缓存、新 session_id 生效、in-flight prefetch join、连续切换、builtin no-op）。
+
 ---
 
 ## 7. 待办 / 已知问题
@@ -200,7 +214,7 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 - [x] ~~V11 `/retain` 含 LLM 调用 + 多次 embedding，单次约 2-5s~~ — V12 已通过后台 writer 解决（主循环 0 阻塞）。
 - [ ] V11 图遍历目前只做 1-hop，复杂场景可能需要 2-hop。
 - [x] ~~V12 后只剩 prefetch 同步阻塞（200-500ms/轮）~~ — V13 已通过后台 prefetch 预热解决（第 2 轮起近零阻塞）。
-- [ ] 仍未实现 `on_session_switch`：切 session 时 buffer 没 flush，可能丢入队中的 retain — V14 候选。
+- [x] ~~仍未实现 `on_session_switch`：切 session 时 buffer 没 flush~~ — V14 已通过 on_session_switch 生命周期钩子解决（drain + 清缓存 + 轮转）。
 
 ---
 

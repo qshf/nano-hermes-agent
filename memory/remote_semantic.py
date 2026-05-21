@@ -1,11 +1,14 @@
 """
-RemoteSemanticProvider — V13 后台 prefetch 预热版（V12 + 两阶段 recall）。
+RemoteSemanticProvider — V14 会话切换版（V13 + on_session_switch 生命周期钩子）。
 
-V13 变化（相对 V12）：
-- 新增 queue_prefetch()：当轮结束后启动 daemon 线程预热下一轮 recall/reflect
-- 重写 prefetch()：先消费预热缓存，冷启动时 fallback 到同步调用
-- 新增 _prefetch_thread / _prefetch_result / _prefetch_lock 三个实例变量
-- shutdown 增加 join prefetch 线程
+V14 变化（相对 V13）：
+- 新增 on_session_switch()：drain writer queue + join prefetch + 清缓存 + 轮转 session_id
+- 切换后 writer 线程保持存活供新 session 复用
+
+V13 保留（不变）：
+- queue_prefetch()：当轮结束后启动 daemon 线程预热下一轮 recall/reflect
+- prefetch()：先消费预热缓存，冷启动时 fallback 到同步调用
+- _prefetch_thread / _prefetch_result / _prefetch_lock 三个实例变量
 
 V12 保留（不变）：
 - 单写者线程 + queue.Queue + sentinel 模式（retain 异步写入）
@@ -17,9 +20,8 @@ V11 保留（不变）：
 - prefetch 支持 recall / reflect 两种方式
 
 设计依据（对应源项目 plugins/memory/hindsight/__init__.py）：
-- queue_prefetch：daemon 线程 + lock 保护缓存写入，匹配源项目 1:1
-- prefetch：join(timeout=3.0) + 消费缓存 + 冷启动 fallback
-- 两阶段模式让第 2 轮起 prefetch 近零延迟（后台线程已提前完成 HTTP 调用）
+- on_session_switch：queue.join() drain + prefetch join + rotate，匹配源项目 1:1
+- 不 set _shutting_down — 那是永久关闭标志，session switch 后 provider 仍需工作
 """
 
 from __future__ import annotations
@@ -307,6 +309,43 @@ class RemoteSemanticProvider(MemoryProvider):
             target=_run, daemon=True, name="remote-semantic-prefetch"
         )
         self._prefetch_thread.start()
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        reset: bool = False,
+        **kwargs,
+    ) -> None:
+        """切换会话 — drain 旧 session 写入 + 清 prefetch 缓存 + 轮转 session_id。
+
+        4 步：
+        1. drain writer queue — 旧 session 的 retain 必须全部落盘
+        2. join prefetch thread + 清空缓存 — 旧 session 的预热对新 session 无意义
+        3. 轮转 session_id
+        4. log transition
+
+        注意：不 set _shutting_down — writer 线程保持存活供新 session 复用。
+        """
+        old_session_id = self._session_id
+
+        self._retain_queue.join()
+
+        prefetch_thread = self._prefetch_thread
+        if prefetch_thread is not None and prefetch_thread.is_alive():
+            prefetch_thread.join(timeout=3.0)
+        with self._prefetch_lock:
+            self._prefetch_result = ""
+        self._prefetch_thread = None
+
+        self._session_id = new_session_id
+
+        logger.info(
+            "RemoteSemantic session switch: %s → %s (reset=%s)",
+            old_session_id,
+            new_session_id,
+            reset,
+        )
 
     def sync_turn(
         self,
