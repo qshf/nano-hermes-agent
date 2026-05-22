@@ -34,6 +34,7 @@ import os
 import uuid
 
 from dotenv import load_dotenv
+load_dotenv()
 from openai import OpenAI
 
 from model_tools import get_tool_definitions, get_available_tool_names
@@ -73,6 +74,7 @@ if _remote_url:
         auto_retain=os.environ.get("MEMORY_AUTO_RETAIN", "1") not in ("0", "false", "False", ""),
         auto_recall=os.environ.get("MEMORY_AUTO_RECALL", "1") not in ("0", "false", "False", ""),
         retain_tags=_retain_tags,
+        retain_every_n_turns=max(1, int(os.environ.get("MEMORY_RETAIN_EVERY_N_TURNS", "1"))),
     )
     if _remote.is_available():
         memory_manager.add_provider(_remote)
@@ -96,7 +98,7 @@ def build_system_prompt() -> str:
 
 
 def run_agent():
-    load_dotenv()
+
 
     client = OpenAI(
         api_key=os.environ.get("OPENAI_API_KEY"),

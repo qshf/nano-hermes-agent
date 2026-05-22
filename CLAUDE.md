@@ -9,8 +9,8 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到能挂载长期记忆。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级 AI Agent，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v14 已完成 — on_session_switch 生命周期钩子，运行期通过 /new + /resume 切换会话，切换时 drain writer queue + 清 prefetch 缓存 + 轮转 session_id。
-- **核心叙事**：通过 V0→V14 的 15 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换。
+- **当前阶段**：v16 已完成 — retain 批量 + cadence 控制（client）+ 多跳图遍历 + 时间衰减（server），三特性同档对齐源项目 Hindsight 生产能力。
+- **核心叙事**：通过 V0→V16 的 17 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减。
 
 ---
 
@@ -46,10 +46,12 @@
 | v10.1 | pgvector + OpenAI embedding | 真实向量存储 + 范式 embedding | ✅ |
 | v11 | 知识图谱记忆（Hindsight 1:1） | 实体/关系/事实抽取 + 多策略检索 + reflect 合成 + memory mode | ✅ |
 | v12 | 异步 retain（后台 writer 线程） | queue + sentinel 优雅关闭 + lazy 启动 + atexit 兜底 | ✅ |
-| **v13** | **后台 prefetch 预热** | **queue_prefetch + 两阶段消费 + 冷启动 fallback + join timeout** | **✅ 已完成** |
-| **v14** | **会话切换（on_session_switch）** | **/new + /resume 命令 + drain writer + 清 prefetch 缓存 + 轮转 session_id** | **✅ 已完成** |
+| v13 | 后台 prefetch 预热 | queue_prefetch + 两阶段消费 + 冷启动 fallback + join timeout | ✅ |
+| v14 | 会话切换（on_session_switch） | /new + /resume 命令 + drain writer + 清 prefetch 缓存 + 轮转 session_id | ✅ |
+| v15 | 上下文压缩（on_pre_compress） | 五阶段压缩流水线 + 抢救对话进 retain 队列 | ✅ |
+| **v16** | **retain 批量 + 多跳 + 时间衰减** | **retain_every_n_turns 缓冲 / N-hop BFS 图遍历 / 半衰期指数衰减** | **✅ 已完成** |
 
-**下一档候选**（未启动）：v15 上下文压缩 `on_pre_compress` 钩子 / 多 provider 优先级编排。
+**下一档候选**（未启动）：v17 多 provider 优先级编排 / 命名实体消歧。
 
 ---
 
@@ -82,6 +84,15 @@ MEMORY_SESSION_ID=default
 MEMORY_MODE=hybrid                          # context / tools / hybrid
 MEMORY_BANK_ID=hermes                       # bank 命名空间
 MEMORY_PREFETCH_METHOD=recall               # recall / reflect
+MEMORY_RETAIN_EVERY_N_TURNS=1               # V16: N>1 时缓冲 N 轮再合并 retain
+```
+
+### 4.5 v16 新增（mock server 端）
+```bash
+RECALL_HOPS=2                # 多跳图遍历跳数；1=单跳（V11 行为）
+HOP_DECAY=0.7                # 跨跳权重衰减系数；hop=N 的 fact 权重 = 0.7^(N-1)
+DECAY_HALF_LIFE_DAYS=30      # 时间衰减半衰期；<=0 关闭
+DECAY_ALPHA=0.3              # decay 在最终 score 中的混合权重；0 关闭
 ```
 
 ---
@@ -202,6 +213,24 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 - **原因**：nano 不持久化对话历史，切 session 后旧对话上下文对新 session 无意义。
 - **验证**：`scripts/test_v14_session_switch.py` 7 项测试覆盖（更新 session_id、drain writer、清 prefetch 缓存、新 session_id 生效、in-flight prefetch join、连续切换、builtin no-op）。
 
+### v16 — retain 批量 + 多跳图遍历 + 时间衰减
+**Client（retain_every_n_turns 批量）**
+- **选 1**：在 `RemoteSemanticProvider` 加 `retain_every_n_turns` + `_session_turns` buffer + `_turn_counter`，N=1 时立即入队（V12-V15 行为不变），N>1 时累积到第 N 轮才合并入队（payload tag `batch:N`）。
+- **没选**：在服务端做批量。原因：缓冲应贴近事件源 — provider 知道一轮的天然边界，服务端只看到拼接好的 content 反而丢失了"几轮"这个语义。也对齐源项目 1:1。
+- **选 2**：合并方式 `"\n\n---\n\n".join(turns)`，整体作为单条 content 发到 `/retain`，服务端 LLM 一次性看完整对话块再做实体/关系/事实抽取。
+- **原因**：(a) 服务端抽取调用量降为 1/N，单次 retain 通常 2-5s，N=3 时三轮合并约省 70% 抽取时延；(b) 一组连续 turn 的实体共指更易被 LLM 识别（"他/她/这个项目"等指代），抽出的图谱质量更高。
+- **选 3**：`on_session_switch` 在 `queue.join()` drain 前先 `_flush_buffer(session_id=old)`；`shutdown` 在 set `_shutting_down` 前先 flush。
+- **原因**：buffer 里的 turn 不在 queue 里，drain queue 不能落盘缓冲。Flush 必须用旧 session_id，否则 N=3 累积了 2 条切 session 时这 2 条会被错记为新 session（违反 V14 的 session 隔离不变量）。
+
+**Server（多跳图遍历 + 时间衰减）**
+- **选 4**：把 V11 的硬编码 1-hop 升级为可配置 N-hop BFS，复用 frontier 集合按跳数染色（`{entity_name: hop_distance}`）。最终 fact score 乘 `hop_weight = HOP_DECAY ** (hop-1)`，hop=1 不打折。
+- **没选**：固定 2-hop。原因：把跳数做成 env (`RECALL_HOPS`) 让教学受众能直观对比"单跳 vs 双跳"召回差异 — 这是图谱相对扁平向量库的核心卖点。HOP_DECAY=0.7 来源于"二跳证据应该比一跳证据弱但不可忽略"的经验值。
+- **选 5**：时间衰减用指数半衰期 `time_weight = 0.5 ^ (age_days / half_life)`，再用 `DECAY_ALPHA` 混合：`final = cosine * hop_weight * ((1-α) + α * time_weight)`，age 取 fact.updated_at（事实更新时复活到 now）。
+- **没选**：硬替换 — 让 final = cosine * time_weight。原因：α 混合让"完全关闭衰减"（α=0）和"完全跟随时间"（α=1）成连续可调的旋钮，符合教学的可观测性要求。半衰期模型对应"用户记忆遗忘曲线"的经典假设。
+- **选 6**：源项目 Hindsight 通过独立 `hindsight_embed` 库做 graph rerank + 复杂衰减；nano 在 SQL + `math.pow` 层用最少代码复现核心思想。
+- **原因**：rerank 库引入复杂依赖（faiss / scipy.spatial），教学价值低于自己写一遍 BFS + 半衰期函数。RecallResult 多暴露 `cosine / hop / age_days / time_weight` 字段，让客户端能看到打分细节，便于"为什么 A 排在 B 前面"的回答。
+- **验证**：`scripts/test_v16_batch_decay.py` 7 项覆盖（N=1 立即入队 / N=3 缓冲合并 / session switch flush 旧 buffer / shutdown flush 旧 buffer / hop_weight 单调 / time_weight 半衰期 / decay_blend α 开关）。所有测试 + V12/V13/V14/V15 回归全绿。
+
 ---
 
 ## 7. 待办 / 已知问题
@@ -212,9 +241,11 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 - [ ] V11 知识图谱抽取 prompt 需要根据实际使用效果调优（当前是通用版）。
 - [ ] V11 事实去重阈值 `FACT_DEDUP_THRESHOLD=0.92` 需要实测验证。
 - [x] ~~V11 `/retain` 含 LLM 调用 + 多次 embedding，单次约 2-5s~~ — V12 已通过后台 writer 解决（主循环 0 阻塞）。
-- [ ] V11 图遍历目前只做 1-hop，复杂场景可能需要 2-hop。
+- [x] ~~V11 图遍历目前只做 1-hop，复杂场景可能需要 2-hop。~~ — V16 已通过 `RECALL_HOPS` 实现 N-hop BFS（默认 2）。
 - [x] ~~V12 后只剩 prefetch 同步阻塞（200-500ms/轮）~~ — V13 已通过后台 prefetch 预热解决（第 2 轮起近零阻塞）。
 - [x] ~~仍未实现 `on_session_switch`：切 session 时 buffer 没 flush~~ — V14 已通过 on_session_switch 生命周期钩子解决（drain + 清缓存 + 轮转）。
+- [ ] V16 `RECALL_HOPS=2` 的实测召回质量需要在真实 bank 上验证（教学示例可能数据量太小看不出差异）。
+- [ ] V16 `DECAY_HALF_LIFE_DAYS=30` 是猜测值，需要根据实际记忆使用周期调优；用户能不能"显式重要"标记免衰减？
 
 ---
 

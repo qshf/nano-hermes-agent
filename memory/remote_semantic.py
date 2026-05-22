@@ -1,27 +1,29 @@
 """
-RemoteSemanticProvider — V14 会话切换版（V13 + on_session_switch 生命周期钩子）。
+RemoteSemanticProvider — V16 retain 批量 + cadence 控制版。
 
-V14 变化（相对 V13）：
-- 新增 on_session_switch()：drain writer queue + join prefetch + 清缓存 + 轮转 session_id
+V16 变化（相对 V14/V15）：
+- 新增 retain_every_n_turns：N>1 时把多轮 turn 缓冲后合并为一次 retain
+  - 减少服务端 LLM 抽取次数（每次 retain 都要做实体/关系/事实抽取）
+  - 提高知识图谱一致性（一组连续 turn 一次性进入抽取上下文）
+- 实例缓冲：_session_turns（list[str] turn json）+ _turn_counter
+- on_session_switch：drain 前先 flush 旧 buffer，再清空 + 轮转
+- shutdown：drain 前 flush buffer
+- 对应源项目 plugins/memory/hindsight/__init__.py 的 retain_every_n_turns 字段
+
+V15 保留：
+- on_pre_compress() 抢救压缩前对话
+
+V14 保留：
+- on_session_switch()：drain writer queue + 清缓存 + 轮转 session_id
 - 切换后 writer 线程保持存活供新 session 复用
 
-V13 保留（不变）：
-- queue_prefetch()：当轮结束后启动 daemon 线程预热下一轮 recall/reflect
-- prefetch()：先消费预热缓存，冷启动时 fallback 到同步调用
-- _prefetch_thread / _prefetch_result / _prefetch_lock 三个实例变量
-
-V12 保留（不变）：
-- 单写者线程 + queue.Queue + sentinel 模式（retain 异步写入）
-- sync_turn 入队即返回，不阻塞主循环
-
-V11 保留（不变）：
-- memory_mode: context / tools / hybrid
-- 三个工具：hindsight_retain / hindsight_recall / hindsight_reflect
-- prefetch 支持 recall / reflect 两种方式
+V13 保留：queue_prefetch 两阶段预热
+V12 保留：单写者线程 + queue.Queue + sentinel
+V11 保留：memory_mode + hindsight 三工具
 
 设计依据（对应源项目 plugins/memory/hindsight/__init__.py）：
-- on_session_switch：queue.join() drain + prefetch join + rotate，匹配源项目 1:1
-- 不 set _shutting_down — 那是永久关闭标志，session switch 后 provider 仍需工作
+- retain_every_n_turns：与源 1:1，counter % N != 0 缓冲，等于 0 才入队
+- on_session_switch：drain 前 flush buffer，避免旧 session 缓冲数据丢失
 """
 
 from __future__ import annotations
@@ -131,6 +133,7 @@ class RemoteSemanticProvider(MemoryProvider):
         auto_retain: bool = True,
         auto_recall: bool = True,
         retain_tags: list[str] | None = None,
+        retain_every_n_turns: int = 1,
         timeout: float = 360.0,
         writer_join_timeout: float = 10.0,
     ) -> None:
@@ -148,6 +151,7 @@ class RemoteSemanticProvider(MemoryProvider):
         self._auto_retain = auto_retain
         self._auto_recall = auto_recall
         self._retain_tags = retain_tags or []
+        self._retain_every_n_turns = max(1, int(retain_every_n_turns))
         self._session_id: str = ""
         self._client = httpx.Client(timeout=timeout)
 
@@ -162,6 +166,11 @@ class RemoteSemanticProvider(MemoryProvider):
         self._prefetch_thread: threading.Thread | None = None
         self._prefetch_result: str = ""
         self._prefetch_lock = threading.Lock()
+
+        # V16: retain 批量缓冲 — N>1 时在内存累积 turn 直到达到阈值才入队
+        self._session_turns: list[str] = []
+        self._turn_counter: int = 0
+        self._buffer_lock = threading.Lock()
 
     @property
     def name(self) -> str:
@@ -181,16 +190,21 @@ class RemoteSemanticProvider(MemoryProvider):
         self._session_id = session_id
 
     def shutdown(self) -> None:
-        """优雅关闭：先停收，再 drain writer，join prefetch，最后关 client。
+        """优雅关闭：flush buffer → 停收 → drain writer → join prefetch → 关 client。
 
         步骤：
-        1. set _shutting_down — 后续 sync_turn / queue_prefetch 直接丢弃
-        2. put sentinel + bounded join — writer drain 完已入队的 job 后退出
-        3. join prefetch 线程（如果在跑）
-        4. 关 httpx client
+        1. flush 缓冲 turn — 否则 retain_every_n_turns>1 时会丢数据
+        2. set _shutting_down — 后续 sync_turn / queue_prefetch 直接丢弃
+        3. put sentinel + bounded join — writer drain 完已入队的 job 后退出
+        4. join prefetch 线程（如果在跑）
+        5. 关 httpx client
         """
         if self._shutting_down.is_set():
             return
+
+        # 必须先 flush，set 标志后 _enqueue_retain 会被 sync_turn 跳过；
+        # 这里走的是直接 put 到 queue 的路径，不受 _shutting_down 影响。
+        self._flush_buffer()
         self._shutting_down.set()
 
         writer = self._writer_thread
@@ -317,17 +331,20 @@ class RemoteSemanticProvider(MemoryProvider):
         reset: bool = False,
         **kwargs,
     ) -> None:
-        """切换会话 — drain 旧 session 写入 + 清 prefetch 缓存 + 轮转 session_id。
+        """切换会话 — flush buffer + drain writer + 清 prefetch 缓存 + 轮转 session_id。
 
-        4 步：
-        1. drain writer queue — 旧 session 的 retain 必须全部落盘
-        2. join prefetch thread + 清空缓存 — 旧 session 的预热对新 session 无意义
-        3. 轮转 session_id
-        4. log transition
+        5 步：
+        1. flush 旧 session 的缓冲 turn — 否则 retain_every_n_turns>1 时会丢数据
+        2. drain writer queue — 旧 session 的 retain 必须全部落盘
+        3. join prefetch thread + 清空缓存 — 旧 session 的预热对新 session 无意义
+        4. 轮转 session_id + 重置 turn_counter
+        5. log transition
 
         注意：不 set _shutting_down — writer 线程保持存活供新 session 复用。
         """
         old_session_id = self._session_id
+
+        flushed = self._flush_buffer(session_id=old_session_id)
 
         self._retain_queue.join()
 
@@ -339,12 +356,16 @@ class RemoteSemanticProvider(MemoryProvider):
         self._prefetch_thread = None
 
         self._session_id = new_session_id
+        with self._buffer_lock:
+            self._session_turns = []
+            self._turn_counter = 0
 
         logger.info(
-            "RemoteSemantic session switch: %s → %s (reset=%s)",
+            "RemoteSemantic session switch: %s → %s (reset=%s, flushed=%d turns)",
             old_session_id,
             new_session_id,
             reset,
+            flushed,
         )
 
     def on_pre_compress(self, messages: list[dict], **kwargs) -> None:
@@ -384,7 +405,11 @@ class RemoteSemanticProvider(MemoryProvider):
         *,
         session_id: str = "",
     ) -> None:
-        """每轮结束后入队一个 retain job — 立即返回，不阻塞主循环。
+        """每轮结束后缓冲 turn；达到 retain_every_n_turns 才入队 retain job。
+
+        N=1（默认）：行为与 V12-V15 一致，每轮立即入队。
+        N>1：累积到第 N 轮才把 N 条 turn 合并成一条 content 入队，
+            服务端的 LLM 抽取看到更完整的对话上下文，且抽取调用量降为 1/N。
 
         实际 HTTP 调用在 _writer_loop 里串行执行；服务端做知识图谱抽取。
         """
@@ -392,16 +417,53 @@ class RemoteSemanticProvider(MemoryProvider):
             return
         if self._shutting_down.is_set():
             return
+        if session_id:
+            self._session_id = session_id
 
-        content = f"User: {user_content}\nAssistant: {assistant_content}"
+        turn_text = f"User: {user_content}\nAssistant: {assistant_content}"
+
+        with self._buffer_lock:
+            self._session_turns.append(turn_text)
+            self._turn_counter += 1
+            if self._turn_counter % self._retain_every_n_turns != 0:
+                return
+            # 达到批量阈值 — snapshot 后清空缓冲
+            turns_snapshot = list(self._session_turns)
+            self._session_turns = []
+
+        self._enqueue_buffered_retain(turns_snapshot, session_id=self._session_id)
+
+    def _enqueue_buffered_retain(self, turns: list[str], *, session_id: str) -> None:
+        """把一组缓冲的 turn 合并为一条 content 入队（带 v16 batch tag）。"""
+        if not turns:
+            return
+        content = "\n\n---\n\n".join(turns) if len(turns) > 1 else turns[0]
+        tags = list(self._retain_tags)
+        if len(turns) > 1:
+            tags.append(f"batch:{len(turns)}")
         payload = {
             "bank_id": self._bank_id,
             "content": content,
             "document_id": session_id or self._session_id,
-            "tags": self._retain_tags,
+            "tags": tags,
             "update_mode": "append",
         }
         self._enqueue_retain(payload)
+
+    def _flush_buffer(self, *, session_id: str = "") -> int:
+        """把当前缓冲的 turn 立即入队（用于 session switch / shutdown 前）。
+
+        返回入队的 turn 数。N=1 时缓冲始终为空，返回 0。
+        """
+        with self._buffer_lock:
+            if not self._session_turns:
+                return 0
+            turns_snapshot = list(self._session_turns)
+            self._session_turns = []
+            self._turn_counter = 0
+
+        self._enqueue_buffered_retain(turns_snapshot, session_id=session_id or self._session_id)
+        return len(turns_snapshot)
 
     # ─── 内部方法 ────────────────────────────────────────────────────────
 

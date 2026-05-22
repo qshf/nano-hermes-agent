@@ -1,26 +1,24 @@
 """
-Mock Memory Server — V11 知识图谱版（Hindsight 1:1 复现）。
+Mock Memory Server — V16 多跳遍历 + 时间衰减版。
 
-相对 V10.1 的变化：
-- 存储：单表 memories → 知识图谱（banks + documents + entities + relations + facts）
-- 抽取：LLM 事实抽取 → LLM 实体/关系/事实三层抽取
-- 检索：单纯余弦 top-k → 多策略（语义搜索 + 实体匹配 + 图遍历）
-- 新端点：/reflect（LLM 合成反思）
+V16 变化（相对 V11）：
+- 多跳图遍历：recall 支持 N-hop BFS（默认 RECALL_HOPS=2），跳数越深权重越低
+- 时间衰减：fact 按 updated_at 计算 age，半衰期 DECAY_HALF_LIFE_DAYS（默认 30）
+- 综合 score = cosine * (hop_weight) * (decay_blend(time_weight))
+
+V11 保留：
+- 存储：知识图谱（banks + documents + entities + relations + facts）
+- 抽取：LLM 实体/关系/事实三层抽取
+- 检索：多策略（语义搜索 + 实体匹配 + 图遍历）
+- /reflect（LLM 合成反思）
 
 对应源项目：plugins/memory/hindsight/__init__.py 的服务端逻辑。
-Hindsight 完整版含实体图、多 bank 隔离、tags 过滤、多策略 rerank。
-nano 版保留核心模式，去掉生产复杂性。
-
-启动流程：
-    docker compose down -v && docker compose up -d   # 重建 DB（schema 变了）
-    uv pip install -e ".[mock-server]"
-    cp .env.example .env && vim .env
-    python scripts/mock_memory_server.py
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 from contextlib import asynccontextmanager
 from typing import Any
@@ -64,6 +62,19 @@ LLM_MODEL = os.environ.get("MODEL", "deepseek-chat")
 
 # 事实去重阈值 — 同实体下新 fact 与已有 fact 余弦相似度超过此值时 UPDATE
 FACT_DEDUP_THRESHOLD = float(os.environ.get("FACT_DEDUP_THRESHOLD", "0.92"))
+
+# V16: 多跳图遍历配置
+# RECALL_HOPS=1 退回 V11 行为；2 表示 1-hop + 2-hop 邻居都参与召回
+RECALL_HOPS = max(1, int(os.environ.get("RECALL_HOPS", "2")))
+# 跨跳衰减系数 — 第 N 跳的实体上 fact 权重 = HOP_DECAY ** N
+HOP_DECAY = float(os.environ.get("HOP_DECAY", "0.7"))
+
+# V16: 时间衰减配置
+# 半衰期：每过 N 天 time_weight 衰减一半（指数衰减）；<=0 关闭衰减
+DECAY_HALF_LIFE_DAYS = float(os.environ.get("DECAY_HALF_LIFE_DAYS", "30"))
+# decay 在最终 score 中的权重；其余为纯 cosine
+# final = cosine * ((1 - alpha) + alpha * time_weight)
+DECAY_ALPHA = float(os.environ.get("DECAY_ALPHA", "0.3"))
 
 
 # ─── 全局资源 ────────────────────────────────────────────────────────────────
@@ -136,6 +147,10 @@ async def lifespan(app: FastAPI):
 
     _llm_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
     logger.info("llm: %s (model=%s)", LLM_BASE_URL, LLM_MODEL)
+    logger.info(
+        "v16: recall_hops=%d, hop_decay=%.2f, decay_half_life=%.1fd, decay_alpha=%.2f",
+        RECALL_HOPS, HOP_DECAY, DECAY_HALF_LIFE_DAYS, DECAY_ALPHA,
+    )
 
     yield
 
@@ -372,13 +387,72 @@ def store_fact(bank_id: str, document_id: str, entity_name: str,
 
 # ─── 多策略检索（Hindsight recall 核心模式）──────────────────────────────────
 #
-# 源项目 Hindsight 的 recall 组合多种策略：
-#   1. 语义搜索（embedding cosine）
-#   2. 关键词匹配
-#   3. 实体图遍历（1-hop 扩展）
-#   4. 时间衰减加权
+# V16 把源项目 Hindsight 的两个生产特性纳入 nano 版：
+#   1. 多跳图遍历（BFS）：从 query-matched 实体出发逐跳扩展，跳数越深 fact 权重越低。
+#      源项目通过独立 `hindsight_embed` 库做 graph rerank，nano 在 SQL 层用迭代 BFS
+#      复现核心思想。
+#   2. 时间衰减：用 fact.updated_at 计算 age，按指数半衰期降权，让旧记忆自然褪色，
+#      避免过期信息覆盖近期事实。
 #
-# nano 简化版保留前三种，去掉时间衰减。
+# 综合公式：
+#   final_score = base_cosine * hop_weight(d) * decay_blend(age)
+#   hop_weight(d)     = HOP_DECAY ** (d - 1)             # d=1 不打折
+#   decay_blend(age)  = (1 - DECAY_ALPHA) + DECAY_ALPHA * 2^(-age_days / half_life)
+
+
+def _time_weight(age_days: float) -> float:
+    """指数半衰期：age=0 → 1.0；age=half_life → 0.5。half_life<=0 → 1.0（关闭衰减）。"""
+    if DECAY_HALF_LIFE_DAYS <= 0:
+        return 1.0
+    return math.pow(0.5, age_days / DECAY_HALF_LIFE_DAYS)
+
+
+def _decay_blend(age_days: float) -> float:
+    """混合系数：DECAY_ALPHA=0 → 1.0（关闭）；=1 → 完全跟随 time_weight。"""
+    if DECAY_ALPHA <= 0:
+        return 1.0
+    tw = _time_weight(age_days)
+    return (1.0 - DECAY_ALPHA) + DECAY_ALPHA * tw
+
+
+def _hop_weight(hop_distance: int) -> float:
+    """跳数权重：hop=1 → 1.0；hop=2 → HOP_DECAY；以此类推。"""
+    if hop_distance <= 1:
+        return 1.0
+    return math.pow(HOP_DECAY, hop_distance - 1)
+
+
+def _bfs_neighbors(conn, bank_id: str, seeds: set[str], max_hops: int) -> dict[str, int]:
+    """从 seeds 出发逐跳 BFS，返回 {entity_name: hop_distance}（distance 取最小值）。
+
+    seeds 中的实体距离记为 1（直接命中），下一跳为 2，再下一跳 3。
+    每跳查 relations 表的双向邻居（source/target 互通）。
+    """
+    visited: dict[str, int] = {name: 1 for name in seeds}
+    if max_hops <= 1:
+        return visited
+    frontier: set[str] = set(seeds)
+    for hop in range(2, max_hops + 1):
+        if not frontier:
+            break
+        placeholders = ",".join(["%s"] * len(frontier))
+        cur = conn.execute(
+            f"""SELECT DISTINCT target_entity AS neighbor FROM relations
+                WHERE bank_id = %s AND source_entity IN ({placeholders})
+                UNION
+                SELECT DISTINCT source_entity AS neighbor FROM relations
+                WHERE bank_id = %s AND target_entity IN ({placeholders});""",
+            (bank_id, *frontier, bank_id, *frontier),
+        )
+        next_frontier: set[str] = set()
+        for row in cur.fetchall():
+            name = row[0]
+            if name in visited:
+                continue
+            visited[name] = hop
+            next_frontier.add(name)
+        frontier = next_frontier
+    return visited
 
 
 def recall_multi_strategy(
@@ -387,18 +461,25 @@ def recall_multi_strategy(
     k: int,
     tags: list[str] | None = None,
     tags_match: str = "any",
+    hops: int | None = None,
 ) -> list[dict[str, Any]]:
-    """多策略检索：语义搜索 + 实体匹配 + 图遍历。"""
+    """多策略检索 — 语义 + 实体匹配 + N-hop 图遍历 + 时间衰减。
+
+    hops=None → 用 RECALL_HOPS 默认值；hops=1 退回 V11 单跳行为。
+    返回每条 hit 含 score（最终）、cosine（原始相似度）、source（语义/图）、
+    hop（图遍历跳数）、age_days（年龄）、time_weight（衰减系数）。
+    """
     try:
         q_vec = embed(query)
     except Exception as e:
         logger.warning("embed query failed: %s", e)
         return []
 
-    results: dict[int, dict[str, Any]] = {}  # fact_id → {text, score, source}
+    n_hops = RECALL_HOPS if hops is None else max(1, int(hops))
+    results: dict[int, dict[str, Any]] = {}
 
     with _pool.connection() as conn:
-        # Strategy 1: 语义搜索 facts
+        # Strategy 1: 语义搜索 facts（source='semantic', hop=0 表示非图召回）
         tag_filter = ""
         params: list[Any] = [q_vec, bank_id, q_vec, k * 2]
         if tags:
@@ -409,15 +490,28 @@ def recall_multi_strategy(
             params = [q_vec, bank_id, tags, q_vec, k * 2]
 
         sql = f"""
-            SELECT id, text, 1 - (embedding <=> %s::vector) AS score
+            SELECT id, text, entity_name, updated_at,
+                   1 - (embedding <=> %s::vector) AS cosine
             FROM facts
             WHERE bank_id = %s {tag_filter}
             ORDER BY embedding <=> %s::vector
             LIMIT %s;
         """
         cur = conn.execute(sql, params)
-        for row in cur.fetchall():
-            results[row[0]] = {"text": row[1], "score": float(row[2]), "source": "semantic"}
+        rows = cur.fetchall()
+
+        for row in rows:
+            fid, text, entity_name, updated_at, cosine = row
+            cosine = float(cosine)
+            results[fid] = {
+                "_id": fid,
+                "text": text,
+                "entity_name": entity_name,
+                "updated_at": updated_at,
+                "cosine": cosine,
+                "source": "semantic",
+                "hop": 0,
+            }
 
         # Strategy 2: 实体匹配 — 找语义上接近 query 的实体
         cur = conn.execute(
@@ -425,46 +519,85 @@ def recall_multi_strategy(
                FROM entities
                WHERE bank_id = %s
                ORDER BY embedding <=> %s::vector
-               LIMIT 3;""",
+               LIMIT 5;""",
             (q_vec, bank_id, q_vec),
         )
-        matched_entities = [(row[0], float(row[1])) for row in cur.fetchall() if float(row[1]) > 0.3]
+        seed_entities: set[str] = {row[0] for row in cur.fetchall() if float(row[1]) > 0.3}
 
-        # Strategy 3: 图遍历 — 匹配实体的 facts + 1-hop 邻居的 facts
-        entity_names = set()
-        for ent_name, _ in matched_entities:
-            entity_names.add(ent_name)
-            # 1-hop: 找关联实体
-            cur = conn.execute(
-                """SELECT target_entity FROM relations
-                   WHERE bank_id = %s AND source_entity = %s
-                   UNION
-                   SELECT source_entity FROM relations
-                   WHERE bank_id = %s AND target_entity = %s;""",
-                (bank_id, ent_name, bank_id, ent_name),
-            )
-            for row in cur.fetchall():
-                entity_names.add(row[0])
+        # Strategy 3: N-hop BFS 图遍历 — 收集每个邻居实体的最短跳数
+        if seed_entities:
+            entity_hops = _bfs_neighbors(conn, bank_id, seed_entities, n_hops)
+        else:
+            entity_hops = {}
 
-        if entity_names:
-            placeholders = ",".join(["%s"] * len(entity_names))
+        if entity_hops:
+            placeholders = ",".join(["%s"] * len(entity_hops))
             cur = conn.execute(
-                f"""SELECT id, text, 1 - (embedding <=> %s::vector) AS score
+                f"""SELECT id, text, entity_name, updated_at,
+                           1 - (embedding <=> %s::vector) AS cosine
                     FROM facts
                     WHERE bank_id = %s AND entity_name IN ({placeholders})
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s;""",
-                (q_vec, bank_id, *entity_names, q_vec, k * 2),
+                (q_vec, bank_id, *entity_hops.keys(), q_vec, k * n_hops * 2),
             )
             for row in cur.fetchall():
-                fid = row[0]
-                if fid not in results or float(row[2]) > results[fid]["score"]:
-                    results[fid] = {"text": row[1], "score": float(row[2]), "source": "graph"}
+                fid, text, entity_name, updated_at, cosine = row
+                cosine = float(cosine)
+                hop = entity_hops.get(entity_name, 1)
+                existing = results.get(fid)
+                # 同一 fact 已在语义召回中：保留更优的 hop（语义本身记 hop=0，
+                # 但图遍历命中说明它也是邻居，仍按图算分能享受 1.0 hop_weight）
+                if existing is None:
+                    results[fid] = {
+                        "_id": fid,
+                        "text": text,
+                        "entity_name": entity_name,
+                        "updated_at": updated_at,
+                        "cosine": cosine,
+                        "source": "graph",
+                        "hop": hop,
+                    }
+                else:
+                    # 图遍历命中已有 fact：若 hop 更近（=更高 hop_weight），更新 source
+                    if existing["hop"] == 0 or hop < existing["hop"]:
+                        existing["source"] = "graph" if existing["source"] == "semantic" else existing["source"]
+                        existing["hop"] = hop
 
-    # 合并排序，取 top-k
-    sorted_results = sorted(results.values(), key=lambda x: x["score"], reverse=True)[:k]
-    logger.info("recall bank=%s query=%r → %d results (from %d candidates)", bank_id, query[:40], len(sorted_results), len(results))
-    return sorted_results
+    # ─── 综合打分（cosine × hop_weight × decay_blend）────────────────────
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    scored: list[dict[str, Any]] = []
+    for r in results.values():
+        cosine = r["cosine"]
+        hop = r["hop"] if r["hop"] >= 1 else 1  # 语义直接命中按 1 跳算分（不打折）
+        ts = r["updated_at"]
+        if ts is None:
+            age_days = 0.0
+        else:
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age_days = max(0.0, (now - ts).total_seconds() / 86400.0)
+        hw = _hop_weight(hop)
+        db = _decay_blend(age_days)
+        final_score = cosine * hw * db
+        scored.append({
+            "text": r["text"],
+            "score": final_score,
+            "cosine": cosine,
+            "source": r["source"],
+            "hop": r["hop"],
+            "age_days": round(age_days, 2),
+            "time_weight": round(_time_weight(age_days), 4),
+        })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    top = scored[:k]
+    logger.info(
+        "recall bank=%s query=%r hops=%d → %d/%d (hop_decay=%.2f, half_life=%.1fd)",
+        bank_id, query[:40], n_hops, len(top), len(scored), HOP_DECAY, DECAY_HALF_LIFE_DAYS,
+    )
+    return top
 
 
 # ─── Reflect 合成（Hindsight reflect 核心模式）───────────────────────────────
@@ -544,6 +677,10 @@ class RecallResult(BaseModel):
     text: str
     score: float
     source: str = ""
+    cosine: float = 0.0
+    hop: int = 0
+    age_days: float = 0.0
+    time_weight: float = 1.0
 
 
 class RecallResponse(BaseModel):
@@ -562,7 +699,7 @@ class ReflectResponse(BaseModel):
 
 # ─── 应用 ────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Nano Memory v11 (Knowledge Graph)", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Nano Memory v16 (Multi-hop + Decay)", version="0.4.0", lifespan=lifespan)
 
 
 @app.get("/healthz")
