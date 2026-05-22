@@ -1,0 +1,4 @@
+# main 分支只放 README + 索引，所有源码都在 topic 分支
+*
+!.gitignore
+!README.md
