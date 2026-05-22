@@ -9,6 +9,7 @@ V9 新增：广播生命周期事件到所有 provider，并提供上下文围�
 - sync_all() — 持久化完成的对话到所有 provider
 - queue_prefetch_all() — 预热下一轮的 recall（V13）
 - on_session_switch_all() — 切换会话时 drain + 清缓存 + 轮转 session_id（V14）
+- on_pre_compress_all() — 上下文压缩前通知 provider 抢救信息（V15）
 - 围栏辅助：sanitize_context / build_memory_context_block
 
 为什么前缀缓存敏感：召回结果每轮都不同，绝不能放进 system prompt
@@ -17,7 +18,7 @@ V9 新增：广播生命周期事件到所有 provider，并提供上下文围�
 
 简化（相比源项目）：
 - 无 _ext_prefetch_cache 优化
-- 无 on_session_end / on_pre_compress / on_memory_write 等钩子
+- 无 on_session_end / on_memory_write 等钩子
 
 对应源项目：agent/memory_manager.py
 """
@@ -368,6 +369,22 @@ class MemoryManager:
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' on_session_switch() failed: %s",
+                    provider.name,
+                    e,
+                )
+
+    def on_pre_compress_all(self, messages: list[dict], **kwargs) -> None:
+        """广播 on_pre_compress 到所有 provider。
+
+        上下文压缩前调用。messages 是即将被摘要替换的中间消息列表。
+        Provider 可从中抢救关键信息到长期存储。单个 provider 失败不阻塞其他。
+        """
+        for provider in self._providers:
+            try:
+                provider.on_pre_compress(messages, **kwargs)
+            except Exception as e:
+                logger.warning(
+                    "Memory provider '%s' on_pre_compress() failed: %s",
                     provider.name,
                     e,
                 )

@@ -5,6 +5,7 @@ V7 核心：定义任何记忆后端必须满足的接口。
 V9 扩展：新增生命周期方法，让 manager 能在 agent loop 的正确时机广播事件。
 V13 扩展：新增 queue_prefetch()，实现两阶段预热模式。
 V14 扩展：新增 on_session_switch()，运行期切换会话时 drain + 清缓存 + 轮转 session_id。
+V15 扩展：新增 on_pre_compress()，上下文压缩前通知 provider 抢救信息到长期存储。
 
 核心方法（必须实现）：
 - name: 短标识符
@@ -21,6 +22,7 @@ V9 生命周期钩子（默认 no-op，按需 override）：
 - sync_turn(): 每轮结束后持久化完成的对话
 - queue_prefetch(): 每轮结束后启动后台预热，供下一轮 prefetch() 消费（V13）
 - on_session_switch(): 运行期切换会话（drain + 清缓存 + 轮转 session_id）（V14）
+- on_pre_compress(): 上下文压缩前通知，provider 可抢救信息到长期存储（V15）
 
 为什么 prefetch/sync_turn 是默认实现而不是 abstractmethod：
 内置 provider（文件存储）通过 system_prompt_block 一次性注入全部记忆，
@@ -128,5 +130,13 @@ class MemoryProvider(ABC):
 
         reset=True 表示全新会话（/new），reset=False 表示切回已有会话（/resume）。
         默认 no-op — 无状态的 provider 不需要处理。
+        """
+
+    def on_pre_compress(self, messages: list[dict], **kwargs) -> None:
+        """上下文压缩前调用。Provider 可从即将被丢弃的消息中抢救信息。
+
+        messages 是即将被压缩（摘要替换）的中间消息列表（不含 system prompt 和 tail）。
+        Provider 应异步处理（如入队 retain），不阻塞主循环。
+        默认 no-op — 不需要抢救信息的 provider 不需要处理。
         """
 

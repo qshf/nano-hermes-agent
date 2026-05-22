@@ -1,14 +1,17 @@
 """
-Nano Hermes Agent — V14: 会话切换（on_session_switch 生命周期钩子）
+Nano Hermes Agent — V15: 上下文压缩（on_pre_compress 生命周期钩子）
 
-架构变化（相比 V13）：
-- 新增 /new 命令：创建全新会话（drain + 清缓存 + 新 session_id）
-- 新增 /resume <id> 命令：切回已有会话
-- 新增 /session 命令：查看当前 session_id
-- MemoryManager 广播 on_session_switch_all 到所有 provider
-- RemoteSemanticProvider 实现 4 步切换（drain writer → join prefetch → rotate → log）
+架构变化（相比 V14）：
+- 新增 ContextCompressor：token 估算 + LLM 摘要 + 结构化模板
+- 新增 on_pre_compress 生命周期钩子：压缩前通知 provider 抢救信息到长期存储
+- 新增 /compress 命令：手动触发压缩（调试用）
+- RemoteSemanticProvider 实现 on_pre_compress（提取对话 → 入队 retain）
 
 env 开关：
+    CONTEXT_WINDOW              模型上下文窗口大小（默认 32000 tokens）
+    CONTEXT_THRESHOLD_PERCENT   压缩阈值比例（默认 0.75）
+    CONTEXT_PROTECT_HEAD        保留前 N 条消息（默认 3）
+    CONTEXT_TAIL_BUDGET         tail 保留 token 预算（默认 4000）
     MEMORY_SERVICE_URL          外部记忆服务 URL（设了才挂 remote_semantic）
     MEMORY_SESSION_ID           会话隔离 id（默认 default）
     MEMORY_BANK_ID              bank 命名空间（默认 hermes）
@@ -36,6 +39,7 @@ from openai import OpenAI
 from model_tools import get_tool_definitions, get_available_tool_names
 from tools.registry import registry
 from memory import BuiltinMemoryProvider, MemoryManager, RemoteSemanticProvider
+from context_compressor import ContextCompressor
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
 ENABLED_TOOLSETS = ["core"]
@@ -108,8 +112,11 @@ def run_agent():
     # V14: 跟踪当前 session_id
     current_session_id = os.environ.get("MEMORY_SESSION_ID", "default")
 
+    # V15: 上下文压缩器
+    compressor = ContextCompressor()
+
     print("=" * 60)
-    print("  Nano Hermes Agent v14 — Session Switch (on_session_switch)")
+    print("  Nano Hermes Agent v15 — Context Compression (on_pre_compress)")
     print(f"  Model: {model}")
     print(f"  Session: {current_session_id}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
@@ -119,9 +126,12 @@ def run_agent():
         print(f"    file: {store.file_path}")
         print(f"    entries: {len(store.entries)}, "
               f"usage: {store.char_count()}/{store.char_limit} chars")
+    print(f"  Compression: threshold={compressor.threshold_tokens}tok, "
+          f"tail_budget={compressor.tail_token_budget}tok, "
+          f"protect_head={compressor.protect_first_n}")
     print(f"  Available tools: {', '.join(get_available_tool_names(ENABLED_TOOLSETS))}")
     print(f"  Memory tools: {', '.join(sorted(memory_manager.get_all_tool_names()))}")
-    print("  Commands: /memory /tools /load /mcp /plugin /new /resume /session")
+    print("  Commands: /memory /tools /load /mcp /plugin /new /resume /session /compress")
     print("  输入 'quit' 退出")
     print("=" * 60)
     print()
@@ -281,6 +291,18 @@ def run_agent():
                 print(f"  [session] {current_session_id}")
                 continue
 
+            # /compress 命令：手动触发上下文压缩（调试用）
+            if user_input == "/compress":
+                est = compressor.estimate_tokens(messages)
+                print(f"  [compress] estimated tokens: {est}, threshold: {compressor.threshold_tokens}")
+                if len(messages) < compressor.protect_first_n + 5:
+                    print("  [compress] not enough messages to compress")
+                    continue
+                memory_manager.on_pre_compress_all(messages[compressor.protect_first_n:])
+                messages = compressor.compress(messages, client, model)
+                print(f"  [compress] compacted to {len(messages)} messages")
+                continue
+
             # /new 命令：创建全新会话
             if user_input == "/new":
                 new_id = f"session-{uuid.uuid4().hex[:8]}"
@@ -326,6 +348,14 @@ def run_agent():
             final_assistant_text = ""
 
             while True:
+                # V15: 压缩检查 — API 调用前判断是否需要压缩上下文
+                if compressor.should_compress(messages):
+                    print("  [compress] context exceeds threshold, compacting...")
+                    head_end = compressor.protect_first_n
+                    memory_manager.on_pre_compress_all(messages[head_end:])
+                    messages = compressor.compress(messages, client, model)
+                    print(f"  [compress] compacted to {len(messages)} messages")
+
                 # 每轮重新计算：check_fn 结果可能变化（如用户中途装了 Docker）
                 tools_schema = get_tool_definitions(ENABLED_TOOLSETS)
                 # V8: 通过 manager 收集所有 provider 的 tool schema
@@ -339,6 +369,15 @@ def run_agent():
                     messages=messages,
                     tools=all_tools_schema,
                 )
+
+                # 用 API 返回的真实 token 数更新压缩器（下一轮触发判断用）
+                if response.usage and response.usage.prompt_tokens:
+                    '''
+                    prompt_tokens — 输入（所有 messages + tools schema）的 token 数
+                    completion_tokens — 本次 assistant 生成的 token 数
+                    total_tokens — 两者之和
+                    '''
+                    compressor.update_usage(response.usage.prompt_tokens)
 
                 choice = response.choices[0]
                 assistant_message = choice.message

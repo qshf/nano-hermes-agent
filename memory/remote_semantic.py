@@ -347,6 +347,36 @@ class RemoteSemanticProvider(MemoryProvider):
             reset,
         )
 
+    def on_pre_compress(self, messages: list[dict], **kwargs) -> None:
+        """上下文压缩前抢救 — 提取即将被丢弃的对话，入队 retain 到知识图谱。
+
+        从被压缩的消息中提取最后 10 条 user/assistant 对话，
+        拼接后通过 writer queue 异步 retain（非阻塞）。
+        """
+        if self._shutting_down.is_set():
+            return
+
+        parts = []
+        for msg in messages[-10:]:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if isinstance(content, str) and content.strip() and role in ("user", "assistant"):
+                parts.append(f"{role.capitalize()}: {content[:500]}")
+
+        if not parts:
+            return
+
+        combined = "\n".join(parts)
+        payload = {
+            "bank_id": self._bank_id,
+            "content": f"[Pre-compression context]\n{combined}",
+            "document_id": self._session_id,
+            "tags": self._retain_tags + ["pre-compress"],
+            "update_mode": "append",
+        }
+        self._enqueue_retain(payload)
+        logger.info("RemoteSemantic on_pre_compress: enqueued %d messages for retain", len(parts))
+
     def sync_turn(
         self,
         user_content: str,
