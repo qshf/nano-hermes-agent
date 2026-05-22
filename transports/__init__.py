@@ -55,4 +55,7 @@ def _discover_transports() -> None:
         import transports.chat_completions  # noqa: F401
     except ImportError:
         pass
-    # V18 起会增加 anthropic / 更多家族 — 在这里追加 import 即可。
+    try:
+        import transports.anthropic  # noqa: F401
+    except ImportError:
+        pass

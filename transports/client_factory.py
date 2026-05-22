@@ -26,8 +26,6 @@ def make_llm_client(api_mode: str) -> Any:
 
     支持的 api_mode:
         "chat_completions" — OpenAI 兼容（DeepSeek/Qwen OpenAI 端点 等）
-
-    V18 计划新增:
         "anthropic_messages" — Anthropic Messages API（Qwen DashScope 端点 等）
     """
     if api_mode == "chat_completions":
@@ -38,7 +36,15 @@ def make_llm_client(api_mode: str) -> Any:
             base_url=os.environ.get("OPENAI_BASE_URL"),
         )
 
+    if api_mode == "anthropic_messages":
+        import anthropic
+
+        return anthropic.Anthropic(
+            api_key=os.environ.get("ANTHROPIC_API_KEY"),
+            base_url=os.environ.get("ANTHROPIC_BASE_URL"),
+        )
+
     raise ValueError(
         f"Unsupported api_mode: {api_mode!r} "
-        f"(V17 only supports 'chat_completions'; V18 will add 'anthropic_messages')"
+        f"(supported: 'chat_completions', 'anthropic_messages')"
     )

@@ -1,12 +1,17 @@
 """
-Nano Hermes Agent — V17: Transport ABC + ChatCompletionsTransport
+Nano Hermes Agent — V18: AnthropicTransport + Registry
 
-架构变化（相比 V16）：
-- 新增 transports/ 子模块：ProviderTransport ABC + NormalizedResponse 数据类
-- 新增 ChatCompletionsTransport：把 OpenAI 兼容协议从 agent.py 解耦
-- 新增 transports.client_factory.make_llm_client：按 api_mode 实例化 SDK
-- agent loop 调用点替换：build_kwargs → client.create(**kwargs) → normalize_response
-- agent.py 不再 import openai，LLM 调用完全收敛进 transport 边界
+架构变化（相比 V17）：
+- 新增 AnthropicTransport：Anthropic Messages API 格式转换（system 拆分 / tool_use blocks / stop_reason 映射）
+- 新增 TRANSPORT_MODE env：运行时选择 transport（chat_completions / anthropic_messages）
+- client_factory 支持 anthropic_messages → anthropic.Anthropic(api_key, base_url)
+- agent loop SDK 调用按 api_mode 路由（chat.completions.create / messages.create）
+- ContextCompressor 支持 transport 参数，Anthropic 模式下也能压缩
+
+env 开关（V18 新增）：
+    TRANSPORT_MODE              chat_completions（默认）/ anthropic_messages
+    ANTHROPIC_API_KEY           Anthropic SDK key（DashScope 等）
+    ANTHROPIC_BASE_URL          Anthropic SDK base_url（如 https://dashscope.aliyuncs.com/apps/anthropic）
 
 env 开关：
     CONTEXT_WINDOW              模型上下文窗口大小（默认 32000 tokens）
@@ -102,11 +107,13 @@ def build_system_prompt() -> str:
 def run_agent():
 
 
-    # V17: 通过 transport 抽象层调用 LLM；client 由 factory 按 api_mode 实例化。
-    # 当前唯一支持 "chat_completions"，V18 会增加 "anthropic_messages"。
-    transport = get_transport("chat_completions")
+    # V18: env-driven transport 路由 — TRANSPORT_MODE 决定走哪个 LLM 家族。
+    # "chat_completions"（默认）→ OpenAI 兼容（DeepSeek 等）
+    # "anthropic_messages" → Anthropic Messages API（Qwen DashScope 等）
+    transport_mode = os.environ.get("TRANSPORT_MODE", "chat_completions")
+    transport = get_transport(transport_mode)
     if transport is None:
-        raise RuntimeError("chat_completions transport not registered")
+        raise RuntimeError(f"Transport not registered: {transport_mode!r}")
     client = make_llm_client(transport.api_mode)
     model = os.environ.get("MODEL", "gpt-4o-mini")
 
@@ -122,7 +129,7 @@ def run_agent():
     compressor = ContextCompressor()
 
     print("=" * 60)
-    print("  Nano Hermes Agent v17 — Transport ABC + ChatCompletionsTransport")
+    print("  Nano Hermes Agent v18 — AnthropicTransport + Registry")
     print(f"  Model: {model}")
     print(f"  Transport: {transport.api_mode}")
     print(f"  Session: {current_session_id}")
@@ -306,7 +313,7 @@ def run_agent():
                     print("  [compress] not enough messages to compress")
                     continue
                 memory_manager.on_pre_compress_all(messages[compressor.protect_first_n:])
-                messages = compressor.compress(messages, client, model)
+                messages = compressor.compress(messages, client, model, transport=transport)
                 print(f"  [compress] compacted to {len(messages)} messages")
                 continue
 
@@ -360,7 +367,7 @@ def run_agent():
                     print("  [compress] context exceeds threshold, compacting...")
                     head_end = compressor.protect_first_n
                     memory_manager.on_pre_compress_all(messages[head_end:])
-                    messages = compressor.compress(messages, client, model)
+                    messages = compressor.compress(messages, client, model, transport=transport)
                     print(f"  [compress] compacted to {len(messages)} messages")
 
                 # 每轮重新计算：check_fn 结果可能变化（如用户中途装了 Docker）
@@ -371,13 +378,20 @@ def run_agent():
                     {"type": "function", "function": s} for s in provider_schemas
                 ]
 
-                response = client.chat.completions.create(
-                    **transport.build_kwargs(
-                        model=model,
-                        messages=messages,
-                        tools=all_tools_schema,
-                    )
+                # V18: SDK 调用按 transport.api_mode 路由到正确的 client 方法。
+                # chat_completions → client.chat.completions.create
+                # anthropic_messages → client.messages.create
+                api_kwargs = transport.build_kwargs(
+                    model=model,
+                    messages=messages,
+                    tools=all_tools_schema,
                 )
+                if transport.api_mode == "chat_completions":
+                    response = client.chat.completions.create(**api_kwargs)
+                elif transport.api_mode == "anthropic_messages":
+                    response = client.messages.create(**api_kwargs)
+                else:
+                    raise RuntimeError(f"Unknown api_mode: {transport.api_mode}")
 
                 # V17: 通过 transport 把原生响应标准化成 NormalizedResponse。
                 # 下游消费的 .content / .tool_calls / .usage 与原 OpenAI 字段同名，

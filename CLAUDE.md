@@ -9,8 +9,8 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到能挂载长期记忆。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级 AI Agent，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v17 已完成 — Transport 抽象层（ProviderTransport ABC + NormalizedResponse 数据类 + ChatCompletionsTransport + 注册表 + client 工厂），把"调 LLM"从 agent.py 解耦出独立模块，为 V18 接 Anthropic 等异家族 provider 铺路。
-- **核心叙事**：通过 V0→V17 的 18 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减 + provider 协议解耦。
+- **当前阶段**：v18 已完成 — AnthropicTransport + Registry（第二家 transport 验证 ABC 价值 + env-driven 路由 + Qwen DashScope 真跑）。
+- **核心叙事**：通过 V0→V18 的 19 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减 + 多家族 provider 协议解耦。
 
 ---
 
@@ -50,9 +50,10 @@
 | v14 | 会话切换（on_session_switch） | /new + /resume 命令 + drain writer + 清 prefetch 缓存 + 轮转 session_id | ✅ |
 | v15 | 上下文压缩（on_pre_compress） | 五阶段压缩流水线 + 抢救对话进 retain 队列 | ✅ |
 | v16 | retain 批量 + 多跳 + 时间衰减 | retain_every_n_turns 缓冲 / N-hop BFS 图遍历 / 半衰期指数衰减 | ✅ |
-| **v17** | **Transport ABC + ChatCompletionsTransport** | **provider 解耦：messages/tools/response 标准化 + 注册表 + client 工厂** | **✅ 已完成** |
+| **v17** | **Transport ABC + ChatCompletionsTransport** | **provider 解耦：messages/tools/response 标准化 + 注册表 + client 工厂** | **✅** |
+| **v18** | **AnthropicTransport + Registry** | **第二家 transport / env-driven 路由 / 格式差异具体化 / Qwen DashScope 真跑** | **✅ 已完成** |
 
-**下一档候选**（未启动）：v18 AnthropicTransport / 多 provider 优先级编排 / 命名实体消歧。
+**下一档候选**（未启动）：v19 Failover + 健康检查 / v20 Prompt cache 控制。
 
 ---
 
@@ -63,6 +64,14 @@
 OPENAI_API_KEY=...           # 对话模型 key（DeepSeek/OpenAI/...）
 OPENAI_BASE_URL=...          # 对话端点
 MODEL=deepseek-chat          # 模型名
+TRANSPORT_MODE=chat_completions  # V18: chat_completions（默认）/ anthropic_messages
+```
+
+### 4.1.1 V18 Anthropic 模式（TRANSPORT_MODE=anthropic_messages 时必填）
+```bash
+ANTHROPIC_API_KEY=...        # DashScope API key 等
+ANTHROPIC_BASE_URL=https://dashscope.aliyuncs.com/apps/anthropic
+MODEL=qwen3.6-plus           # DashScope Anthropic 端点支持的模型
 ```
 
 ### 4.2 v11 新增（mock server 端）
@@ -247,6 +256,25 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 - **原因**：DeepSeek/Moonshot 的 `reasoning_content` 是协议特定的（OpenAI 标准没有），跨家族通用字段（content / tool_calls / finish_reason / usage）才升 top-level。这是 ABC 设计中"共享接口 vs 协议特化"的边界划分原则的实例。
 - **真实裁剪权衡**：源项目 transports/ 还包含 `bedrock.py` / `codex_responses.py` / `anthropic_messages.py`，nano 只复刻基础模式。V18 会增加 Anthropic（凭借 Anthropic SDK 与 OpenAI SDK 在 messages / tools / response shape 上的真实差异演示 ABC 的价值）。
 - **验证**：`scripts/test_v17_transport.py` 10 项覆盖（注册表查找 / unknown api_mode 返回 None / build_kwargs 最小集 / build_kwargs 含 tools+options / 文本响应标准化 / tool_calls 响应+向后兼容 / validate 拒绝空 choices / cached_tokens 抽取 / reasoning_content 进 provider_data / build_tool_call 工厂）。所有测试 + V12/V13/V14/V15/V16 回归全绿。
+
+### v18 — AnthropicTransport + Registry
+- **选 1**：新增 `transports/anthropic.py` 实现 `AnthropicTransport`，核心格式差异全部在 transport 内部消化，agent loop 零改动。
+- **原因**：这正是 V17 抽 ABC 的承诺 — "加第二家 transport 时 agent loop 不动"。V18 是这个承诺的实证。
+- **选 2**：`convert_messages` 返回 `(system, messages)` 元组 — system 拆出作为独立参数。
+- **原因**：Anthropic API 的 system 是顶层参数而非 messages 数组里的一条。这是两家协议最显著的结构差异之一。
+- **选 3**：assistant tool_calls → `tool_use` content blocks；tool results → user 消息里的 `tool_result` content blocks。
+- **原因**：Anthropic 把 tool 调用和结果都建模为 content blocks（不是 OpenAI 的顶层 `tool_calls` 字段 + 独立 `role=tool` 消息）。这是第二个核心差异。
+- **选 4**：`build_kwargs` 默认 `thinking={"type":"disabled"}`。
+- **原因**：DashScope Qwen 的 Anthropic 端点要求显式传 thinking 配置，不传会 400。默认 disabled 让 Qwen 能跑；未来 V20 可以改成 enabled 来启用 reasoning。
+- **选 5**：`TRANSPORT_MODE` env 驱动 transport 选择（默认 `chat_completions`）。
+- **没选**：自动探测（按 base_url 猜）。原因：显式优于隐式 — 教学场景下学员应该清楚知道自己在用哪条路径。
+- **选 6**：agent loop 的 SDK 调用按 `transport.api_mode` 路由（`client.chat.completions.create` vs `client.messages.create`）。
+- **没选**：让 transport 自己持有 client 并暴露 `call()` 方法。原因：transport 的职责是格式转换，不是 SDK 调用 — 把调用留在 agent loop 让"谁负责什么"更清晰。
+- **选 7**：`client_factory.make_llm_client` 新增 `anthropic_messages` 分支 → `anthropic.Anthropic(api_key, base_url)`。
+- **原因**：factory 是 V17 就铺好的基础设施，V18 只是多一个 elif — 验证了"加新家族的成本是 O(1)"。
+- **选 8**：`ContextCompressor.compress()` 新增 `transport` 参数，Anthropic 模式下用 `client.messages.create` 做摘要。
+- **原因**：压缩器也需要调 LLM，不能假设永远是 OpenAI 兼容。transport 参数让压缩器跟主循环走同一条路径。
+- **验证**：`scripts/test_v18_anthropic.py` 11 项覆盖（注册表 / system 拆出 / tool_calls+results 转换 / tools schema 转换 / build_kwargs 必填字段 / text 响应标准化 / tool_use 响应+向后兼容 / stop_reason 映射 / validate / cached_tokens / env 路由）。所有测试 + V12-V17 回归全绿。
 
 ---
 
