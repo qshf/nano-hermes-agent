@@ -9,8 +9,8 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到能挂载长期记忆。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级 AI Agent，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v16 已完成 — retain 批量 + cadence 控制（client）+ 多跳图遍历 + 时间衰减（server），三特性同档对齐源项目 Hindsight 生产能力。
-- **核心叙事**：通过 V0→V16 的 17 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减。
+- **当前阶段**：v17 已完成 — Transport 抽象层（ProviderTransport ABC + NormalizedResponse 数据类 + ChatCompletionsTransport + 注册表 + client 工厂），把"调 LLM"从 agent.py 解耦出独立模块，为 V18 接 Anthropic 等异家族 provider 铺路。
+- **核心叙事**：通过 V0→V17 的 18 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减 + provider 协议解耦。
 
 ---
 
@@ -49,9 +49,10 @@
 | v13 | 后台 prefetch 预热 | queue_prefetch + 两阶段消费 + 冷启动 fallback + join timeout | ✅ |
 | v14 | 会话切换（on_session_switch） | /new + /resume 命令 + drain writer + 清 prefetch 缓存 + 轮转 session_id | ✅ |
 | v15 | 上下文压缩（on_pre_compress） | 五阶段压缩流水线 + 抢救对话进 retain 队列 | ✅ |
-| **v16** | **retain 批量 + 多跳 + 时间衰减** | **retain_every_n_turns 缓冲 / N-hop BFS 图遍历 / 半衰期指数衰减** | **✅ 已完成** |
+| v16 | retain 批量 + 多跳 + 时间衰减 | retain_every_n_turns 缓冲 / N-hop BFS 图遍历 / 半衰期指数衰减 | ✅ |
+| **v17** | **Transport ABC + ChatCompletionsTransport** | **provider 解耦：messages/tools/response 标准化 + 注册表 + client 工厂** | **✅ 已完成** |
 
-**下一档候选**（未启动）：v17 多 provider 优先级编排 / 命名实体消歧。
+**下一档候选**（未启动）：v18 AnthropicTransport / 多 provider 优先级编排 / 命名实体消歧。
 
 ---
 
@@ -231,6 +232,22 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 - **原因**：rerank 库引入复杂依赖（faiss / scipy.spatial），教学价值低于自己写一遍 BFS + 半衰期函数。RecallResult 多暴露 `cosine / hop / age_days / time_weight` 字段，让客户端能看到打分细节，便于"为什么 A 排在 B 前面"的回答。
 - **验证**：`scripts/test_v16_batch_decay.py` 7 项覆盖（N=1 立即入队 / N=3 缓冲合并 / session switch flush 旧 buffer / shutdown flush 旧 buffer / hop_weight 单调 / time_weight 半衰期 / decay_blend α 开关）。所有测试 + V12/V13/V14/V15 回归全绿。
 
+### v17 — Transport ABC + ChatCompletionsTransport
+- **选 1**：抽 `ProviderTransport` ABC（`api_mode` / `convert_messages` / `convert_tools` / `build_kwargs` / `normalize_response` 五件套 + 三个可选 hook），新增 `transports/` 子模块。
+- **没选**：在 agent.py 里直接按 if/elif 分支不同 provider。原因：源项目 Hermes 已经验证了一旦要接 Anthropic（messages 拆 system / tool 用 input_schema / stop_reason 映射不同）就会污染 agent loop；ABC 把"协议特化"压进单个文件，agent loop 只看标准化结果。
+- **选 2**：`NormalizedResponse` 数据类替代直接消费 SDK 原生 `ChatCompletion` 对象，但通过 `ToolCall.function` property 返回 self 维持向后兼容（`tc.function.name` / `tc.function.arguments` / `tc.type` 现有读法零改动）。
+- **没选**：硬切到全新接口、agent.py 全面改写。原因：教学项目下相邻版本应该尽量"看得见的差异最少" — V17 的核心是抽出边界，不是借机重构调用点。
+- **选 3**：注册表 + 自动发现（`_discover_transports` 在首次 `get_transport()` 时 import 所有 transport 模块触发 `register_transport`）。
+- **没选**：硬编码 dispatch 表。原因：V18 加 AnthropicTransport 时只需在新文件末尾 `register_transport(...)` 即可被发现，agent.py 一行不改 — 这是"抽 ABC"声称的可扩展性的实证。
+- **选 4**：`make_llm_client(api_mode)` 工厂函数独立于 transport（`transports/client_factory.py`），不让 transport 自己实例化 client。
+- **原因**：transport 的职责是格式转换，client 的实例化是部署关注点（endpoint / api_key / 超时等）— 把它们分开让两侧能独立替换。V18 加 Anthropic 时只是这个 factory 多一个 elif 分支。
+- **选 5**：裁剪 — nano 只保留 `chat_completions`，不复制源项目 614 行里的 16+ provider quirks（Moonshot tool schema / Gemini thinking / OpenRouter cache 等）。
+- **原因**：那些是"产品需要"的兼容性补丁，对教学受众而言只是让核心模式被噪音淹没。V17 只演示一种 transport 形态，V18 加第二种（Anthropic）才是验证 ABC 价值的关键。
+- **选 6**：`reasoning_content` 走 `provider_data` 而非升 top-level。
+- **原因**：DeepSeek/Moonshot 的 `reasoning_content` 是协议特定的（OpenAI 标准没有），跨家族通用字段（content / tool_calls / finish_reason / usage）才升 top-level。这是 ABC 设计中"共享接口 vs 协议特化"的边界划分原则的实例。
+- **真实裁剪权衡**：源项目 transports/ 还包含 `bedrock.py` / `codex_responses.py` / `anthropic_messages.py`，nano 只复刻基础模式。V18 会增加 Anthropic（凭借 Anthropic SDK 与 OpenAI SDK 在 messages / tools / response shape 上的真实差异演示 ABC 的价值）。
+- **验证**：`scripts/test_v17_transport.py` 10 项覆盖（注册表查找 / unknown api_mode 返回 None / build_kwargs 最小集 / build_kwargs 含 tools+options / 文本响应标准化 / tool_calls 响应+向后兼容 / validate 拒绝空 choices / cached_tokens 抽取 / reasoning_content 进 provider_data / build_tool_call 工厂）。所有测试 + V12/V13/V14/V15/V16 回归全绿。
+
 ---
 
 ## 7. 待办 / 已知问题
@@ -246,6 +263,8 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 - [x] ~~仍未实现 `on_session_switch`：切 session 时 buffer 没 flush~~ — V14 已通过 on_session_switch 生命周期钩子解决（drain + 清缓存 + 轮转）。
 - [ ] V16 `RECALL_HOPS=2` 的实测召回质量需要在真实 bank 上验证（教学示例可能数据量太小看不出差异）。
 - [ ] V16 `DECAY_HALF_LIFE_DAYS=30` 是猜测值，需要根据实际记忆使用周期调优；用户能不能"显式重要"标记免衰减？
+- [ ] V17 `transports/` 只有 `chat_completions` 一家，ABC 价值在 V18 加 Anthropic 时才会真正显现 — 当前 V17 是基础设施铺设阶段。
+- [ ] CLAUDE.md 已超 250 行硬规则上限，下一档完成后应把决策日志按版本拆到 `docs/decisions/v<N>.md`，本文件只留索引。
 
 ---
 

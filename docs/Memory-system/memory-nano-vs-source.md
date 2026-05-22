@@ -471,3 +471,40 @@ V11 是 nano 项目的"功能封顶"版本 — 从 V6 的文件记忆到 V11 的
 | 后台 prefetch + 缓存 | 同上，搜 `_prefetch_thread` / `_prefetch_result` |
 | Agent loop 集成点（prefetch/sync 时序） | `/Users/qshf/my-project/hermes-agent/run_agent.py:5366-5462`（sync）/ `:11840-11860`（prefetch） |
 | 其他 HTTP 客户端 provider 模式 | `/Users/qshf/my-project/hermes-agent/plugins/memory/mem0/__init__.py` |
+
+---
+
+## 11. 未来迭代候选（V17+ 的 memory 次要项）
+
+> V11–V16 已经把 Hindsight 的核心生产能力 1:1 落地（知识图谱 / 读写双异步 / 会话切换 / 上下文压缩 / 多跳 / 时间衰减）。**剩下的全部是次要打磨项**，本节列出候选，作为本项目子系统排序的参考。
+>
+> 主线判断：**memory 不再单独开档**。这些候选若需要做，应该和"multi-tenant / multi-agent"等场景需求一起触发。整体路线见 [docs/system-roadmap.md](../system-roadmap.md)。
+
+### 11.1 候选项明细（按教学价值排序）
+
+| # | 候选 | 教学价值 | 复杂度 | 触发条件 | 一句话 |
+|---|------|---------|-------|---------|-------|
+| 1 | 实体消歧 + 别名合并 | 中（NLP pipeline） | 中 | 真实数据出现"小明 / XiaoMing / 小明同学"指代同一人未合并的 case | 在 server 抽取后增加一步 alias resolution，把同义实体合并到同一节点 |
+| 2 | Bank 模板渲染（多维隔离） | 中（多租户） | 低 | multi-agent 或 multi-user 场景出现 | `_bank_id_template` 支持 `{user_id}` / `{platform}` / `{agent_identity}` 占位符动态生成 bank_id |
+| 3 | Plugin 发现机制 | 中（约定优于配置） | 中 | 出现 ≥3 个 memory provider 候选（不只 builtin + remote） | 扫描 `plugins/memory/*/plugin.yaml` 自动加载；当前是硬编码注册 |
+| 4 | 注入扫描（`_scan_memory_content`） | 小（安全） | 小 | 暴露给真实多用户 / 引入对手模型场景 | 12 条 regex 防止 prompt injection / role hijack / curl exfil 写入记忆 |
+| 5 | Schema 迁移工具 | 小（运维） | 中 | 真实数据量上来后改 schema 不能 down -v | 用 alembic 或手写 migration 序号 |
+| 6 | 流式围栏 scrubber | 小 | 小 | 引入流式 UI 渲染（SSE / TUI） | 跨 chunk 状态机，处理 `<memory-context>` 跨 chunk 闭合 |
+| 7 | retain 服务端异步 | 小 | 小 | 实测服务端 retain 排队拥塞 | 当前 `/retain` 同步抽取 → LLM 调用阻塞响应；可改为接收即返回 + 后台 worker 抽取 |
+| 8 | 重要性显式标记 | 小 | 低 | 用户反馈"重要事实被时间衰减压低"（V16 决策日志已记） | 工具增加 `important: bool` 字段，免参与时间衰减 |
+
+### 11.2 为什么不再单独开 memory 档
+
+1. **核心模式已经讲完**。V6→V16 11 个核心设计模式（见第 9 节"总结"）覆盖了 ABC / 单一集成点 / 围栏 / 知识图谱 / 异步 IO / 生命周期钩子 / 上下文压缩等所有教学性论点。继续做都是细节打磨，边际教学价值递减。
+2. **次要项更适合"按需触发"**。比如别名合并 + bank 模板这两项，单独做意义不大；但如果做 multi-agent 时父子各自需要独立 bank、又需要把"小明"在两个子 agent 之间对齐，就成了 V22 多租户记忆增强的天然组合档。
+3. **教学项目要避免"无限收尾"**。源项目 hermes-agent 的 hindsight plugin 1747 行靠生产场景反馈打磨而成，nano 没有这个反馈通路，强行复现细节会变成"看着源代码抄"，丧失"为什么这样设计"的演进叙事。
+
+### 11.3 触发后的预期组合档
+
+| 假设档名 | 包含的次要项 | 触发场景 |
+|---------|------------|---------|
+| V22 多租户记忆增强 | #1 实体消歧 + #2 bank 模板 + #4 注入扫描 | multi-agent（V19+）落地后，父子记忆隔离 + 跨子 agent 实体对齐成为真实需求 |
+| V23 流式与 UI | #6 流式 scrubber + 流式 prefetch 注入 | 引入 TUI / Web UI 时一起做 |
+| V24 运维与持久 | #5 schema migration + #7 retain 服务端异步 | 真实部署阶段（如果项目转为长期运行实例） |
+
+> 注：以上是**预期**组合，不是承诺。具体哪些需要做、什么时候做，由 [docs/system-roadmap.md](../system-roadmap.md) 主线决定。当前主线已锁定 V17 transports → V19 delegate。

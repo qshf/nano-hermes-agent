@@ -1,11 +1,12 @@
 """
-Nano Hermes Agent — V15: 上下文压缩（on_pre_compress 生命周期钩子）
+Nano Hermes Agent — V17: Transport ABC + ChatCompletionsTransport
 
-架构变化（相比 V14）：
-- 新增 ContextCompressor：token 估算 + LLM 摘要 + 结构化模板
-- 新增 on_pre_compress 生命周期钩子：压缩前通知 provider 抢救信息到长期存储
-- 新增 /compress 命令：手动触发压缩（调试用）
-- RemoteSemanticProvider 实现 on_pre_compress（提取对话 → 入队 retain）
+架构变化（相比 V16）：
+- 新增 transports/ 子模块：ProviderTransport ABC + NormalizedResponse 数据类
+- 新增 ChatCompletionsTransport：把 OpenAI 兼容协议从 agent.py 解耦
+- 新增 transports.client_factory.make_llm_client：按 api_mode 实例化 SDK
+- agent loop 调用点替换：build_kwargs → client.create(**kwargs) → normalize_response
+- agent.py 不再 import openai，LLM 调用完全收敛进 transport 边界
 
 env 开关：
     CONTEXT_WINDOW              模型上下文窗口大小（默认 32000 tokens）
@@ -35,12 +36,13 @@ import uuid
 
 from dotenv import load_dotenv
 load_dotenv()
-from openai import OpenAI
 
 from model_tools import get_tool_definitions, get_available_tool_names
 from tools.registry import registry
 from memory import BuiltinMemoryProvider, MemoryManager, RemoteSemanticProvider
 from context_compressor import ContextCompressor
+from transports import get_transport
+from transports.client_factory import make_llm_client
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
 ENABLED_TOOLSETS = ["core"]
@@ -100,10 +102,12 @@ def build_system_prompt() -> str:
 def run_agent():
 
 
-    client = OpenAI(
-        api_key=os.environ.get("OPENAI_API_KEY"),
-        base_url=os.environ.get("OPENAI_BASE_URL"),
-    )
+    # V17: 通过 transport 抽象层调用 LLM；client 由 factory 按 api_mode 实例化。
+    # 当前唯一支持 "chat_completions"，V18 会增加 "anthropic_messages"。
+    transport = get_transport("chat_completions")
+    if transport is None:
+        raise RuntimeError("chat_completions transport not registered")
+    client = make_llm_client(transport.api_mode)
     model = os.environ.get("MODEL", "gpt-4o-mini")
 
     messages = [{"role": "system", "content": build_system_prompt()}]
@@ -118,8 +122,9 @@ def run_agent():
     compressor = ContextCompressor()
 
     print("=" * 60)
-    print("  Nano Hermes Agent v15 — Context Compression (on_pre_compress)")
+    print("  Nano Hermes Agent v17 — Transport ABC + ChatCompletionsTransport")
     print(f"  Model: {model}")
+    print(f"  Transport: {transport.api_mode}")
     print(f"  Session: {current_session_id}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
     print(f"  Memory providers: {[p.name for p in memory_manager.providers]}")
@@ -367,30 +372,49 @@ def run_agent():
                 ]
 
                 response = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    tools=all_tools_schema,
+                    **transport.build_kwargs(
+                        model=model,
+                        messages=messages,
+                        tools=all_tools_schema,
+                    )
                 )
 
+                # V17: 通过 transport 把原生响应标准化成 NormalizedResponse。
+                # 下游消费的 .content / .tool_calls / .usage 与原 OpenAI 字段同名，
+                # ToolCall.function.name / .function.arguments 通过兼容 property 提供。
+                if not transport.validate_response(response):
+                    print("  [warn] invalid response shape, skipping turn")
+                    break
+                normalized = transport.normalize_response(response)
+
                 # 用 API 返回的真实 token 数更新压缩器（下一轮触发判断用）
-                if response.usage and response.usage.prompt_tokens:
+                if normalized.usage and normalized.usage.prompt_tokens:
                     '''
                     prompt_tokens — 输入（所有 messages + tools schema）的 token 数
                     completion_tokens — 本次 assistant 生成的 token 数
                     total_tokens — 两者之和
                     '''
-                    compressor.update_usage(response.usage.prompt_tokens)
+                    compressor.update_usage(normalized.usage.prompt_tokens)
 
-                choice = response.choices[0]
-                assistant_message = choice.message
-                messages.append(assistant_message.model_dump())
+                # 把标准化响应回填进对话历史（保持 OpenAI 消息 shape，下一轮 build_kwargs 还能消费）
+                assistant_dump: dict = {"role": "assistant", "content": normalized.content}
+                if normalized.tool_calls:
+                    assistant_dump["tool_calls"] = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {"name": tc.name, "arguments": tc.arguments},
+                        }
+                        for tc in normalized.tool_calls
+                    ]
+                messages.append(assistant_dump)
 
-                if not assistant_message.tool_calls:
-                    final_assistant_text = assistant_message.content or ""
+                if not normalized.tool_calls:
+                    final_assistant_text = normalized.content or ""
                     print(f"\nAgent > {final_assistant_text}\n")
                     break
 
-                for tool_call in assistant_message.tool_calls:
+                for tool_call in normalized.tool_calls:
                     name = tool_call.function.name
                     args = json.loads(tool_call.function.arguments)
                     print(f"  [tool] {name}({tool_call.function.arguments})")
