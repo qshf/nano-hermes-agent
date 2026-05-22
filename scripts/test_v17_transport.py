@@ -215,6 +215,30 @@ def test_build_tool_call_factory_serializes_dict() -> None:
     assert tc.function.name == "f"
 
 
+def test_call_unified_entry_point() -> None:
+    """transport.call() 统一入口 — 内部 build_kwargs + SDK call + normalize。"""
+    transport = get_transport("chat_completions")
+
+    class _FakeClient:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    return _FakeChatCompletion(
+                        choices=[_FakeChoice(message=_FakeMsg(content="unified!"))],
+                        usage=_FakeUsage(prompt_tokens=10, completion_tokens=3, total_tokens=13),
+                    )
+
+    result = transport.call(
+        _FakeClient,
+        model="test-model",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert isinstance(result, NormalizedResponse)
+    assert result.content == "unified!"
+    assert result.usage.prompt_tokens == 10
+
+
 # ─── 入口 ─────────────────────────────────────────────────────────────────
 
 
@@ -229,6 +253,7 @@ TESTS = [
     test_cached_tokens_extracted,
     test_reasoning_content_in_provider_data,
     test_build_tool_call_factory_serializes_dict,
+    test_call_unified_entry_point,
 ]
 
 

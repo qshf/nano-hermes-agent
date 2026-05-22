@@ -135,6 +135,13 @@ class ChatCompletionsTransport(ProviderTransport):
             provider_data=provider_data or None,
         )
 
+    def call(self, client: Any, **kwargs) -> NormalizedResponse:
+        api_kwargs = self.build_kwargs(**kwargs)
+        response = client.chat.completions.create(**api_kwargs)
+        if not self.validate_response(response):
+            raise ValueError("Invalid response from chat.completions.create")
+        return self.normalize_response(response)
+
     def validate_response(self, response: Any) -> bool:
         """检查 ``response.choices`` 非空。"""
         if response is None:

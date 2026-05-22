@@ -242,6 +242,31 @@ def test_transport_mode_env_routing() -> None:
     assert t2.api_mode == "anthropic_messages"
 
 
+def test_call_unified_entry_point_anthropic() -> None:
+    """transport.call() 统一入口 — Anthropic 路径。"""
+    transport = get_transport("anthropic_messages")
+
+    class _FakeClient:
+        class messages:
+            @staticmethod
+            def create(**kwargs):
+                return _FakeMessage(
+                    content=[_FakeTextBlock(text="unified anthropic!")],
+                    stop_reason="end_turn",
+                    usage=_FakeUsage(input_tokens=20, output_tokens=8),
+                )
+
+    result = transport.call(
+        _FakeClient,
+        model="qwen3.6-plus",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert isinstance(result, NormalizedResponse)
+    assert result.content == "unified anthropic!"
+    assert result.usage.prompt_tokens == 20
+    assert result.finish_reason == "stop"
+
+
 # ─── 入口 ─────────────────────────────────────────────────────────────────
 
 
@@ -257,6 +282,7 @@ TESTS = [
     test_validate_response,
     test_usage_with_cached_tokens,
     test_transport_mode_env_routing,
+    test_call_unified_entry_point_anthropic,
 ]
 
 

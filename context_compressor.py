@@ -171,11 +171,10 @@ class ContextCompressor:
         )
         return token_count >= self.threshold_tokens
 
-    def compress(self, messages: list[dict], client, model: str, transport=None) -> list[dict]:
+    def compress(self, messages: list[dict], client, model: str, transport) -> list[dict]:
         """五阶段压缩流水线。
 
         返回压缩后的 messages 列表。LLM 调用失败时返回原始 messages。
-        transport 参数（V18 新增）：传入时用 transport 路由 LLM 调用；None 时走 OpenAI 兼容。
         """
         pre_tokens = self.estimate_tokens(messages)
 
@@ -317,7 +316,7 @@ class ContextCompressor:
     # ─── Phase 3: LLM Summary ────────────────────────────────────────────────
 
     def _generate_summary(
-        self, middle: list[dict], client, model: str, transport=None
+        self, middle: list[dict], client, model: str, transport
     ) -> str | None:
         """用 LLM 生成结构化摘要。支持 iterative update。"""
         conversation_text = self._format_messages(middle)
@@ -348,26 +347,12 @@ class ContextCompressor:
             )
 
         try:
-            # V18: 按 transport 路由 LLM 调用
             summary_messages = [{"role": "user", "content": prompt}]
-            if transport and transport.api_mode == "anthropic_messages":
-                api_kwargs = transport.build_kwargs(
-                    model=model,
-                    messages=summary_messages,
-                    tools=None,
-                    temperature=0.2,
-                    max_tokens=2048,
-                )
-                response = client.messages.create(**api_kwargs)
-                normalized = transport.normalize_response(response)
-                summary = normalized.content or ""
-            else:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=summary_messages,
-                    temperature=0.2,
-                )
-                summary = response.choices[0].message.content or ""
+            normalized = transport.call(
+                client, model=model, messages=summary_messages,
+                # temperature=0.2, max_tokens=2048,
+            )
+            summary = normalized.content or ""
         except Exception as e:
             logger.warning("Compression LLM call failed: %s", e)
             return None

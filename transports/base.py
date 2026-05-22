@@ -71,6 +71,17 @@ class ProviderTransport(ABC):
         """
         ...
 
+    # ── 统一调用入口 ─────────────────────────────────────────────
+
+    @abstractmethod
+    def call(self, client: Any, **kwargs) -> NormalizedResponse:
+        """统一 LLM 调用 — 调用方不需要知道底层是哪个 SDK 方法。
+
+        内部流程：build_kwargs → SDK call → validate → normalize_response。
+        kwargs 透传给 build_kwargs（model, messages, tools, temperature 等）。
+        """
+        ...
+
     # ── 可选 hook ───────────────────────────────────────────────
 
     def validate_response(self, response: Any) -> bool:

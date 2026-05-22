@@ -378,28 +378,18 @@ def run_agent():
                     {"type": "function", "function": s} for s in provider_schemas
                 ]
 
-                # V18: SDK 调用按 transport.api_mode 路由到正确的 client 方法。
-                # chat_completions → client.chat.completions.create
-                # anthropic_messages → client.messages.create
-                api_kwargs = transport.build_kwargs(
-                    model=model,
-                    messages=messages,
-                    tools=all_tools_schema,
-                )
-                if transport.api_mode == "chat_completions":
-                    response = client.chat.completions.create(**api_kwargs)
-                elif transport.api_mode == "anthropic_messages":
-                    response = client.messages.create(**api_kwargs)
-                else:
-                    raise RuntimeError(f"Unknown api_mode: {transport.api_mode}")
-
-                # V17: 通过 transport 把原生响应标准化成 NormalizedResponse。
-                # 下游消费的 .content / .tool_calls / .usage 与原 OpenAI 字段同名，
-                # ToolCall.function.name / .function.arguments 通过兼容 property 提供。
-                if not transport.validate_response(response):
+                # V18: 统一 LLM 调用 — transport.call() 内部路由到正确的 SDK 方法。
+                # 调用方不需要知道底层是 chat.completions.create 还是 messages.create。
+                try:
+                    normalized = transport.call(
+                        client,
+                        model=model,
+                        messages=messages,
+                        tools=all_tools_schema,
+                    )
+                except ValueError:
                     print("  [warn] invalid response shape, skipping turn")
                     break
-                normalized = transport.normalize_response(response)
 
                 # 用 API 返回的真实 token 数更新压缩器（下一轮触发判断用）
                 if normalized.usage and normalized.usage.prompt_tokens:

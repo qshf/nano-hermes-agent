@@ -237,6 +237,13 @@ class AnthropicTransport(ProviderTransport):
             provider_data=None,
         )
 
+    def call(self, client: Any, **kwargs) -> NormalizedResponse:
+        api_kwargs = self.build_kwargs(**kwargs)
+        response = client.messages.create(**api_kwargs)
+        if not self.validate_response(response):
+            raise ValueError("Invalid response from messages.create")
+        return self.normalize_response(response)
+
     def validate_response(self, response: Any) -> bool:
         """检查 Anthropic 响应结构。"""
         if response is None:
