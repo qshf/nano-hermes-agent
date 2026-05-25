@@ -35,7 +35,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("mock_memory")
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────

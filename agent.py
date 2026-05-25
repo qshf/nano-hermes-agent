@@ -47,7 +47,7 @@ import os
 import uuid
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 from model_tools import get_tool_definitions, get_available_tool_names
 from tools.registry import registry
@@ -457,6 +457,14 @@ def run_agent():
                         }
                         for tc in normalized.tool_calls
                     ]
+                # DeepSeek/Kimi/Moonshot thinking mode 要求每条 assistant 消息回传 reasoning_content
+                # 否则下一轮请求 400: "The reasoning_content in the thinking mode must be passed back"
+                # 对齐源项目 run_agent.py:9621-9635（pad 一个空格避开 DeepSeek V4 Pro 的非空校验）
+                rc = normalized.reasoning_content
+                if rc is not None:
+                    assistant_dump["reasoning_content"] = rc
+                elif normalized.tool_calls:
+                    assistant_dump["reasoning_content"] = " "
                 messages.append(assistant_dump)
 
                 if not normalized.tool_calls:

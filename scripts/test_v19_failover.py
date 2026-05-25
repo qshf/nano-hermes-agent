@@ -17,9 +17,6 @@
 12. 断路器半开自愈 — cooldown 过后允许探针，成功后 closed
 13. FATAL 错误 — 直接抛出（不切下一家、不计入失败计数）
 14. 单 transport 链 — 退化为"transport.call + 重试"，行为同 V18
-15. V19.1 per-entry model — entry.model 覆盖调用方传入的 model
-16. V19.1 per-entry model failover — 切备家时用备家自己的 model
-17. V19.1 per-entry model None 回退 — entry.model=None 时用调用方传入的 model
 """
 
 from __future__ import annotations
