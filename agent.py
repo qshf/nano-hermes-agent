@@ -1,14 +1,21 @@
 """
-Nano Hermes Agent — V18: AnthropicTransport + Registry
+Nano Hermes Agent — V19: Failover + 健康检查（断路器）
 
-架构变化（相比 V17）：
-- 新增 AnthropicTransport：Anthropic Messages API 格式转换（system 拆分 / tool_use blocks / stop_reason 映射）
-- 新增 TRANSPORT_MODE env：运行时选择 transport（chat_completions / anthropic_messages）
-- client_factory 支持 anthropic_messages → anthropic.Anthropic(api_key, base_url)
-- agent loop SDK 调用按 api_mode 路由（chat.completions.create / messages.create）
-- ContextCompressor 支持 transport 参数，Anthropic 模式下也能压缩
+架构变化（相比 V18）：
+- 新增 TransportChain：主备 transport 顺序故障切换 + 断路器自愈 + jittered backoff
+- 新增 classify_error：3 类决策（RETRYABLE / FAILOVER / FATAL），驱动 chain 行为
+- 新增 TRANSPORT_CHAIN env：逗号分隔多个 api_mode（不设则退化为单 transport，行为同 V18）
+- 新增 /transport 命令：查看每家 transport 的健康状态（断路器三态 closed/half_open/open）
+- agent loop 调用从 transport.call(client,...) 改为 chain.call(...)，签名兼容
 
-env 开关（V18 新增）：
+env 开关（V19 新增）：
+    TRANSPORT_CHAIN              chat_completions,anthropic_messages（不设则用 TRANSPORT_MODE 单家）
+    FAILOVER_FAILURE_THRESHOLD   断路器打开阈值（默认 3 次连续失败）
+    FAILOVER_COOLDOWN_SECONDS    断路器冷却时间（默认 60s）
+    FAILOVER_MAX_RETRIES         单 transport RETRYABLE 错误最大重试次数（默认 2）
+    FAILOVER_BASE_DELAY          backoff 基数（默认 1.0s）
+
+env 开关（V18 保留）：
     TRANSPORT_MODE              chat_completions（默认）/ anthropic_messages
     ANTHROPIC_API_KEY           Anthropic SDK key（DashScope 等）
     ANTHROPIC_BASE_URL          Anthropic SDK base_url（如 https://dashscope.aliyuncs.com/apps/anthropic）
@@ -46,7 +53,7 @@ from model_tools import get_tool_definitions, get_available_tool_names
 from tools.registry import registry
 from memory import BuiltinMemoryProvider, MemoryManager, RemoteSemanticProvider
 from context_compressor import ContextCompressor
-from transports import get_transport
+from transports.chain import FailoverExhausted, build_chain_from_env
 from transports.client_factory import make_llm_client
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
@@ -107,14 +114,25 @@ def build_system_prompt() -> str:
 def run_agent():
 
 
-    # V18: env-driven transport 路由 — TRANSPORT_MODE 决定走哪个 LLM 家族。
-    # "chat_completions"（默认）→ OpenAI 兼容（DeepSeek 等）
-    # "anthropic_messages" → Anthropic Messages API（Qwen DashScope 等）
-    transport_mode = os.environ.get("TRANSPORT_MODE", "chat_completions")
-    transport = get_transport(transport_mode)
-    if transport is None:
-        raise RuntimeError(f"Transport not registered: {transport_mode!r}")
-    client = make_llm_client(transport.api_mode)
+    # V19: 构建 transport 链 — TRANSPORT_CHAIN 优先（多家），否则退化为
+    # TRANSPORT_MODE 单家（行为同 V18）。chain 长度 1 时仍带 RETRYABLE 错误重试，
+    # 但不会切换 — 链长 ≥ 2 才有 failover 价值。
+    chain_env = os.environ.get("TRANSPORT_CHAIN", "").strip()
+    if not chain_env:
+        chain_env = os.environ.get("TRANSPORT_MODE", "chat_completions")
+
+    chain = build_chain_from_env(
+        chain_env,
+        client_factory=make_llm_client,
+        failure_threshold=int(os.environ.get("FAILOVER_FAILURE_THRESHOLD", "3")),
+        cooldown_seconds=float(os.environ.get("FAILOVER_COOLDOWN_SECONDS", "60")),
+        max_retries=int(os.environ.get("FAILOVER_MAX_RETRIES", "2")),
+        base_delay=float(os.environ.get("FAILOVER_BASE_DELAY", "1.0")),
+    )
+
+    # 兼容存量代码路径 — 主家用于 client 引用（仅作为 compressor.compress 第三个
+    # 位置参数兼容签名传入；真正的 LLM 调用统一走 chain.call()）。
+    client = chain.primary_client
     model = os.environ.get("MODEL", "gpt-4o-mini")
 
     messages = [{"role": "system", "content": build_system_prompt()}]
@@ -129,9 +147,16 @@ def run_agent():
     compressor = ContextCompressor()
 
     print("=" * 60)
-    print("  Nano Hermes Agent v18 — AnthropicTransport + Registry")
-    print(f"  Model: {model}")
-    print(f"  Transport: {transport.api_mode}")
+    print("  Nano Hermes Agent v19 — Failover + 健康检查（断路器）")
+    print(f"  Default MODEL (entries 不内联时回退到此): {model}")
+    chain_modes = " → ".join(
+        f"{e.api_mode}({e.model})" if e.model else e.api_mode
+        for e in chain.entries
+    )
+    print(f"  Transport chain: {chain_modes}")
+    print(f"    failure_threshold={chain.failure_threshold}, "
+          f"cooldown={chain.cooldown_seconds}s, "
+          f"max_retries={chain.max_retries}, base_delay={chain.base_delay}s")
     print(f"  Session: {current_session_id}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
     print(f"  Memory providers: {[p.name for p in memory_manager.providers]}")
@@ -145,7 +170,7 @@ def run_agent():
           f"protect_head={compressor.protect_first_n}")
     print(f"  Available tools: {', '.join(get_available_tool_names(ENABLED_TOOLSETS))}")
     print(f"  Memory tools: {', '.join(sorted(memory_manager.get_all_tool_names()))}")
-    print("  Commands: /memory /tools /load /mcp /plugin /new /resume /session /compress")
+    print("  Commands: /memory /tools /load /mcp /plugin /new /resume /session /compress /transport")
     print("  输入 'quit' 退出")
     print("=" * 60)
     print()
@@ -313,8 +338,26 @@ def run_agent():
                     print("  [compress] not enough messages to compress")
                     continue
                 memory_manager.on_pre_compress_all(messages[compressor.protect_first_n:])
-                messages = compressor.compress(messages, client, model, transport=transport)
+                # V19: 压缩调用走 chain — 链长 1 时与 V18 一致；链长 ≥2 时摘要
+                # 也享受故障切换。chain.call(client,...) 签名兼容 transport.call。
+                messages = compressor.compress(messages, client, model, transport=chain)
                 print(f"  [compress] compacted to {len(messages)} messages")
+                continue
+
+            # /transport 命令：V19 健康检查 — 显示每家 transport 的断路器状态
+            if user_input == "/transport":
+                status = chain.status()
+                for s in status:
+                    state_label = s["state"]
+                    model_label = s["model"] or f"{model} (fallback)"
+                    extra = ""
+                    if state_label != "closed":
+                        extra = (
+                            f" failures={s['consecutive_failures']}"
+                            f" last={s['last_reason']}"
+                            f" cooldown_left={s['cooldown_left']:.1f}s"
+                        )
+                    print(f"  [transport] {s['api_mode']}({model_label}): {state_label}{extra}")
                 continue
 
             # /new 命令：创建全新会话
@@ -367,7 +410,8 @@ def run_agent():
                     print("  [compress] context exceeds threshold, compacting...")
                     head_end = compressor.protect_first_n
                     memory_manager.on_pre_compress_all(messages[head_end:])
-                    messages = compressor.compress(messages, client, model, transport=transport)
+                    # V19: 摘要 LLM 调用也走 chain，享受 failover
+                    messages = compressor.compress(messages, client, model, transport=chain)
                     print(f"  [compress] compacted to {len(messages)} messages")
 
                 # 每轮重新计算：check_fn 结果可能变化（如用户中途装了 Docker）
@@ -378,15 +422,17 @@ def run_agent():
                     {"type": "function", "function": s} for s in provider_schemas
                 ]
 
-                # V18: 统一 LLM 调用 — transport.call() 内部路由到正确的 SDK 方法。
-                # 调用方不需要知道底层是 chat.completions.create 还是 messages.create。
+                # V19: 统一 LLM 调用走 chain — 主家失败自动切备家。
+                # ValueError 仍按"响应不合法"处理，FailoverExhausted 表示链全挂。
                 try:
-                    normalized = transport.call(
-                        client,
+                    normalized = chain.call(
                         model=model,
                         messages=messages,
                         tools=all_tools_schema,
                     )
+                except FailoverExhausted as e:
+                    print(f"  [error] all transports failed: {e}")
+                    break
                 except ValueError:
                     print("  [warn] invalid response shape, skipping turn")
                     break

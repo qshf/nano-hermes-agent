@@ -9,8 +9,8 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到能挂载长期记忆。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级 AI Agent，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v18 已完成 — AnthropicTransport + Registry（第二家 transport 验证 ABC 价值 + env-driven 路由 + Qwen DashScope 真跑）。
-- **核心叙事**：通过 V0→V18 的 19 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减 + 多家族 provider 协议解耦。
+- **当前阶段**：v19 已完成 — TransportChain + 断路器 + jittered backoff（多 transport 故障切换 + 健康检查）。
+- **核心叙事**：通过 V0→V19 的 20 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减 + 多家族 provider 协议解耦 + 主备故障切换。
 
 ---
 
@@ -28,7 +28,7 @@
 
 ---
 
-## 3. 进度状态（15 档迭代）
+## 3. 进度状态（20 档迭代）
 
 | 版本 | 标题 | 引入概念 | 状态 |
 |------|------|---------|------|
@@ -51,9 +51,10 @@
 | v15 | 上下文压缩（on_pre_compress） | 五阶段压缩流水线 + 抢救对话进 retain 队列 | ✅ |
 | v16 | retain 批量 + 多跳 + 时间衰减 | retain_every_n_turns 缓冲 / N-hop BFS 图遍历 / 半衰期指数衰减 | ✅ |
 | **v17** | **Transport ABC + ChatCompletionsTransport** | **provider 解耦：messages/tools/response 标准化 + 注册表 + client 工厂** | **✅** |
-| **v18** | **AnthropicTransport + Registry** | **第二家 transport / env-driven 路由 / 格式差异具体化 / Qwen DashScope 真跑** | **✅ 已完成** |
+| v18 | AnthropicTransport + Registry | 第二家 transport / env-driven 路由 / 格式差异具体化 / Qwen DashScope 真跑 | ✅ |
+| **v19** | **TransportChain + 断路器** | **多 transport 故障切换 / 错误三分类 / 断路器自愈 / jittered backoff** | **✅ 已完成** |
 
-**下一档候选**（未启动）：v19 Failover + 健康检查 / v20 Prompt cache 控制。
+**下一档候选**（未启动）：v20 Prompt cache 控制 / v21 流式输出 + 中断。
 
 ---
 
@@ -65,6 +66,18 @@ OPENAI_API_KEY=...           # 对话模型 key（DeepSeek/OpenAI/...）
 OPENAI_BASE_URL=...          # 对话端点
 MODEL=deepseek-chat          # 模型名
 TRANSPORT_MODE=chat_completions  # V18: chat_completions（默认）/ anthropic_messages
+```
+
+### 4.1.0 V19 故障切换（可选，多家 transport 时启用）
+```bash
+# 链段语法：api_mode[:model] — 每个 entry 自包含模型名（仿源项目 fallback chain）
+TRANSPORT_CHAIN=chat_completions:deepseek-chat,anthropic_messages:qwen3.6-plus
+# 不内联 model 时回退到全局 MODEL env：
+# TRANSPORT_CHAIN=chat_completions,anthropic_messages   # 两家共享 MODEL（一般不实用）
+FAILOVER_FAILURE_THRESHOLD=3        # 断路器打开阈值（连续失败次数）
+FAILOVER_COOLDOWN_SECONDS=60        # 断路器冷却时间
+FAILOVER_MAX_RETRIES=2              # 单 transport RETRYABLE 错误最大重试次数
+FAILOVER_BASE_DELAY=1.0             # backoff 基数（实际延迟 = base * 2^attempt + jitter）
 ```
 
 ### 4.1.1 V18 Anthropic 模式（TRANSPORT_MODE=anthropic_messages 时必填）
@@ -276,6 +289,30 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 - **原因**：压缩器也需要调 LLM，不能假设永远是 OpenAI 兼容。transport 参数让压缩器跟主循环走同一条路径。
 - **验证**：`scripts/test_v18_anthropic.py` 11 项覆盖（注册表 / system 拆出 / tool_calls+results 转换 / tools schema 转换 / build_kwargs 必填字段 / text 响应标准化 / tool_use 响应+向后兼容 / stop_reason 映射 / validate / cached_tokens / env 路由）。所有测试 + V12-V17 回归全绿。
 
+### v19 — TransportChain + 断路器（多 transport 故障切换）
+- **选 1**：抽 `TransportChain` 类管理"主备 transport 顺序故障切换"，agent loop 从 `transport.call(client, ...)` 改成 `chain.call(...)`，签名兼容（链版本 `client` 参数被忽略，每个 entry 自带 client）。
+- **没选**：在 agent loop 里写 try/except + if 切换。原因：故障切换涉及错误分类、断路器状态、backoff、半开探针四件事，混进主循环会让"主流"和"故障路径"耦合得难维护。源项目 `run_agent.py:1655-1697` 把 fallback 逻辑铺在主循环里，已经踩过这个坑（一改主循环就要重新思考 fallback 边界）— nano 把这层抽出来作为反例的正解。
+- **选 2**：错误分类做成独立 `classify_error()` 函数，返回 3 类 `ErrorAction`（RETRYABLE / FAILOVER / FATAL）。
+- **没选**：源项目的 14 种 `FailoverReason`。原因：14 种是为了对接十几家 provider 的私有错误码做精细化决策，nano 教学只关心"该不该切" — 二元决策再加个"重试一次"足够。具体决策为：
+  - **RETRYABLE**（瞬时故障）：500/502/504/408、timeout 关键词 → 同 transport 等待后重试 N 次；
+  - **FAILOVER**（这家不行了）：429/401-403/402/503/529、rate_limit/auth/billing/overloaded 关键词 → 直接切下一家；
+  - **FATAL**（用户/输入问题）：400 + context_overflow、413 payload_too_large、format_error → 切了也是错，直接抛出。
+- **选 3**：断路器三态自愈（closed / open / half_open），用最小数据结构 `_BreakerState(consecutive_failures, opened_at)` 表达。
+- **原因**：`opened_at == 0.0` → closed；`opened_at != 0` 且 `now - opened_at < cooldown` → open；过了 cooldown 但还没探针成功 → half_open。两个字段表达三态比"独立 enum + 状态机"清爽得多。半开探针成功后立即 close（重置两个字段），失败则 `_record_failure` 重新累计 — 不需要"半开 → 重新打开"的特殊路径。
+- **选 4**：jittered backoff 用 `base * 2^attempt + uniform(0, 0.5*delay)`。
+- **原因**：纯指数退避会让多 session 的重试时刻同步（thundering herd），打到刚刚恢复的服务上立即把它再打挂。jitter 让重试时刻散开。源项目 `agent/retry_utils.py:19-57` 做的就是这个，nano 复刻。`min(..., 60s)` 上限避免重试到天荒地老。
+- **选 5**：`TRANSPORT_CHAIN` env 优先于 `TRANSPORT_MODE`，不设则退化为 V18 的单 transport 行为。
+- **原因**：(a) 向后兼容 — V18 的部署不需要改任何 env；(b) 显式优于隐式 — 链顺序由 env 字符串顺序决定（`chat_completions,anthropic_messages` 表示主家是 OpenAI 兼容，备家是 Anthropic），教学受众一眼能看出主备。链长 1 时仍带 RETRYABLE 重试，但不会跨家切换 — 这是该选择的副作用，可接受。
+- **选 6**：`ContextCompressor.compress()` 接受 chain 当 transport 用（duck typing），无需改造。
+- **原因**：chain.call 的签名 `(client, **kwargs)` 与 `transport.call` 完全一致 — `client` 在 chain 上被忽略，但保留位置参数让 V18 的调用点零改动。这是"接口收敛"的复利 — V17 把所有 LLM 调用收敛到 `transport.call()` 的好处在 V19 兑现：摘要 LLM 也免费享受 failover。
+- **选 7**：`/transport` 命令展示链状态（每个 entry 的 closed/open/half_open + 失败计数 + 冷却剩余时间 + 模型名）。
+- **原因**：断路器是隐式状态，没有可观测性的话用户根本不知道"为什么 primary 被跳过"。教学项目尤其需要这种透明度。
+- **选 8（V19.1 修补）**：每个 chain entry 自带 `model` 字段，链字符串语法升级为 `api_mode[:model]`，例：`chat_completions:deepseek-chat,anthropic_messages:qwen3.6-plus`。entry.model 为 None 时回退到全局 `MODEL` env。
+- **没选**：让两家 transport 共享同一个 `MODEL` env。原因：现实里主备两家用的是**不同 provider 的不同模型**（DeepSeek 的 `deepseek-chat` 切到 Qwen 的 `qwen3.6-plus`）— 共享 `MODEL` 会让备家激活时带着错误的模型名调过去，立即 400。源项目 `hermes-agent/run_agent.py:1742-1765` 把 fallback chain 做成 `list[dict]`，每条 entry 自包含 `{provider, model, base_url, api_key}`，激活时按 entry 重建 client + 切 model — 这是 "fallback 必须自包含"的硬约束的根本原因。nano 翻译为字符串内联（`api_mode:model`）保留单 env 字符串的简洁，同时把"每条 entry 携带自己的模型"这个不变量做硬。
+- **真实踩坑（设计阶段，未上线）**：V19 第一版只让链共享 `MODEL` env，写完 banner 才发现这意味着两家被强制共用同一个模型名 — 在 DeepSeek + DashScope 混搭场景下根本跑不通。修复策略：增加 `_ChainEntry.model: Optional[str]`，`build_chain_from_env` 解析 `:` 分隔的内联 model，`_try_with_retry` 用 `dict(kwargs)` 浅拷贝后覆盖（避免链上各 entry 互相污染调用 kwargs）。新增 3 项测试覆盖（per-entry model 覆盖 / failover 后切到备家用对模型 / entry.model None 回退到调用方 model）。
+- **真实裁剪权衡**：源项目 `error_classifier.py` 1058 行 + `run_agent.py:1742-1764` 的 fallback chain + `retry_utils.py` 三处合计约 1500 行，nano 用 `error_classifier.py`（170 行）+ `chain.py`（240 行，含 V19.1 model 字段）共约 410 行复刻核心机制。删掉的部分：(a) provider-specific 错误串匹配（gemini "thinking signature" / openrouter cache miss / llama_cpp grammar 等），(b) `OAuthLongContextBetaForbidden` 之类边缘 reason，(c) status code → reason 的优先级精细化（nano 用直接映射），(d) entry 自包含 `base_url / api_key`（nano 复用 `client_factory.make_llm_client`，每个 api_mode 一组 env，简单够用）。教学价值在于"看清主备链 + 断路器 + jitter + per-entry model 四个机制如何协同"，不是 1:1 复制 provider 兼容矩阵。
+- **验证**：`scripts/test_v19_failover.py` 17 项覆盖（5 项 classify_error + 9 项 chain + 3 项 V19.1 per-entry model）。所有测试 + V12/V13/V14/V16/V17/V18 回归全绿（V15 的 2 项预存在错误是 V18 改 `compress()` 签名时未同步该测试，与 V19 无关）。
+
 ---
 
 ## 7. 待办 / 已知问题
@@ -291,7 +328,9 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 - [x] ~~仍未实现 `on_session_switch`：切 session 时 buffer 没 flush~~ — V14 已通过 on_session_switch 生命周期钩子解决（drain + 清缓存 + 轮转）。
 - [ ] V16 `RECALL_HOPS=2` 的实测召回质量需要在真实 bank 上验证（教学示例可能数据量太小看不出差异）。
 - [ ] V16 `DECAY_HALF_LIFE_DAYS=30` 是猜测值，需要根据实际记忆使用周期调优；用户能不能"显式重要"标记免衰减？
-- [ ] V17 `transports/` 只有 `chat_completions` 一家，ABC 价值在 V18 加 Anthropic 时才会真正显现 — 当前 V17 是基础设施铺设阶段。
+- [x] ~~V17 `transports/` 只有 `chat_completions` 一家，ABC 价值在 V18 加 Anthropic 时才会真正显现~~ — V18 加 Anthropic 验证 ABC，V19 加 Chain 进一步验证"抽出来的边界能复用"。
+- [ ] V19 断路器 `cooldown_seconds=60` 是猜测值，需要根据实际 provider 恢复时间调优；不同 reason 应不应该有不同 cooldown？
+- [ ] V19 真实多家 provider 联跑测试缺失 — 当前只有 fake transport 的不变量测试，需要在两家真 endpoint 上验证（比如故意把 OPENAI_API_KEY 改错触发 401，观察 chain 是否切到 Anthropic）。
 - [ ] CLAUDE.md 已超 250 行硬规则上限，下一档完成后应把决策日志按版本拆到 `docs/decisions/v<N>.md`，本文件只留索引。
 
 ---

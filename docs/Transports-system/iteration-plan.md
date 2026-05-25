@@ -117,7 +117,7 @@ message = client.messages.create(
 |------|------|---------|---------|-----------|
 | **V17** | Transport ABC + ChatCompletionsTransport | ABC / NormalizedResponse / format conversion / client 工厂 | DeepSeek | `transports/base.py` + `transports/types.py` + `transports/chat_completions.py`（核心 ~150 行） |
 | **V18** | AnthropicTransport + Registry | 第二家 transport / 注册表 / env-driven 路由 / 格式差异具体化 | Qwen via DashScope Anthropic 端点 | `transports/anthropic.py` + `transports/__init__.py`（注册表）+ `anthropic_adapter.py` 子集 |
-| **V19**（候选） | Failover + 健康检查 | 主家挂切备家 / 连续失败计数 / 健康恢复探针 | DeepSeek + Qwen 联合演示主备切换 | 散落在 `run_agent.py` retry/fallback 路径 |
+| **V19** | TransportChain + 断路器 | 多 transport 故障切换 / 错误三分类 / 断路器自愈 / jittered backoff | fake transport 不变量测试（14 项） | `agent/error_classifier.py` 简化版 + `agent/retry_utils.py` + `run_agent.py` fallback chain |
 | **V20**（候选） | Prompt cache 控制 | Anthropic `cache_control: ephemeral` 显式标记 / 缓存命中率统计 | Qwen + 测命中率 | `agent/prompt_caching.py` + transport `extract_cache_stats()` |
 
 ### 4.1 为什么这样拆，不更细也不更粗
@@ -141,7 +141,7 @@ message = client.messages.create(
 |------|-------|---------|
 | V17 | **必做** | transports 子系统的最小可演示单元 |
 | V18 | **必做** | 第二家适配是验证 ABC 价值的关键；Qwen 已可真跑 |
-| V19 | 推荐 | 落地 multi-agent（V21+）后失败容错才有真实价值 |
+| V19 | **已完成** | TransportChain + 断路器 + jittered backoff，14 项不变量测试覆盖 |
 | V20 | 推荐 | 真实使用中发现重复发送相同 system prompt 才有动机 |
 
 ---
@@ -232,3 +232,111 @@ for tc in (normalized.tool_calls or []):
   - empty content + finish_reason="stop" → 断言 valid
 - **回归**：V12/V13/V14/V15/V16 现有脚本全过（agent loop 行为零变化）
 - **真跑**：DeepSeek 跑两轮对话 + 一次 tool call（read_file 或 list_dir），目测正常输出
+
+---
+
+## 6. V19 详细设计（已完成）
+
+### 6.1 标题
+**TransportChain + 断路器 — 多 transport 故障切换 + 健康检查**
+
+### 6.2 解决的问题
+- V18 已有两家 transport 真跑，但任一家挂了 agent 就死（429 / 503 / 网络抖动 / billing 等都直接抛出，主循环没有兜底）
+- 错误判断散落在调用点：哪些错误该重试？哪些该切下一家？哪些是用户输入问题切了也是错？没有统一决策
+- 没有"刚刚连续失败的 transport，下一轮还要不要试"的概念 — 每次都重新调用一遍刚挂的家会浪费时间 + 加重对方故障
+- 重试时机如果是固定 backoff，多 session 同步重试会形成 thundering herd 把刚恢复的服务再打挂
+
+### 6.3 引入的概念
+
+1. **`classify_error(exc)` 函数**（裁剪自源项目 `agent/error_classifier.py` 1058 行 → nano 170 行）
+   - 返回 `ClassifiedError(action, reason, status_code, message)`
+   - 三类 `ErrorAction` 表达完整决策空间：
+     - `RETRYABLE` — 同一家再试一次（500/502/504/408、timeout 关键词）
+     - `FAILOVER` — 这家彻底不行，切下一家（429 rate_limit / 401-403 auth / 402 billing / 503/529 overloaded / 404 model_not_found）
+     - `FATAL` — 用户/输入问题，切了也是错（400 + context_overflow / 413 payload_too_large / 400 format_error）
+   - 决策顺序：先看 status code → 再看消息关键词 → 兜底 RETRYABLE（保守）
+
+2. **`TransportChain` 类**（裁剪自 `run_agent.py` 散落 fallback chain）
+   - 持有 `list[_ChainEntry]`，每 entry = `(api_mode, transport, client, breaker)`
+   - 主入口 `chain.call(client=None, **kwargs)` 签名兼容 `transport.call(client, **kwargs)` — `ContextCompressor` 等存量调用点零改动
+   - 内部按链顺序：跳过 open 状态、对每 entry 做 RETRYABLE 内部重试、FAILOVER 切下家、FATAL 直接抛出、全失败 → `raise FailoverExhausted(attempts)`
+
+3. **断路器三态（closed / open / half_open）**
+   - 数据结构：`_BreakerState(consecutive_failures, opened_at, last_reason)` — 两字段表达三态
+   - `opened_at == 0.0` → closed；`opened_at != 0` 且 `now - opened_at < cooldown` → open；过了 cooldown 但 `opened_at != 0` → half_open（探针）
+   - 转换：连续失败 ≥ `failure_threshold` → 打开；冷却完毕的下一次调用是探针；探针成功 → 重置；探针失败 → 重新累计
+
+4. **Jittered backoff**（仿源 `agent/retry_utils.py:19-57`）
+   - `delay = min(base * 2^(attempt-1), 60.0) + uniform(0, 0.5*delay)`
+   - jitter 防 thundering herd（多 session 同时重试），上限 60s 避免重试到天荒地老
+
+5. **`/transport` 命令** — 健康检查可观测性
+   - 展示每 entry 的 `state` / `consecutive_failures` / `last_reason` / `cooldown_left` / `model`
+   - 教学场景必需：断路器是隐式状态，没 surface 学员根本看不到"为什么 primary 被跳过"
+
+6. **Per-entry model（V19.1 修补）** — 每个 chain entry 自带 `model` 字段
+   - 链字符串语法：`api_mode[:model]`，例：`chat_completions:deepseek-chat,anthropic_messages:qwen3.6-plus`
+   - entry.model 为 None 时回退到调用方传入的 model（兼容 V18 单家行为）
+   - 仿源项目 `run_agent.py:1742-1765` fallback chain 设计 — 每条 entry 自包含 `{provider, model}`，避免"主家 DeepSeek 但 MODEL=qwen3.6-plus"这种错配
+   - 实现：`_try_with_retry` 用 `dict(kwargs)` 浅拷贝后覆盖 `model`，避免链上各 entry 互相污染调用 kwargs
+
+### 6.4 agent.py 改造路径
+
+```python
+# 改造前（V18）
+transport_mode = os.environ.get("TRANSPORT_MODE", "chat_completions")
+transport = get_transport(transport_mode)
+client = make_llm_client(transport.api_mode)
+...
+normalized = transport.call(client, model=model, messages=messages, tools=tools)
+
+# 改造后（V19）
+chain_env = os.environ.get("TRANSPORT_CHAIN") or os.environ.get("TRANSPORT_MODE", "chat_completions")
+chain = build_chain_from_env(chain_env, client_factory=make_llm_client, ...)
+client = chain.primary_client  # 兼容 compressor 等存量位置参数
+...
+try:
+    normalized = chain.call(model=model, messages=messages, tools=tools)
+except FailoverExhausted as e:
+    print(f"[error] all transports failed: {e}")
+```
+
+### 6.5 对应源项目
+
+- `agent/error_classifier.py` 1058 行 — nano `transports/error_classifier.py` 170 行
+- `agent/retry_utils.py` 整个文件 — nano 的 `_jittered_backoff` 一个方法
+- `run_agent.py:1655-1697` fallback 激活 + `run_agent.py:1742-1764` chain 初始化 — nano 的 `TransportChain.call` + `build_chain_from_env`
+
+### 6.6 实际代码量
+
+| 文件 | 行数 | 说明 |
+|------|------|------|
+| `transports/error_classifier.py` | ~170 | 3 类 ErrorAction + status code/关键词分类 |
+| `transports/chain.py` | ~230 | TransportChain + _BreakerState + _ChainEntry + build_chain_from_env |
+| **新增** | **~400** | — |
+| `agent.py` | -3/+25 | 替换 transport 创建 + 增加 /transport 命令 + chain.call 调用点 |
+
+### 6.7 裁剪权衡
+
+源项目复杂度大头（被 nano 删掉的部分）：
+- **provider-specific 错误串匹配** — gemini "thinking signature" / openrouter cache miss / llama_cpp grammar 等十几种 — 教学价值低于"看清三类决策"
+- **`OAuthLongContextBetaForbidden` / `LongContextTier` / `LlamaCppGrammarPattern`** 等边缘 reason — 删
+- **status code → reason 的优先级精细化**（同一个 400 在不同 provider 下 reason 不同）— nano 用直接映射 + 关键词兜底
+- **多家轮询的 health check 后台线程** — nano 把"健康检查"做成请求路径上的副作用（call 时顺带更新 breaker），不开后台
+
+### 6.8 暴露的下一档问题
+
+- 不同 reason 是否应该有不同 cooldown？（rate_limit 几秒就好，billing 可能要几小时）
+- 真实多家联跑测试缺失 — 需故意把主家 key 改错触发 401 验证 chain 是否切到备家
+- `/transport reset` 命令？（手动复位断路器）
+- chain 持有自己的 client，但 `MEMORY_PREFETCH_METHOD=reflect` 也调 LLM — mock_memory_server 是否该接 chain？
+
+→ 后续可拆 V19.1（per-reason cooldown）、V19.2（health check 后台线程）、V19.3（mock server 接 chain）。
+
+### 6.9 验证方式
+
+- **不变量脚本** `scripts/test_v19_failover.py`（14 项，全部用 fake transport / fake exception）：
+  - 5 项 classify_error：429 / 500 / 400-context-overflow / auth 关键词 / 未识别错误
+  - 9 项 chain：primary 成功不切备 / FAILOVER 切备 / RETRYABLE 内部重试 / 全失败 raise FailoverExhausted / 断路器 threshold 打开 / open 状态跳过 entry / 半开探针 closed / FATAL 立即抛出 / 单 transport 链退化为 V18 行为
+- **回归**：V12/V13/V14/V16/V17/V18 现有脚本全过（V15 的 2 项预存在错误来自 V18 改 `compress()` 签名时未同步该测试，与 V19 无关）
+- **真跑**：当前 `TRANSPORT_CHAIN` 不设默认走 V18 单家行为已通过；联跑两家需后续真实环境验证
