@@ -24,10 +24,12 @@ mock-server = [
 ]
 
 [project.scripts]
-nano-hermes = "agent:run_agent"
+nano-hermes = "main:run_agent"
 
 # V10.1: 多个顶层包（memory / tools / plugins）让 setuptools flat-layout 自动发现冲突，
 # 显式列出来 — 这样 `uv pip install -e` 不再报 multiple top-level packages 错误。
+# V21.1: agent.py → main.py（让出 agent/ 包名给 V21.2/V21.3 的 prompt_builder/skill_loader）；
+# 新增 cli/ 子包（slash 命令注册表）和 agent/ 子包（占位，V21.2 起填充）。
 [tool.setuptools]
-packages = ["memory", "tools", "plugins"]
-py-modules = ["agent", "model_tools", "toolsets"]
+packages = ["memory", "tools", "plugins", "transports", "cli", "cli.commands", "agent"]
+py-modules = ["main", "model_tools", "toolsets", "context_compressor"]

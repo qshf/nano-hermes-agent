@@ -1,9 +1,17 @@
 """
-Nano Hermes Agent — V20: Prompt Cache 控制（Anthropic ephemeral）
+Nano Hermes Agent — V21.1: Slash Command 注册表
 
-架构变化（相比 V19）：
-- 新增 transports/prompt_caching.py：``apply_anthropic_cache_control`` (system_and_3 策略)
-- 新增 ABC hook ``apply_prompt_cache``：默认 identity，AnthropicTransport 重写
+V21 主题是"清算 V4 阶段交互层债务"，按 v21.1/v21.2/v21.3 三档落地：
+- V21.1（本档）：slash 命令拆出到 ``cli/commands/<name>.py``，主循环只
+  调 ``cli.dispatch(line, ctx)``；agent.py 整体重命名为 ``main.py`` 让出
+  ``agent/`` 子包名给 V21.2 的 prompt_builder 和 V21.3 的 skill_loader。
+- V21.2（待开发）：``agent/prompt_builder.py`` 三段式 — 骨架 + skill 索引段 + 工具列表段。
+- V21.3（待开发）：``agent/skill_loader.py`` + ``tools/skill_view_tool.py``
+  + ``skills/<name>/SKILL.md`` 示例 + ``/skill`` 命令。
+
+V20 架构（向下保留）：
+- transports/prompt_caching.py：``apply_anthropic_cache_control`` (system_and_3 策略)
+- ABC hook ``apply_prompt_cache``：默认 identity，AnthropicTransport 重写
 - ChatCompletionsTransport / AnthropicTransport 实现 ``extract_cache_stats``
 - chain 在 ``_try_with_retry`` 内做注入 + 累计 cache 命中率到 entry
 - ``Usage`` 增加 ``cache_creation_tokens`` 字段，区分 read/write
@@ -44,12 +52,11 @@ env 开关：
     docker compose down -v && docker compose up -d   # 重建 DB（schema 变了）
     python scripts/mock_memory_server.py
     export MEMORY_SERVICE_URL=http://127.0.0.1:8765
-    python agent.py
+    python main.py
 """
 
 import json
 import os
-import uuid
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
@@ -60,6 +67,7 @@ from memory import BuiltinMemoryProvider, MemoryManager, RemoteSemanticProvider
 from context_compressor import ContextCompressor
 from transports.chain import FailoverExhausted, build_chain_from_env
 from transports.client_factory import make_llm_client
+import cli  # 触发 cli/commands 下所有命令的装饰器注册
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
 ENABLED_TOOLSETS = ["core"]
@@ -182,12 +190,28 @@ def run_agent():
           f"protect_head={compressor.protect_first_n}")
     print(f"  Available tools: {', '.join(get_available_tool_names(ENABLED_TOOLSETS))}")
     print(f"  Memory tools: {', '.join(sorted(memory_manager.get_all_tool_names()))}")
-    print("  Commands: /memory /tools /load /mcp /plugin /new /resume /session /compress /transport")
+    print("  Commands: /help to list all (V21.1: dispatched via cli registry)")
     print("  输入 'quit' 退出")
     print("=" * 60)
     print()
 
     turn_count = 0  # V9: 每轮递增，传给 on_turn_start
+
+    # V21.1: slash handler 共享的运行期上下文
+    ctx = cli.AgentCtx(
+        messages=messages,
+        current_session_id=current_session_id,
+        turn_count=turn_count,
+        chain=chain,
+        client=client,
+        model=model,
+        memory_manager=memory_manager,
+        builtin_provider=builtin_provider,
+        compressor=compressor,
+        registry=registry,
+        enabled_toolsets=ENABLED_TOOLSETS,
+        build_system_prompt=build_system_prompt,
+    )
 
     try:
         while True:
@@ -203,205 +227,13 @@ def run_agent():
                 print("Bye!")
                 break
 
-            # /memory 命令：查看当前记忆状态（通过 manager 找到 builtin provider）
-            if user_input == "/memory":
-                if builtin_provider is None:
-                    print("  [memory] (no builtin provider)")
-                    continue
-                store = builtin_provider.store
-                entries = store.entries
-                if not entries:
-                    print("  [memory] (empty)")
-                else:
-                    print(f"  [memory] {len(entries)} entries, "
-                          f"{store.char_count()}/{store.char_limit} chars")
-                    for i, entry in enumerate(entries, 1):
-                        display = entry[:80] + "..." if len(entry) > 80 else entry
-                        print(f"    {i}. {display}")
-                continue
-
-            # /load 命令：运行时动态加载 plugins/ 下的工具
-            if user_input.startswith("/load "):
-                filename = user_input[6:].strip()
-                try:
-                    from tools import load_plugin
-                    old_gen = registry.generation
-                    load_plugin(filename)
-                    print(f"  [loaded] {filename} (generation: {old_gen} → {registry.generation})")
-                    print(f"  [tools] {registry.tool_names}")
-                except Exception as e:
-                    print(f"  [error] {e}")
-                continue
-
-            # /mcp 命令：按需连接 MCP server
-            if user_input.startswith("/mcp"):
-                from tools.mcp_client import mcp_manager
-                parts = user_input.split()
-
-                if len(parts) == 1 or parts[1] == "list":
-                    servers = mcp_manager.connected_servers
-                    if not servers:
-                        print("  [mcp] No connected servers. Use: /mcp connect <name> <command> [args...]")
-                    else:
-                        for s in servers:
-                            tools = mcp_manager.get_tools(s)
-                            print(f"  [mcp] {s}: {', '.join(tools)}")
-                    continue
-
-                if parts[1] == "connect" and len(parts) >= 4:
-                    # /mcp connect mcp_server_demo python mcp_server_demo.py
-                    name = parts[2]
-                    command = parts[3]
-                    args = parts[4:] if len(parts) > 4 else []
-                    try:
-                        old_gen = registry.generation
-                        mcp_manager.connect(name, command, args)
-                        tools = mcp_manager.get_tools(name)
-                        print(f"  [mcp] Connected to '{name}' (generation: {old_gen} → {registry.generation})")
-                        print(f"  [mcp] Tools: {', '.join(tools)}")
-                    except Exception as e:
-                        print(f"  [mcp error] {e}")
-                    continue
-
-                if parts[1] == "disconnect" and len(parts) >= 3:
-                    name = parts[2]
-                    old_gen = registry.generation
-                    disconnected = mcp_manager.disconnect(name)
-                    if disconnected:
-                        print(f"  [mcp] Disconnected '{name}' (generation: {old_gen} → {registry.generation})")
-                    else:
-                        print(f"  [mcp] '{name}' is not connected. Use /mcp list to see connected servers.")
-                    continue
-
-                if parts[1] == "refresh" and len(parts) >= 3:
-                    name = parts[2]
-                    old_gen = registry.generation
-                    mcp_manager.refresh(name)
-                    tools = mcp_manager.get_tools(name)
-                    print(f"  [mcp] Refreshed '{name}' (generation: {old_gen} → {registry.generation})")
-                    print(f"  [mcp] Tools: {', '.join(tools)}")
-                    continue
-
-                print("  Usage:")
-                print("    /mcp                          — list connected servers")
-                print("    /mcp connect <name> <cmd> [args...]  — connect to MCP server")
-                print("    /mcp disconnect <name>        — disconnect")
-                print("    /mcp refresh <name>           — refresh tool list")
-                continue
-
-            # /plugin 命令：V5 插件生命周期管理
-            if user_input.startswith("/plugin"):
-                from tools import load_plugin, unload_plugin, list_plugins
-                parts = user_input.split()
-
-                if len(parts) == 1 or parts[1] == "list":
-                    plugins = list_plugins()
-                    if not plugins:
-                        print("  [plugin] No loaded plugins. Use: /plugin load <filename>")
-                    else:
-                        for name, hooks in plugins.items():
-                            print(f"  [plugin] {name}: {', '.join(hooks) if hooks else '(no hooks)'}")
-                    continue
-
-                if parts[1] == "load" and len(parts) >= 3:
-                    filename = parts[2]
-                    try:
-                        load_plugin(filename)
-                        plugins = list_plugins()
-                        hooks = plugins.get(filename.replace(".py", "").replace(".py", ""), [])
-                        print(f"  [plugin] Loaded '{filename}'")
-                        print(f"  [plugin] Hooks: {', '.join(hooks) if hooks else '(none)'}")
-                    except Exception as e:
-                        print(f"  [plugin error] {e}")
-                    continue
-
-                if parts[1] == "unload" and len(parts) >= 3:
-                    filename = parts[2]
-                    if unload_plugin(filename):
-                        print(f"  [plugin] Unloaded '{filename}'")
-                    else:
-                        print(f"  [plugin] '{filename}' is not loaded.")
-                    continue
-
-                print("  Usage:")
-                print("    /plugin                  — list loaded plugins")
-                print("    /plugin load <file>      — load plugin and register hooks")
-                print("    /plugin unload <file>    — unload plugin and deregister hooks")
-                continue
-
-            # /tools 命令：查看当前可用工具
-            if user_input == "/tools":
-                available = get_available_tool_names(ENABLED_TOOLSETS)
-                print(f"  [toolset] {ENABLED_TOOLSETS}")
-                print(f"  [available] {', '.join(available)}")
-                print(f"  [registered] {', '.join(registry.tool_names)}")
-                continue
-
-            # /session 命令：查看当前 session_id
-            if user_input == "/session":
-                print(f"  [session] {current_session_id}")
-                continue
-
-            # /compress 命令：手动触发上下文压缩（调试用）
-            if user_input == "/compress":
-                est = compressor.estimate_tokens(messages)
-                print(f"  [compress] estimated tokens: {est}, threshold: {compressor.threshold_tokens}")
-                if len(messages) < compressor.protect_first_n + 5:
-                    print("  [compress] not enough messages to compress")
-                    continue
-                memory_manager.on_pre_compress_all(messages[compressor.protect_first_n:])
-                # V19: 压缩调用走 chain — 链长 1 时与 V18 一致；链长 ≥2 时摘要
-                # 也享受故障切换。chain.call(client,...) 签名兼容 transport.call。
-                messages = compressor.compress(messages, client, model, transport=chain)
-                print(f"  [compress] compacted to {len(messages)} messages")
-                continue
-
-            # /transport 命令：V19 健康检查 — 显示每家 transport 的断路器状态
-            # V20: 增加 prompt cache 命中率（read / write / hit_rate）
-            if user_input == "/transport":
-                status = chain.status()
-                for s in status:
-                    state_label = s["state"]
-                    model_label = s["model"] or f"{model} (fallback)"
-                    extra = ""
-                    if state_label != "closed":
-                        extra = (
-                            f" failures={s['consecutive_failures']}"
-                            f" last={s['last_reason']}"
-                            f" cooldown_left={s['cooldown_left']:.1f}s"
-                        )
-                    print(f"  [transport] {s['api_mode']}({model_label}): {state_label}{extra}")
-                    if s["cache_read"] or s["cache_write"] or s["cache_uncached"]:
-                        print(
-                            f"    cache: read={s['cache_read']} "
-                            f"write={s['cache_write']} "
-                            f"uncached={s['cache_uncached']} "
-                            f"hit_rate={s['cache_hit_rate']:.1%}"
-                        )
-                continue
-
-            # /new 命令：创建全新会话
-            if user_input == "/new":
-                new_id = f"session-{uuid.uuid4().hex[:8]}"
-                memory_manager.on_session_switch_all(new_id, reset=True)
-                current_session_id = new_id
-                messages = [{"role": "system", "content": build_system_prompt()}]
-                turn_count = 0
-                print(f"  [session] New session: {current_session_id}")
-                continue
-
-            # /resume 命令：切回已有会话
-            if user_input.startswith("/resume"):
-                parts = user_input.split(maxsplit=1)
-                if len(parts) < 2 or not parts[1].strip():
-                    print("  Usage: /resume <session_id>")
-                    continue
-                target_id = parts[1].strip()
-                memory_manager.on_session_switch_all(target_id, reset=False)
-                current_session_id = target_id
-                messages = [{"role": "system", "content": build_system_prompt()}]
-                turn_count = 0
-                print(f"  [session] Resumed: {current_session_id}")
+            # V21.1: slash 命令统一通过 cli.dispatch 路由到 cli/commands/*.py
+            # handler 通过 ctx 直接 mutate 状态：
+            #   - messages 与 ctx.messages 共享同一 list 引用（in-place ops）
+            #   - session_id / turn_count 由 handler 改 ctx.* 后此处同步回局部
+            if cli.dispatch(user_input, ctx):
+                current_session_id = ctx.current_session_id
+                turn_count = ctx.turn_count
                 continue
 
             # V9 生命周期：每轮开始通知 + prefetch 召回
@@ -431,7 +263,9 @@ def run_agent():
                     head_end = compressor.protect_first_n
                     memory_manager.on_pre_compress_all(messages[head_end:])
                     # V19: 摘要 LLM 调用也走 chain，享受 failover
-                    messages = compressor.compress(messages, client, model, transport=chain)
+                    # V21.1: 用 in-place 替换避免局部 messages 与 ctx.messages 引用分歧
+                    compacted = compressor.compress(messages, client, model, transport=chain)
+                    messages[:] = compacted
                     print(f"  [compress] compacted to {len(messages)} messages")
 
                 # 每轮重新计算：check_fn 结果可能变化（如用户中途装了 Docker）
@@ -529,6 +363,9 @@ def run_agent():
 
             # V13: 预热下一轮的 recall — 用当轮 user input 作为 query
             memory_manager.queue_prefetch_all(user_input)
+
+            # V21.1: 同步本轮 turn_count 到 ctx（messages / session_id 已通过引用共享）
+            ctx.turn_count = turn_count
     finally:
         # V10: 释放外部 provider 的 httpx client；builtin 的 shutdown 是 no-op
         memory_manager.shutdown_all()

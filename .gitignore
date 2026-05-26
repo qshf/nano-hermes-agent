@@ -5,3 +5,4 @@ __pycache__/
 .env
 .claude/
 docs/social
+.vscode

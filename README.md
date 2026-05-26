@@ -35,7 +35,7 @@ cp .env.example .env
 
 # 运行
 source .venv/bin/activate
-python agent.py
+python main.py
 ```
 
 ## 演进脉络（V6 → V10）
@@ -157,11 +157,11 @@ agent.py 不再直接持有 store，而是通过 provider 收 schema、路由 to
 
 ```bash
 # 不设：跑 V9 的行为（只有 builtin provider）
-python agent.py
+python main.py
 
 # 设：加挂 RemoteSemanticProvider
 export MEMORY_SERVICE_URL=http://127.0.0.1:8765
-python agent.py
+python main.py
 ```
 
 **启动 mock 服务**（另开终端）：
@@ -213,7 +213,7 @@ python scripts/mock_memory_server.py
 export MEMORY_SERVICE_URL=http://127.0.0.1:8765
 export MEMORY_RECALL_BUDGET=mid     # low / mid / high
 export MEMORY_MIN_SCORE=0.3         # 过滤低相似度噪声
-python agent.py
+python main.py
 ```
 
 **V10.1 简化（vs 源项目 Hindsight）**：单文件 mock 而非完整守护进程、无实体抽取/事实图、无 reflect 综合、同步阻塞 sync、无 retain_async 后台批写。保留：pgvector 真后端、SQL 下推余弦排序、budget 语义档位、OpenAI 范式 embedding 端点。
@@ -224,7 +224,7 @@ python agent.py
 
 ```
 nano_hermes_agent/
-├── agent.py                    # 主循环 + 生命周期时序 + 按 env 注册外部 provider
+├── main.py                     # V21.1 起：主循环 + 生命周期时序 + 按 env 注册外部 provider（原 agent.py）
 ├── model_tools.py              # 外层缓存 + MCP 工具自动包含
 ├── toolsets.py                 # 工具组定义（不含 memory，由 provider 管）
 ├── docker-compose.yml          # V10.1 pgvector/pg16 一键起
