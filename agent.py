@@ -133,7 +133,7 @@ def run_agent():
         cooldown_seconds=float(os.environ.get("FAILOVER_COOLDOWN_SECONDS", "60")),
         max_retries=int(os.environ.get("FAILOVER_MAX_RETRIES", "2")),
         base_delay=float(os.environ.get("FAILOVER_BASE_DELAY", "1.0")),
-        cache_enabled=os.environ.get("PROMPT_CACHE_ENABLED", "1") not in ("0", "false", "False", ""),
+        cache_enabled=os.environ.get("PROMPT_CACHE_ENABLED", "0") not in ("0", "false", "False", ""),
         cache_ttl=os.environ.get("PROMPT_CACHE_TTL", "5m"),
     )
 
