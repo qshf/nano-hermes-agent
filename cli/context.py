@@ -11,8 +11,10 @@
 
 后续版本扩展
 ============
-- V21.2: 加 ``prompt_builder: PromptBuilder``，让 ``/new`` / ``/resume``
-  通过 ``ctx.prompt_builder.build()`` 重建 system prompt 而不是再写一遍模板。
+- V21.2（已落地）: ``prompt_builder: PromptBuilder``，``/new`` / ``/resume``
+  直接调 ``ctx.prompt_builder.build()`` 重建 system prompt。``build_system_prompt``
+  字段保留为兼容回调（仍是 ``prompt_builder.build`` 的 thin wrapper），
+  V21.3 再根据需要清理。
 - V21.3: 加 ``skill_loader: SkillLoader``，让 ``/skill`` 命令使用。
 - V22+: 加 ``cancel_token`` / ``stream_state`` 等。
 """
@@ -20,7 +22,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 
 @dataclass
@@ -41,7 +43,10 @@ class AgentCtx:
     - ``compressor``      V15 ContextCompressor
     - ``registry``        ToolRegistry
     - ``enabled_toolsets`` 当前启用的 toolset 列表
-    - ``build_system_prompt``  V21.1 仍是模块函数；V21.2 替换为 PromptBuilder.build
+    - ``prompt_builder``  V21.2 起：三段式 PromptBuilder。``/new`` / ``/resume``
+                          通过 ``ctx.prompt_builder.build()`` 重建 system prompt
+    - ``build_system_prompt``  V21.1 兼容回调；V21.2 起默认指向
+                               ``prompt_builder.build``，handler 可继续调
     """
 
     # 可变 — handler 可改
@@ -59,6 +64,8 @@ class AgentCtx:
     registry: Any                      # tools.registry.ToolRegistry
     enabled_toolsets: list[str]
     build_system_prompt: Callable[[], str]
+    prompt_builder: Optional[Any] = None   # agent.prompt_builder.PromptBuilder（V21.2+）
 
-    # 后续版本扩展位（V21.2 prompt_builder / V21.3 skill_loader / V22 cancel_token）
+    # 后续版本扩展位（V21.3 skill_loader / V22 cancel_token）
     extras: dict[str, Any] = field(default_factory=dict)
+

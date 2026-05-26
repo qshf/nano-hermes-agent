@@ -1,11 +1,13 @@
 """
-Nano Hermes Agent — V21.1: Slash Command 注册表
+Nano Hermes Agent — V21.2: Prompt Builder 三段式
 
 V21 主题是"清算 V4 阶段交互层债务"，按 v21.1/v21.2/v21.3 三档落地：
-- V21.1（本档）：slash 命令拆出到 ``cli/commands/<name>.py``，主循环只
+- V21.1（已完成）：slash 命令拆出到 ``cli/commands/<name>.py``，主循环只
   调 ``cli.dispatch(line, ctx)``；agent.py 整体重命名为 ``main.py`` 让出
   ``agent/`` 子包名给 V21.2 的 prompt_builder 和 V21.3 的 skill_loader。
-- V21.2（待开发）：``agent/prompt_builder.py`` 三段式 — 骨架 + skill 索引段 + 工具列表段。
+- V21.2（本档）：``agent/prompt_builder.py`` 三段式 — 骨架 + skill 索引段
+  （V21.3 填充）+ memory 块 + 工具列表段。删掉 V4 起的
+  ``SYSTEM_PROMPT.format(...)`` 模板替换。
 - V21.3（待开发）：``agent/skill_loader.py`` + ``tools/skill_view_tool.py``
   + ``skills/<name>/SKILL.md`` 示例 + ``/skill`` 命令。
 
@@ -67,19 +69,11 @@ from memory import BuiltinMemoryProvider, MemoryManager, RemoteSemanticProvider
 from context_compressor import ContextCompressor
 from transports.chain import FailoverExhausted, build_chain_from_env
 from transports.client_factory import make_llm_client
+from agent import PromptBuilder
 import cli  # 触发 cli/commands 下所有命令的装饰器注册
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
 ENABLED_TOOLSETS = ["core"]
-
-SYSTEM_PROMPT = """You are a helpful coding assistant. You have access to the following tools:
-{tool_list}
-
-When the user asks you to do something, use the appropriate tool.
-Always explain what you're doing before and after tool use.
-Respond in the same language as the user.
-
-{memory_block}"""
 
 # V8: 通过 manager 编排 provider；V10: 按环境变量加挂外部 provider
 memory_manager = MemoryManager()
@@ -112,16 +106,24 @@ if _remote_url:
 memory_manager.initialize_all(session_id=os.environ.get("MEMORY_SESSION_ID", "default"))
 
 
+# V21.2: 三段式 PromptBuilder 替换 V4 的 SYSTEM_PROMPT.format(...)
+# 段顺序固定（骨架 → skill 索引 → memory → 工具列表），空段自动跳过；
+# V21.3 把 SkillLoader 注入进来即可填充 tier 1 索引段。
+prompt_builder = PromptBuilder(
+    get_toolset_tool_names=get_available_tool_names,
+    enabled_toolsets=ENABLED_TOOLSETS,
+    memory_manager=memory_manager,
+    skill_loader=None,   # V21.3 落地后改为 SkillLoader 实例
+)
+
+
 def build_system_prompt() -> str:
-    tool_names = get_available_tool_names(ENABLED_TOOLSETS)
-    # 通过 manager 收集所有 provider 暴露的工具名
-    provider_tool_names = list(memory_manager.get_all_tool_names())
-    all_tool_names = sorted(set(tool_names + provider_tool_names))
-    tool_list = "\n".join(f"- `{name}`" for name in all_tool_names)
+    """V4→V21.1 兼容入口；V21.2 起 thin wrapper 委托给 prompt_builder.build()。
 
-    memory_block = memory_manager.build_system_prompt()
-
-    return SYSTEM_PROMPT.format(tool_list=tool_list, memory_block=memory_block).strip()
+    保留模块函数是为了兼容 V21.1 期间 ``AgentCtx.build_system_prompt`` 字段
+    的 callable 类型 — 单测里 mock ctx 时直接传 ``lambda: "..."`` 即可。
+    """
+    return prompt_builder.build()
 
 
 def run_agent():
@@ -162,7 +164,7 @@ def run_agent():
     compressor = ContextCompressor()
 
     print("=" * 60)
-    print("  Nano Hermes Agent v20 — Prompt Cache 控制（Anthropic ephemeral）")
+    print("  Nano Hermes Agent v21.2 — Prompt Builder 三段式")
     print(f"  Default MODEL (entries 不内联时回退到此): {model}")
     chain_modes = " → ".join(
         f"{e.api_mode}({e.model})" if e.model else e.api_mode
@@ -211,6 +213,7 @@ def run_agent():
         registry=registry,
         enabled_toolsets=ENABLED_TOOLSETS,
         build_system_prompt=build_system_prompt,
+        prompt_builder=prompt_builder,
     )
 
     try:
