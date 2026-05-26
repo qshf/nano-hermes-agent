@@ -20,8 +20,8 @@
 ## Transports 系统（V17-V20）
 - [x] ~~V17 `transports/` 只有 `chat_completions` 一家，ABC 价值在 V18 加 Anthropic 时才会真正显现~~ — V18 加 Anthropic 验证 ABC，V19 加 Chain 进一步验证"抽出来的边界能复用"。
 - [ ] V19 断路器 `cooldown_seconds=60` 是猜测值，需要根据实际 provider 恢复时间调优；不同 reason 应不应该有不同 cooldown？
-- [ ] V19 真实多家 provider 联跑测试缺失 — 当前只有 fake transport 的不变量测试，需要在两家真 endpoint 上验证（比如故意把 OPENAI_API_KEY 改错触发 401，观察 chain 是否切到 Anthropic）。
-- [ ] V20 真实 cache 命中率验证缺失 — 需要在 DashScope Anthropic 端点上跑多轮对话，观察 `cache_read_input_tokens` 是否真有上升（DashScope 可能不实现 cache_control，盲启可能直接 400）。
+- [x] V19 真实多家 provider 联跑测试缺失 — 当前只有 fake transport 的不变量测试，需要在两家真 endpoint 上验证（比如故意把 OPENAI_API_KEY 改错触发 401，观察 chain 是否切到 Anthropic）。
+- [x] V20 真实 cache 命中率验证缺失 — 需要在 DashScope Anthropic 端点上跑多轮对话，观察 `cache_read_input_tokens` 是否真有上升（DashScope 可能不实现 cache_control，盲启可能直接 400）。
 - [ ] V20 break-even 轮数估算 — 单次 cache write 比 read 贵 ~12 倍，理论上需要 ≥ 13 轮命中才能回本；nano 没暴露 pricing 估算工具。
 
 ## 文档
