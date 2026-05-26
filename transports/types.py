@@ -56,12 +56,18 @@ class ToolCall:
 
 @dataclass
 class Usage:
-    """API 返回的 token 用量统计。"""
+    """API 返回的 token 用量统计。
+
+    ``cached_tokens`` / ``cache_creation_tokens`` 区分 read/write —
+    Anthropic 显式区分，OpenAI 兼容只有 read（write=0）。这是为了让 V20
+    chain 能准确区分"省了多少钱"和"花了多少钱写入缓存"。
+    """
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
     cached_tokens: int = 0
+    cache_creation_tokens: int = 0  # V20: Anthropic cache_creation_input_tokens
 
 
 @dataclass

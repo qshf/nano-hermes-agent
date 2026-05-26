@@ -150,6 +150,27 @@ class ChatCompletionsTransport(ProviderTransport):
             return False
         return bool(response.choices)
 
+    def extract_cache_stats(self, response: Any) -> dict[str, int] | None:
+        """V20 — 抽 OpenAI 兼容协议的 cache 命中 token。
+
+        DeepSeek/OpenAI 把 cache 命中数放在 ``usage.prompt_tokens_details.cached_tokens``。
+        与 Anthropic 不同的是 — OpenAI 兼容侧的 cache 是**隐式**的（自动 prefix 匹配，
+        调用方不打 cache_control），所以这里只能"读取已命中"，无法主动控制写入。
+
+        creation_tokens 字段在 OpenAI 兼容侧不存在 — DeepSeek 不区分 read/write，
+        统一用 ``cached_tokens``。返回 0 时表示未命中或不支持。
+        """
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        details = getattr(usage, "prompt_tokens_details", None)
+        if details is None:
+            return None
+        cached = getattr(details, "cached_tokens", 0) or 0
+        if cached == 0:
+            return None
+        return {"cached_tokens": cached, "creation_tokens": 0}
+
 
 # 模块导入时自动注册。
 from transports import register_transport  # noqa: E402

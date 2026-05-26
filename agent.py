@@ -1,14 +1,19 @@
 """
-Nano Hermes Agent — V19: Failover + 健康检查（断路器）
+Nano Hermes Agent — V20: Prompt Cache 控制（Anthropic ephemeral）
 
-架构变化（相比 V18）：
-- 新增 TransportChain：主备 transport 顺序故障切换 + 断路器自愈 + jittered backoff
-- 新增 classify_error：3 类决策（RETRYABLE / FAILOVER / FATAL），驱动 chain 行为
-- 新增 TRANSPORT_CHAIN env：逗号分隔多个 api_mode（不设则退化为单 transport，行为同 V18）
-- 新增 /transport 命令：查看每家 transport 的健康状态（断路器三态 closed/half_open/open）
-- agent loop 调用从 transport.call(client,...) 改为 chain.call(...)，签名兼容
+架构变化（相比 V19）：
+- 新增 transports/prompt_caching.py：``apply_anthropic_cache_control`` (system_and_3 策略)
+- 新增 ABC hook ``apply_prompt_cache``：默认 identity，AnthropicTransport 重写
+- ChatCompletionsTransport / AnthropicTransport 实现 ``extract_cache_stats``
+- chain 在 ``_try_with_retry`` 内做注入 + 累计 cache 命中率到 entry
+- ``Usage`` 增加 ``cache_creation_tokens`` 字段，区分 read/write
+- ``/transport`` 命令展示 read/write/uncached/hit_rate
 
-env 开关（V19 新增）：
+env 开关（V20 新增）：
+    PROMPT_CACHE_ENABLED        1/0（默认 0，启用后链上每个 entry 自决定是否打标记）
+    PROMPT_CACHE_TTL            5m（默认）/ 1h（1h 单价更高但 TTL 长）
+
+env 开关（V19）：
     TRANSPORT_CHAIN              chat_completions,anthropic_messages（不设则用 TRANSPORT_MODE 单家）
     FAILOVER_FAILURE_THRESHOLD   断路器打开阈值（默认 3 次连续失败）
     FAILOVER_COOLDOWN_SECONDS    断路器冷却时间（默认 60s）
@@ -128,6 +133,8 @@ def run_agent():
         cooldown_seconds=float(os.environ.get("FAILOVER_COOLDOWN_SECONDS", "60")),
         max_retries=int(os.environ.get("FAILOVER_MAX_RETRIES", "2")),
         base_delay=float(os.environ.get("FAILOVER_BASE_DELAY", "1.0")),
+        cache_enabled=os.environ.get("PROMPT_CACHE_ENABLED", "1") not in ("0", "false", "False", ""),
+        cache_ttl=os.environ.get("PROMPT_CACHE_TTL", "5m"),
     )
 
     # 兼容存量代码路径 — 主家用于 client 引用（仅作为 compressor.compress 第三个
@@ -147,7 +154,7 @@ def run_agent():
     compressor = ContextCompressor()
 
     print("=" * 60)
-    print("  Nano Hermes Agent v19 — Failover + 健康检查（断路器）")
+    print("  Nano Hermes Agent v20 — Prompt Cache 控制（Anthropic ephemeral）")
     print(f"  Default MODEL (entries 不内联时回退到此): {model}")
     chain_modes = " → ".join(
         f"{e.api_mode}({e.model})" if e.model else e.api_mode
@@ -157,6 +164,11 @@ def run_agent():
     print(f"    failure_threshold={chain.failure_threshold}, "
           f"cooldown={chain.cooldown_seconds}s, "
           f"max_retries={chain.max_retries}, base_delay={chain.base_delay}s")
+    if chain.cache_enabled:
+        print(f"    prompt_cache: enabled (ttl={chain.cache_ttl}, "
+              f"strategy=system_and_3, applies to anthropic_messages only)")
+    else:
+        print(f"    prompt_cache: disabled (set PROMPT_CACHE_ENABLED=1 to enable)")
     print(f"  Session: {current_session_id}")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
     print(f"  Memory providers: {[p.name for p in memory_manager.providers]}")
@@ -345,6 +357,7 @@ def run_agent():
                 continue
 
             # /transport 命令：V19 健康检查 — 显示每家 transport 的断路器状态
+            # V20: 增加 prompt cache 命中率（read / write / hit_rate）
             if user_input == "/transport":
                 status = chain.status()
                 for s in status:
@@ -358,6 +371,13 @@ def run_agent():
                             f" cooldown_left={s['cooldown_left']:.1f}s"
                         )
                     print(f"  [transport] {s['api_mode']}({model_label}): {state_label}{extra}")
+                    if s["cache_read"] or s["cache_write"] or s["cache_uncached"]:
+                        print(
+                            f"    cache: read={s['cache_read']} "
+                            f"write={s['cache_write']} "
+                            f"uncached={s['cache_uncached']} "
+                            f"hit_rate={s['cache_hit_rate']:.1%}"
+                        )
                 continue
 
             # /new 命令：创建全新会话

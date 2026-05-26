@@ -142,7 +142,7 @@ message = client.messages.create(
 | V17 | **必做** | transports 子系统的最小可演示单元 |
 | V18 | **必做** | 第二家适配是验证 ABC 价值的关键；Qwen 已可真跑 |
 | V19 | **已完成** | TransportChain + 断路器 + jittered backoff，14 项不变量测试覆盖 |
-| V20 | 推荐 | 真实使用中发现重复发送相同 system prompt 才有动机 |
+| V20 | **已完成** | Prompt Cache 控制（Anthropic ephemeral system_and_3 + Usage 拆 read/write + chain 累计命中率），13 项不变量测试覆盖 |
 
 ---
 
@@ -340,3 +340,108 @@ except FailoverExhausted as e:
   - 9 项 chain：primary 成功不切备 / FAILOVER 切备 / RETRYABLE 内部重试 / 全失败 raise FailoverExhausted / 断路器 threshold 打开 / open 状态跳过 entry / 半开探针 closed / FATAL 立即抛出 / 单 transport 链退化为 V18 行为
 - **回归**：V12/V13/V14/V16/V17/V18 现有脚本全过（V15 的 2 项预存在错误来自 V18 改 `compress()` 签名时未同步该测试，与 V19 无关）
 - **真跑**：当前 `TRANSPORT_CHAIN` 不设默认走 V18 单家行为已通过；联跑两家需后续真实环境验证
+
+---
+
+## 7. V20 详细设计（已完成）
+
+### 7.1 标题
+**Prompt Cache 控制（Anthropic ephemeral system_and_3）— 显式标记缓存边界 + 命中率统计**
+
+### 7.2 解决的问题
+- V18-V19 已经能跨两家 transport 跑通，但每轮都把整个 system prompt + 历史消息重发 — 多轮对话里几 KB 的稳定 prefix 反复占 input token 计费
+- Anthropic 提供 `cache_control: ephemeral` 显式标记机制可省 ~75% input 计费，但需要调用方主动在消息上打 marker（与 OpenAI/DeepSeek 隐式 prefix 缓存不同）
+- 没有命中率可观测性 — 调用方根本不知道"我打的 marker 真生效了吗""命中多少"
+
+### 7.3 引入的概念
+
+1. **`apply_anthropic_cache_control(messages, cache_ttl)`**（仿源项目 `prompt_caching.py` 72 行版本，几乎照搬）
+   - **system_and_3 策略**：1 breakpoint 在 system + 3 breakpoints 在最后 3 条非 system 消息（Anthropic 单请求 4 个上限）
+   - str content 自动升级为 `[{"type":"text", "text":..., "cache_control":...}]` block list
+   - role=tool 直接在顶层挂 cache_control（convert_messages 后落到 tool_result 块）
+   - 返回深拷贝，原 list 不被污染（避免跨轮污染）
+
+2. **ABC hook `apply_prompt_cache(messages, cache_ttl)`**（在 `transports/base.py` 上加默认 identity）
+   - 让"哪家需要主动打 cache_control"成为 transport 自己的协议特性
+   - `ChatCompletionsTransport` 走默认 identity（DeepSeek/OpenAI 用 prefix 匹配自动缓存）
+   - `AnthropicTransport` 重写为 `apply_anthropic_cache_control`
+   - 设计原则：每加一种 cache 行为不同的 provider，只需在它的 transport 内部覆写 hook，chain 一行不动
+
+3. **`Usage` 拆 read/write 两字段**
+   - `cached_tokens`: cache 命中读取（Anthropic `cache_read_input_tokens` / OpenAI `prompt_tokens_details.cached_tokens`）
+   - `cache_creation_tokens`: cache 首次写入（仅 Anthropic `cache_creation_input_tokens`，OpenAI 兼容 = 0）
+   - 计费完全不同（read ~1/10 input 价，write ~1.25x input 价），合并会丢失关键信息
+
+4. **chain 集成**（在 `_try_with_retry` 内）
+   - 调 `entry.transport.apply_prompt_cache(messages)` 后再 call — 每个 entry 用自己的 transport hook 决定怎么标记
+   - 累计 read/write/uncached 到 `_ChainEntry.cache_*_total`
+   - failover 切备家时新 entry 用自己的 hook（chat_completions 走 identity，互不干扰）
+
+5. **`/transport` 命令展示命中率**（V19 加入的命令上扩展）
+   - 单次数字噪音大（一个字段差异就能让 prefix 失配率波动 30%+），累计统计才稳定可读
+   - 输出格式：`cache: read=N write=M uncached=K hit_rate=XX.X%`
+
+### 7.4 agent.py 改造路径
+
+```python
+# 改造前（V19）
+chain = build_chain_from_env(chain_env, client_factory=make_llm_client, ...)
+
+# 改造后（V20）— 多 2 个 cache 参数
+chain = build_chain_from_env(
+    chain_env, client_factory=make_llm_client,
+    ...,
+    cache_enabled=os.environ.get("PROMPT_CACHE_ENABLED", "0") not in ("0", "false", ""),
+    cache_ttl=os.environ.get("PROMPT_CACHE_TTL", "5m"),
+)
+
+# /transport 命令多打印 cache 行
+if s["cache_read"] or s["cache_write"] or s["cache_uncached"]:
+    print(f"    cache: read={s['cache_read']} write={s['cache_write']} "
+          f"uncached={s['cache_uncached']} hit_rate={s['cache_hit_rate']:.1%}")
+```
+
+### 7.5 对应源项目
+
+- `agent/prompt_caching.py` 72 行 — nano `transports/prompt_caching.py` 几乎 1:1（删 `native_anthropic` 标志）
+- `agent/transports/anthropic.py:150-159` `extract_cache_stats` — nano 同名方法 1:1
+- `agent/transports/chat_completions.py:596-608` `extract_cache_stats` — nano 简化版（OpenAI 兼容只 read 不 write）
+- `agent/usage_pricing.py` 的 cache token 累计 — nano 移到 chain（不算钱）
+
+### 7.6 实际代码量
+
+| 文件 | 行数 | 说明 |
+|------|------|------|
+| `transports/prompt_caching.py` | ~110 | apply_anthropic_cache_control + _apply_cache_marker |
+| `transports/base.py` | +14 | apply_prompt_cache 默认 hook |
+| `transports/anthropic.py` | +35 | extract_cache_stats / apply_prompt_cache 重写 / convert_messages 保留 cache_control |
+| `transports/chat_completions.py` | +20 | extract_cache_stats |
+| `transports/types.py` | +2 | Usage.cache_creation_tokens |
+| `transports/chain.py` | +60 | _accumulate_cache_stats / cache_enabled+cache_ttl 参数 / status() 加 cache 字段 |
+| **新增** | **~240** | — |
+| `agent.py` | +12 | env 解析 + banner + /transport 命令扩展 |
+
+### 7.7 裁剪权衡
+
+源项目复杂度大头（被 nano 删掉）：
+- **`usage_pricing.py` 700+ 行** — 把 cache read/write/input token 转换成各家具体单价的钱数估算。教学价值低于"看清命中率怎么算"
+- **`native_anthropic` 标志** — 适配 Anthropic 兼容代理（如 OpenRouter 的 anthropic 模式），nano 永远走 native
+- **Anthropic 1h TTL 单价区分** — 1h ttl write 比 5m write 贵 2x，read 同价；nano 不算钱，跳过
+- **runtime override**（`agent.py:8555` 跨多个 session 切换 cache 开关）— nano 单 env 决定，启动后不改
+
+### 7.8 暴露的下一档问题
+
+- DashScope Qwen Anthropic 兼容端点是否真支持 `cache_control`？盲启可能 400。需要 V20.1 加"启动期一次探测"
+- break-even 轮数估算工具？write 比 read 贵 ~12 倍，理论上需要 ≥ 13 轮命中才能回本
+- chat_completions 隐式缓存的命中率统计已经累计在 `cache_read_total` 里，但用户可能误以为这是"自己打的 cache_control 生效了"。需要在 `/transport` 输出里区分 explicit vs implicit
+- 多轮对话里 prefix 失配（比如 prefetch 的召回内容每轮变化）会让 cache 命中率断崖下跌 — nano 的注入位置（user message 内）会破坏前缀稳定性，需要在 prefetch 之前打 marker 还是之后？
+
+### 7.9 验证方式
+
+- **不变量脚本** `scripts/test_v20_prompt_cache.py`（13 项，全部用纯函数 / fake transport / fake response）：
+  - 5 项 prompt_caching 模块：system_and_3 策略 / str→block 升级 / 1h ttl 注入 / 空 messages / 深拷贝不污染原 list
+  - 3 项 transport hook：ChatCompletions identity / Anthropic 调底层模块 / convert_messages 保留 cache_control
+  - 2 项 extract_cache_stats：Anthropic read+creation / chat_completions cached_tokens
+  - 3 项 chain 集成：disabled 不注入 / enabled 注入到 transport 收到的 messages / status 累计 read/write/uncached/hit_rate
+- **回归**：V12/V13/V14/V16/V17/V18/V19 现有脚本全过（V15 的 2 项预存在错误同 V19，stash 后 baseline 也是 7/9，与 V20 无关）
+- **真跑**：当前 `PROMPT_CACHE_ENABLED=0` 默认行为同 V19；启用后联 DashScope Qwen 真跑命中率需后续真实环境验证

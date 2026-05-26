@@ -9,8 +9,8 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到能挂载长期记忆。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级 AI Agent，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v19 已完成 — TransportChain + 断路器 + jittered backoff（多 transport 故障切换 + 健康检查）。
-- **核心叙事**：通过 V0→V19 的 20 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减 + 多家族 provider 协议解耦 + 主备故障切换。
+- **当前阶段**：v20 已完成 — Prompt Cache 控制（Anthropic ephemeral system_and_3 + 命中率统计）。
+- **核心叙事**：通过 V0→V20 的 21 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减 + 多家族 provider 协议解耦 + 主备故障切换 + 显式 prompt cache。
 
 ---
 
@@ -28,7 +28,7 @@
 
 ---
 
-## 3. 进度状态（20 档迭代）
+## 3. 进度状态（21 档迭代）
 
 | 版本 | 标题 | 引入概念 | 状态 |
 |------|------|---------|------|
@@ -50,11 +50,12 @@
 | v14 | 会话切换（on_session_switch） | /new + /resume 命令 + drain writer + 清 prefetch 缓存 + 轮转 session_id | ✅ |
 | v15 | 上下文压缩（on_pre_compress） | 五阶段压缩流水线 + 抢救对话进 retain 队列 | ✅ |
 | v16 | retain 批量 + 多跳 + 时间衰减 | retain_every_n_turns 缓冲 / N-hop BFS 图遍历 / 半衰期指数衰减 | ✅ |
-| **v17** | **Transport ABC + ChatCompletionsTransport** | **provider 解耦：messages/tools/response 标准化 + 注册表 + client 工厂** | **✅** |
+| v17 | Transport ABC + ChatCompletionsTransport | provider 解耦：messages/tools/response 标准化 + 注册表 + client 工厂 | ✅ |
 | v18 | AnthropicTransport + Registry | 第二家 transport / env-driven 路由 / 格式差异具体化 / Qwen DashScope 真跑 | ✅ |
-| **v19** | **TransportChain + 断路器** | **多 transport 故障切换 / 错误三分类 / 断路器自愈 / jittered backoff** | **✅ 已完成** |
+| v19 | TransportChain + 断路器 | 多 transport 故障切换 / 错误三分类 / 断路器自愈 / jittered backoff | ✅ |
+| **v20** | **Prompt Cache 控制（Anthropic ephemeral）** | **system_and_3 cache_control 注入 / Usage 拆 read+write / chain 累计命中率 / /transport 展示** | **✅ 已完成** |
 
-**下一档候选**（未启动）：v20 Prompt cache 控制 / v21 流式输出 + 中断。
+**下一档候选**（未启动）：v21 流式输出 + 中断 / v22 多 agent 协作。
 
 ---
 
@@ -85,6 +86,14 @@ FAILOVER_BASE_DELAY=1.0             # backoff 基数（实际延迟 = base * 2^a
 ANTHROPIC_API_KEY=...        # DashScope API key 等
 ANTHROPIC_BASE_URL=https://dashscope.aliyuncs.com/apps/anthropic
 MODEL=qwen3.6-plus           # DashScope Anthropic 端点支持的模型
+```
+
+### 4.1.2 V20 Prompt Cache（可选，启用后 Anthropic transport 自动打 cache_control）
+```bash
+PROMPT_CACHE_ENABLED=1       # 1/0；启用后 chain 在每次调用前调 transport.apply_prompt_cache
+PROMPT_CACHE_TTL=5m          # 5m（默认）/ 1h；1h 单价更高但 TTL 长
+# 注意：仅 Anthropic transport 实际打标记；ChatCompletions 是 identity 直通
+# （DeepSeek/OpenAI 用 prefix 匹配自动缓存，不需调用方主动标记）
 ```
 
 ### 4.2 v11 新增（mock server 端）
@@ -313,6 +322,24 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 - **真实裁剪权衡**：源项目 `error_classifier.py` 1058 行 + `run_agent.py:1742-1764` 的 fallback chain + `retry_utils.py` 三处合计约 1500 行，nano 用 `error_classifier.py`（170 行）+ `chain.py`（240 行，含 V19.1 model 字段）共约 410 行复刻核心机制。删掉的部分：(a) provider-specific 错误串匹配（gemini "thinking signature" / openrouter cache miss / llama_cpp grammar 等），(b) `OAuthLongContextBetaForbidden` 之类边缘 reason，(c) status code → reason 的优先级精细化（nano 用直接映射），(d) entry 自包含 `base_url / api_key`（nano 复用 `client_factory.make_llm_client`，每个 api_mode 一组 env，简单够用）。教学价值在于"看清主备链 + 断路器 + jitter + per-entry model 四个机制如何协同"，不是 1:1 复制 provider 兼容矩阵。
 - **验证**：`scripts/test_v19_failover.py` 17 项覆盖（5 项 classify_error + 9 项 chain + 3 项 V19.1 per-entry model）。所有测试 + V12/V13/V14/V16/V17/V18 回归全绿（V15 的 2 项预存在错误是 V18 改 `compress()` 签名时未同步该测试，与 V19 无关）。
 
+### v20 — Prompt Cache 控制（Anthropic ephemeral system_and_3）
+- **选 1**：在 `ProviderTransport` ABC 上加 `apply_prompt_cache(messages, cache_ttl)` hook，默认 identity；只有 `AnthropicTransport` 重写为 `apply_anthropic_cache_control`。
+- **没选**：让 chain 自己判断 api_mode 然后分支调 prompt_caching 模块。原因：分支判断是 V17 抽 ABC 时极力消除的反模式 — chain 不应该知道"哪家需要主动打 cache_control"，这是 transport 自己的协议特性。每加一种 cache 行为不同的 provider（如未来 Gemini 的 implicit cache）只需要在它的 transport 内部覆写 hook，chain 一行不动。
+- **选 2**：`apply_anthropic_cache_control` 用源项目验证过的 **system_and_3 策略** — 1 个 breakpoint 在 system，3 个在最后 3 条非 system 消息（Anthropic 单请求 4 个 breakpoint 上限）。
+- **原因**：system 是每轮最稳定的 prefix，命中率最高；最后 3 条用滚动窗口确保下一轮的"前 N-3 条"已经被缓存过 — 增量计费，prefix 几乎全吃 cache_read 价（约为 input 价的 1/10）。源项目 72 行版本几乎照搬，只删 `native_anthropic` 标志（nano 永远走 native，不接 Anthropic 兼容代理边缘情况）。
+- **选 3**：`Usage` 数据类拆 `cached_tokens`（read）+ `cache_creation_tokens`（write）两个字段。
+- **没选**：合并成单个 `cache_tokens`。原因：Anthropic 的 read 和 write 计费完全不同（read ~1/10 input 价，write ~1.25x input 价），合并会丢失"省了多少钱 vs 花了多少钱写入"的关键信息。OpenAI 兼容侧只有 read（write=0），是 Anthropic 数据模型在 chat_completions 上的退化形态。
+- **选 4**：cache 注入由 chain 在 `_try_with_retry` 内做（每个 entry 用自己的 transport 注入），不在 agent loop 内。
+- **原因**：(a) failover 切备家时，新 entry 是不同的 transport，要让它用自己的 hook 决定怎么标记（如果 chat_completions 在备家位置，identity 路径继续工作）；(b) `apply_anthropic_cache_control` 已经返回深拷贝，每个 entry 都拿到独立 messages 副本，互不污染。这是 V19 已经铺好的"chain 是统一调用入口"复利的兑现。
+- **选 5**：cache 命中率统计存在 `_ChainEntry.cache_*_total` 三个字段（read / write / uncached），通过 `chain.status()` 暴露给 `/transport` 命令。
+- **没选**：单次响应里 print 命中率。原因：单次数字噪音大（一个 messages 字段差异就能让 prefix 失配率波动 30%+），累计统计才稳定可读。`/transport` 命令本来就是健康检查窗口，加 cache 维度是顺势而为。
+- **选 6**：env 默认 `PROMPT_CACHE_ENABLED=0`（不启用）。
+- **原因**：(a) Anthropic 兼容代理（如 DashScope Qwen）不一定支持 cache_control，盲目启用可能 400；(b) 短对话（< 10 轮）启用 cache 反而亏 — write 贵 read 便宜，要超过 break-even 轮数才划算；(c) 教学受众应该显式启用观察对比效果。把开关交给用户做明确选择。
+- **真实踩坑（设计阶段）**：第一版让 chain 直接调 `apply_anthropic_cache_control` 后再交给 transport，意味着 chat_completions entry 也会拿到带 cache_control 的 messages（OpenAI SDK 不识别会扔掉，但增加协议噪音）。改为通过 transport 自己的 hook 后，chat_completions 走 identity 路径，messages 一字节都不变。这是 ABC 设计权衡的实证 — "什么属于共享接口、什么属于协议特化"的边界划分原则。
+- **真实裁剪权衡**：源项目 `prompt_caching.py` 72 行 + `usage_pricing.py` 700+ 行（计算各家 cache read/write 单价 → 估算节省金额）+ `agent.py:1807` 的 banner / `agent.py:8555` 的 runtime override 等。nano 只复刻 cache 注入 + 命中率累计，不算钱。`prompt_caching.py` 几乎 1:1，`extract_cache_stats` 比源项目薄一半（不区分 ttl=5m vs 1h 的 read 单价）。教学价值在于"看清 cache_control 怎么标、命中率怎么算、stat 怎么累"三件事，不是把 pricing model 整个搬过来。
+- **`Usage` 修改的副作用**：Anthropic 的 `prompt_tokens` 之前等于 `input_tokens` 单一字段，V20 改为 `input + read + write` 总和（与 chat_completions 语义对齐 — `prompt_tokens` 永远是"这次发了多少 input token，无论是否命中 cache"）。`compressor.update_usage(prompt_tokens)` 在 V20 后会更准确反映实际 input 规模。V18 的 `test_usage_with_cached_tokens` 测试只校 `cached_tokens=80` 仍然过。
+- **验证**：`scripts/test_v20_prompt_cache.py` 13 项覆盖（5 项 prompt_caching 模块 + 3 项 transport hook + 2 项 extract_cache_stats + 3 项 chain 集成）。所有测试 + V12/V13/V14/V16/V17/V18/V19 回归全绿（V15 的 2 项预存在错误是 V18 改 `compress()` 签名时未同步该测试，与 V20 无关，已确认 stash 后 baseline 也是 7/9）。
+
 ---
 
 ## 7. 待办 / 已知问题
@@ -331,6 +358,8 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 - [x] ~~V17 `transports/` 只有 `chat_completions` 一家，ABC 价值在 V18 加 Anthropic 时才会真正显现~~ — V18 加 Anthropic 验证 ABC，V19 加 Chain 进一步验证"抽出来的边界能复用"。
 - [ ] V19 断路器 `cooldown_seconds=60` 是猜测值，需要根据实际 provider 恢复时间调优；不同 reason 应不应该有不同 cooldown？
 - [ ] V19 真实多家 provider 联跑测试缺失 — 当前只有 fake transport 的不变量测试，需要在两家真 endpoint 上验证（比如故意把 OPENAI_API_KEY 改错触发 401，观察 chain 是否切到 Anthropic）。
+- [ ] V20 真实 cache 命中率验证缺失 — 需要在 DashScope Anthropic 端点上跑多轮对话，观察 `cache_read_input_tokens` 是否真有上升（DashScope 可能不实现 cache_control，盲启可能直接 400）。
+- [ ] V20 break-even 轮数估算 — 单次 cache write 比 read 贵 ~12 倍，理论上需要 ≥ 13 轮命中才能回本；nano 没暴露 pricing 估算工具。
 - [ ] CLAUDE.md 已超 250 行硬规则上限，下一档完成后应把决策日志按版本拆到 `docs/decisions/v<N>.md`，本文件只留索引。
 
 ---

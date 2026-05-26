@@ -62,25 +62,40 @@ class AnthropicTransport(ProviderTransport):
         """OpenAI messages → ``(system, anthropic_messages)`` 元组。
 
         转换规则：
-        - role=system → 提取为独立 system 字符串
+        - role=system → 提取为独立 system；content 为 str 则原样返回，为 list[block]
+          则保留（V20 prompt_caching 把 str 升级为 list 以挂 cache_control）
         - role=assistant + tool_calls → 转为含 text + tool_use blocks 的 assistant 消息
-        - role=tool → 转为 user 消息里的 tool_result content block
-        - role=user → 保持（content 转为 text block 列表）
+        - role=tool → 转为 user 消息里的 tool_result content block；上层
+          ``msg["cache_control"]`` 会落到 tool_result 块上（V20）
+        - role=user → 保持（content 转为 text block 列表，或保留已升级的 list）
+
+        V20 cache_control 保留规则：
+        - 上层 ``msg["cache_control"]`` （tool / 空 content 的标记位置）→ 落到
+          输出消息的最后一个 content block
+        - content 已是 list[block] 且某 block 带 cache_control → 原样保留
         """
-        system: str | None = None
+        system: Any = None
         result: List[Dict[str, Any]] = []
 
         for m in messages:
             role = m.get("role", "user")
             content = m.get("content", "")
+            top_cache = m.get("cache_control")  # V20: prompt_caching 顶层标记
 
             if role == "system":
-                system = content if isinstance(content, str) else str(content)
+                if isinstance(content, list):
+                    # V20: 已升级为 [{"type":"text", ..., "cache_control":...}]
+                    system = content
+                else:
+                    system = content if isinstance(content, str) else str(content)
                 continue
 
             if role == "assistant":
                 blocks: List[Dict[str, Any]] = []
-                if content:
+                if isinstance(content, list):
+                    # V20: 已是 block list（带 cache_control）
+                    blocks.extend(content)
+                elif content:
                     blocks.append({"type": "text", "text": str(content)})
                 for tc in m.get("tool_calls", []):
                     if not tc or not isinstance(tc, dict):
@@ -98,15 +113,25 @@ class AnthropicTransport(ProviderTransport):
                         "input": parsed,
                     })
                 if blocks:
+                    if top_cache and isinstance(blocks[-1], dict):
+                        blocks[-1]["cache_control"] = top_cache
                     result.append({"role": "assistant", "content": blocks})
                 continue
 
             if role == "tool":
-                tool_result_block = {
+                # V20: tool result 字符串可能已被 prompt_caching 升级为 list；统一回退到 str
+                tr_content: Any
+                if isinstance(content, list):
+                    tr_content = content
+                else:
+                    tr_content = str(content) if content else ""
+                tool_result_block: Dict[str, Any] = {
                     "type": "tool_result",
                     "tool_use_id": m.get("tool_call_id", ""),
-                    "content": str(content) if content else "",
+                    "content": tr_content,
                 }
+                if top_cache:
+                    tool_result_block["cache_control"] = top_cache
                 # Anthropic 要求 tool_result 在 user 角色消息里
                 # 如果上一条已经是 user（含 tool_result），合并进去
                 if result and result[-1].get("role") == "user" and isinstance(result[-1].get("content"), list):
@@ -115,11 +140,22 @@ class AnthropicTransport(ProviderTransport):
                     result.append({"role": "user", "content": [tool_result_block]})
                 continue
 
-            # role=user — 普通用户消息
-            if isinstance(content, str):
-                result.append({"role": "user", "content": content})
+            # role=user
+            if isinstance(content, list):
+                # V20: 已升级为 block list
+                user_content: Any = content
+                if top_cache and content and isinstance(content[-1], dict):
+                    content[-1]["cache_control"] = top_cache
+            elif top_cache:
+                # 顶层 cache 但 content 是 str / 空 — 升级为 block list 挂 cache_control
+                user_content = [{
+                    "type": "text",
+                    "text": str(content) if content else "",
+                    "cache_control": top_cache,
+                }]
             else:
-                result.append({"role": "user", "content": content})
+                user_content = content
+            result.append({"role": "user", "content": user_content})
 
         return system, result
 
@@ -218,14 +254,16 @@ class AnthropicTransport(ProviderTransport):
         usage: Usage | None = None
         resp_usage = getattr(response, "usage", None)
         if resp_usage:
+            input_tok = getattr(resp_usage, "input_tokens", 0) or 0
+            output_tok = getattr(resp_usage, "output_tokens", 0) or 0
+            cache_read = getattr(resp_usage, "cache_read_input_tokens", 0) or 0
+            cache_write = getattr(resp_usage, "cache_creation_input_tokens", 0) or 0
             usage = Usage(
-                prompt_tokens=getattr(resp_usage, "input_tokens", 0) or 0,
-                completion_tokens=getattr(resp_usage, "output_tokens", 0) or 0,
-                total_tokens=(
-                    (getattr(resp_usage, "input_tokens", 0) or 0)
-                    + (getattr(resp_usage, "output_tokens", 0) or 0)
-                ),
-                cached_tokens=getattr(resp_usage, "cache_read_input_tokens", 0) or 0,
+                prompt_tokens=input_tok + cache_read + cache_write,
+                completion_tokens=output_tok,
+                total_tokens=input_tok + cache_read + cache_write + output_tok,
+                cached_tokens=cache_read,
+                cache_creation_tokens=cache_write,
             )
 
         return NormalizedResponse(
@@ -257,6 +295,37 @@ class AnthropicTransport(ProviderTransport):
 
     def map_finish_reason(self, raw_reason: str) -> str:
         return self._STOP_REASON_MAP.get(raw_reason, "stop")
+
+    def extract_cache_stats(self, response: Any) -> Optional[Dict[str, int]]:
+        """V20 — 抽取 Anthropic prompt cache 命中/写入 token。
+
+        Anthropic 在 ``response.usage`` 上暴露两个字段：
+        - ``cache_read_input_tokens``: 命中缓存（按 ~1/10 input 价计费）
+        - ``cache_creation_input_tokens``: 首次写入缓存（按 ~1.25x input 价计费）
+
+        两者皆 0 时返回 None — 表示未启用 cache 或本次未命中。
+        """
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        cached = getattr(usage, "cache_read_input_tokens", 0) or 0
+        written = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        if cached == 0 and written == 0:
+            return None
+        return {"cached_tokens": cached, "creation_tokens": written}
+
+    def apply_prompt_cache(
+        self,
+        messages: List[Dict[str, Any]],
+        cache_ttl: str = "5m",
+    ) -> List[Dict[str, Any]]:
+        """V20 — Anthropic prompt cache 显式标记（``system_and_3`` 策略）。
+
+        在 system + 最后 3 条非 system 消息上打 cache_control，最多 4 个
+        breakpoint。返回深拷贝，原 list 不变（避免跨轮污染）。
+        """
+        from transports.prompt_caching import apply_anthropic_cache_control
+        return apply_anthropic_cache_control(messages, cache_ttl=cache_ttl)
 
 
 # 模块导入时自动注册

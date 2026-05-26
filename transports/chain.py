@@ -81,12 +81,15 @@ class _BreakerState:
 
 @dataclass
 class _ChainEntry:
-    """链中的一个 transport + 配套的客户端 + 模型 + 断路器状态。
+    """链中的一个 transport + 配套的客户端 + 模型 + 断路器状态 + cache 统计。
 
     ``model`` 是 V19.1 加入 — 每个 entry 携带自己的模型名（仿源项目
     ``run_agent.py:1742-1765`` 的 fallback chain 设计：每条 fallback entry 都是
     自包含的 ``{"provider": "...", "model": "..."}``，不依赖全局 MODEL）。
     None 表示"用调用方传入的 model 参数"，对应源项目 legacy single-dict 兼容路径。
+
+    ``cache_*`` 是 V20 加入 — 累计 prompt cache 命中/写入 token，让 ``/transport``
+    能直接展示命中率（cached / (cached + uncached)）。
     """
 
     api_mode: str
@@ -94,6 +97,9 @@ class _ChainEntry:
     client: Any
     model: Optional[str] = None
     breaker: _BreakerState = field(default_factory=_BreakerState)
+    cache_read_total: int = 0
+    cache_write_total: int = 0
+    cache_uncached_total: int = 0  # 非 cache 输入 token，用于算命中率分母
 
 
 # ── TransportChain ──────────────────────────────────────────────────────
@@ -123,6 +129,8 @@ class TransportChain:
         cooldown_seconds: float = 60.0,
         max_retries: int = 2,
         base_delay: float = 1.0,
+        cache_enabled: bool = False,
+        cache_ttl: str = "5m",
         sleep_fn: Callable[[float], None] = time.sleep,
         clock_fn: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -133,6 +141,8 @@ class TransportChain:
         self.cooldown_seconds = cooldown_seconds
         self.max_retries = max_retries
         self.base_delay = base_delay
+        self.cache_enabled = cache_enabled
+        self.cache_ttl = cache_ttl
         self._sleep = sleep_fn
         self._clock = clock_fn
 
@@ -215,15 +225,30 @@ class TransportChain:
         每个 entry 自带 ``model``，覆盖调用方传入的 model（源项目 fallback 链
         每条 entry 都自包含 model 的本地翻译）。entry.model 为 None 时回退到
         kwargs 里的全局 model。
+
+        V20: cache_enabled 时通过 ``transport.apply_prompt_cache`` 注入 cache_control。
+        每个 entry 用自己的 transport 注入 — Anthropic 显式打标记，OpenAI 兼容
+        identity 直通。返回后从 ``NormalizedResponse.usage.cached_tokens`` 累计统计
+        到 entry.cache_*_total。
         """
         # 按 entry 模型覆盖 kwargs（不 mutate 原 dict — 避免链上各 entry 互相污染）
         call_kwargs = dict(kwargs)
         if entry.model:
             call_kwargs["model"] = entry.model
 
+        # V20: cache 启用时让 transport 自己决定怎么标记（Anthropic 打 cache_control，
+        # 其他家 identity）。注意 apply_prompt_cache 返回深拷贝，不污染上游 messages。
+        if self.cache_enabled and "messages" in call_kwargs:
+            call_kwargs["messages"] = entry.transport.apply_prompt_cache(
+                call_kwargs["messages"], cache_ttl=self.cache_ttl,
+            )
+
         for attempt in range(self.max_retries + 1):
             try:
-                return entry.transport.call(entry.client, **call_kwargs)
+                resp = entry.transport.call(entry.client, **call_kwargs)
+                # V20: 累计 cache 统计 — usage.cached_tokens 已被 transport 标准化
+                self._accumulate_cache_stats(entry, resp)
+                return resp
             except Exception as exc:
                 classified = classify_error(exc)
                 attempts.append(classified)
@@ -262,6 +287,29 @@ class TransportChain:
                 entry.api_mode, entry.breaker.consecutive_failures, classified.reason,
             )
 
+    # ── V20 cache 记账 ────────────────────────────────────────
+
+    def _accumulate_cache_stats(
+        self, entry: _ChainEntry, resp: NormalizedResponse,
+    ) -> None:
+        """累计 prompt cache 命中/写入到 entry。
+
+        ``Usage.cached_tokens`` / ``Usage.cache_creation_tokens`` 已被 transport
+        标准化（Anthropic 区分 read/write，OpenAI 兼容只有 read，write=0）。
+
+        命中率分母 = uncached input = ``prompt_tokens - cached - creation``；
+        ``prompt_tokens`` 在 Anthropic 侧是 ``input + read + write`` 的总和。
+        """
+        usage = resp.usage
+        if usage is None:
+            return
+        cached = usage.cached_tokens or 0
+        write = usage.cache_creation_tokens or 0
+        uncached = max(0, (usage.prompt_tokens or 0) - cached - write)
+        entry.cache_read_total += cached
+        entry.cache_write_total += write
+        entry.cache_uncached_total += uncached
+
     # ── Jittered backoff ──────────────────────────────────────
 
     def _jittered_backoff(self, attempt: int) -> float:
@@ -277,11 +325,16 @@ class TransportChain:
     # ── 健康检查窥视（教学/调试用） ───────────────────────────
 
     def status(self) -> list[dict]:
-        """返回每个 entry 的健康状态快照（供 ``/transport`` 命令展示）。"""
+        """返回每个 entry 的健康状态快照（供 ``/transport`` 命令展示）。
+
+        V20: 增加 cache_read / cache_write / cache_hit_rate 字段。
+        """
         now = self._clock()
         result = []
         for e in self.entries:
             is_open = e.breaker.is_open(now, self.cooldown_seconds)
+            total_input = e.cache_read_total + e.cache_uncached_total
+            hit_rate = (e.cache_read_total / total_input) if total_input > 0 else 0.0
             result.append({
                 "api_mode": e.api_mode,
                 "model": e.model,
@@ -292,6 +345,10 @@ class TransportChain:
                     max(0.0, self.cooldown_seconds - (now - e.breaker.opened_at))
                     if e.breaker.opened_at else 0.0
                 ),
+                "cache_read": e.cache_read_total,
+                "cache_write": e.cache_write_total,
+                "cache_uncached": e.cache_uncached_total,
+                "cache_hit_rate": hit_rate,
             })
         return result
 
@@ -307,6 +364,8 @@ def build_chain_from_env(
     cooldown_seconds: float = 60.0,
     max_retries: int = 2,
     base_delay: float = 1.0,
+    cache_enabled: bool = False,
+    cache_ttl: str = "5m",
 ) -> TransportChain:
     """从字符串构建链。
 
@@ -347,4 +406,6 @@ def build_chain_from_env(
         cooldown_seconds=cooldown_seconds,
         max_retries=max_retries,
         base_delay=base_delay,
+        cache_enabled=cache_enabled,
+        cache_ttl=cache_ttl,
     )

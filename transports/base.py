@@ -92,6 +92,21 @@ class ProviderTransport(ABC):
         """抽 provider 特定的 cache 命中/写入 token 数。默认 None。"""
         return None
 
+    def apply_prompt_cache(
+        self,
+        messages: List[Dict[str, Any]],
+        cache_ttl: str = "5m",
+    ) -> List[Dict[str, Any]]:
+        """V20 — 在 messages 上注入 prompt cache 标记。
+
+        默认 identity（chat_completions 不需要主动标记 — DeepSeek/OpenAI 隐式
+        缓存 prefix）。AnthropicTransport 重写此方法走 ``apply_anthropic_cache_control``
+        显式打 cache_control。
+
+        cache_ttl: ``"5m"`` 或 ``"1h"`` — 缓存生命周期。
+        """
+        return messages
+
     def map_finish_reason(self, raw_reason: str) -> str:
         """provider stop reason → OpenAI 标准（"stop"/"tool_calls"/"length"）。
 
