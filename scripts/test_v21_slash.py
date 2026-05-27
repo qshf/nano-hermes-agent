@@ -67,10 +67,11 @@ def _make_ctx(messages=None) -> AgentCtx:
 
 
 def test_all_v21_1_commands_registered() -> None:
-    """启动期注册的命令应等于预期 11 个（不算 alias）。"""
+    """启动期注册的命令应等于预期 12 个（不算 alias；V21.3 新增 /skill）。"""
     expected = {
         "help", "memory", "load", "mcp", "plugin",
         "tools", "session", "new", "resume", "compress", "transport",
+        "skill",
     }
     actual = {c.name for c in registered_commands()}
     missing = expected - actual

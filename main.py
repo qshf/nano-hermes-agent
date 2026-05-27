@@ -1,15 +1,17 @@
 """
-Nano Hermes Agent — V21.2: Prompt Builder 三段式
+Nano Hermes Agent — V21.3: Skill 系统（progressive disclosure）
 
 V21 主题是"清算 V4 阶段交互层债务"，按 v21.1/v21.2/v21.3 三档落地：
 - V21.1（已完成）：slash 命令拆出到 ``cli/commands/<name>.py``，主循环只
   调 ``cli.dispatch(line, ctx)``；agent.py 整体重命名为 ``main.py`` 让出
   ``agent/`` 子包名给 V21.2 的 prompt_builder 和 V21.3 的 skill_loader。
-- V21.2（本档）：``agent/prompt_builder.py`` 三段式 — 骨架 + skill 索引段
+- V21.2（已完成）：``agent/prompt_builder.py`` 三段式 — 骨架 + skill 索引段
   （V21.3 填充）+ memory 块 + 工具列表段。删掉 V4 起的
   ``SYSTEM_PROMPT.format(...)`` 模板替换。
-- V21.3（待开发）：``agent/skill_loader.py`` + ``tools/skill_view_tool.py``
-  + ``skills/<name>/SKILL.md`` 示例 + ``/skill`` 命令。
+- V21.3（本档）：``agent/skill_loader.py`` 扫 ``skills/<name>/SKILL.md``
+  抽 frontmatter 生成 tier 1 索引；``tools/skill_view_tool.py`` 在 agent
+  按需调时返回完整 markdown（tier 2）；``/skill list|view|reload`` 命令；
+  附 plan / TDD / systematic-debugging 三个示例 SKILL.md。
 
 V20 架构（向下保留）：
 - transports/prompt_caching.py：``apply_anthropic_cache_control`` (system_and_3 策略)
@@ -59,17 +61,19 @@ env 开关：
 
 import json
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from model_tools import get_tool_definitions, get_available_tool_names
 from tools.registry import registry
+from tools.skill_view_tool import set_skill_loader as _inject_skill_loader
 from memory import BuiltinMemoryProvider, MemoryManager, RemoteSemanticProvider
 from context_compressor import ContextCompressor
 from transports.chain import FailoverExhausted, build_chain_from_env
 from transports.client_factory import make_llm_client
-from agent import PromptBuilder
+from agent import PromptBuilder, SkillLoader
 import cli  # 触发 cli/commands 下所有命令的装饰器注册
 
 # ─── 配置 ────────────────────────────────────────────────────────────────────
@@ -106,14 +110,24 @@ if _remote_url:
 memory_manager.initialize_all(session_id=os.environ.get("MEMORY_SESSION_ID", "default"))
 
 
+# V21.3: skill 系统 — progressive disclosure tier 1
+# 一级目录约定 ``skills/<name>/SKILL.md``；scan 失败的单个 skill 会被跳过且打印
+# warning，不影响 agent 启动。skill_loader 同时注入到 PromptBuilder（tier 1
+# 索引段）和 tools/skill_view_tool（tier 2 工具回调），保证两条路径看到的是
+# 同一份 metadata 缓存。
+skill_loader = SkillLoader(Path(__file__).parent / "skills")
+skill_loader.scan()
+_inject_skill_loader(skill_loader)
+
+
 # V21.2: 三段式 PromptBuilder 替换 V4 的 SYSTEM_PROMPT.format(...)
 # 段顺序固定（骨架 → skill 索引 → memory → 工具列表），空段自动跳过；
-# V21.3 把 SkillLoader 注入进来即可填充 tier 1 索引段。
+# V21.3 起 SkillLoader 实际注入，tier 1 索引段开始填充内容。
 prompt_builder = PromptBuilder(
     get_toolset_tool_names=get_available_tool_names,
     enabled_toolsets=ENABLED_TOOLSETS,
     memory_manager=memory_manager,
-    skill_loader=None,   # V21.3 落地后改为 SkillLoader 实例
+    skill_loader=skill_loader,
 )
 
 
@@ -164,7 +178,7 @@ def run_agent():
     compressor = ContextCompressor()
 
     print("=" * 60)
-    print("  Nano Hermes Agent v21.2 — Prompt Builder 三段式")
+    print("  Nano Hermes Agent v21.3 — Skill 系统（progressive disclosure）")
     print(f"  Default MODEL (entries 不内联时回退到此): {model}")
     chain_modes = " → ".join(
         f"{e.api_mode}({e.model})" if e.model else e.api_mode
@@ -192,6 +206,11 @@ def run_agent():
           f"protect_head={compressor.protect_first_n}")
     print(f"  Available tools: {', '.join(get_available_tool_names(ENABLED_TOOLSETS))}")
     print(f"  Memory tools: {', '.join(sorted(memory_manager.get_all_tool_names()))}")
+    skill_names = skill_loader.names()
+    if skill_names:
+        print(f"  Skills: {len(skill_names)} loaded ({', '.join(skill_names)})")
+    else:
+        print(f"  Skills: 0 loaded (skills/ empty or absent)")
     print("  Commands: /help to list all (V21.1: dispatched via cli registry)")
     print("  输入 'quit' 退出")
     print("=" * 60)
@@ -214,6 +233,7 @@ def run_agent():
         enabled_toolsets=ENABLED_TOOLSETS,
         build_system_prompt=build_system_prompt,
         prompt_builder=prompt_builder,
+        skill_loader=skill_loader,
     )
 
     try:

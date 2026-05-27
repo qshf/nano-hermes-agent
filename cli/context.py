@@ -15,7 +15,8 @@
   直接调 ``ctx.prompt_builder.build()`` 重建 system prompt。``build_system_prompt``
   字段保留为兼容回调（仍是 ``prompt_builder.build`` 的 thin wrapper），
   V21.3 再根据需要清理。
-- V21.3: 加 ``skill_loader: SkillLoader``，让 ``/skill`` 命令使用。
+- V21.3（已落地）: 加 ``skill_loader: SkillLoader``，``/skill`` 命令通过它
+  list / view / reload；``PromptBuilder`` 也读它生成 tier 1 索引段。
 - V22+: 加 ``cancel_token`` / ``stream_state`` 等。
 """
 
@@ -65,7 +66,8 @@ class AgentCtx:
     enabled_toolsets: list[str]
     build_system_prompt: Callable[[], str]
     prompt_builder: Optional[Any] = None   # agent.prompt_builder.PromptBuilder（V21.2+）
+    skill_loader: Optional[Any] = None     # agent.skill_loader.SkillLoader（V21.3+）
 
-    # 后续版本扩展位（V21.3 skill_loader / V22 cancel_token）
+    # 后续版本扩展位（V22 cancel_token / stream_state 等）
     extras: dict[str, Any] = field(default_factory=dict)
 

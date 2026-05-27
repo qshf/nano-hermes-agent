@@ -14,4 +14,5 @@ from cli.commands import (  # noqa: F401
     session,
     compress,
     transport,
+    skill,
 )

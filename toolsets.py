@@ -3,6 +3,10 @@ Toolsets — 工具分组管理。
 
 V2 核心：用 toolset 名管理工具组合，不用逐个列工具名。
 agent 只需指定 enabled_toolsets=["core"]，自动展开为具体工具列表。
+
+V21.3：新增 ``skill_view`` 到 core / docker — progressive disclosure tier 2 入口。
+``check_fn`` 在 loader 未注入时把它从可见列表里隐藏，所以"不挂 skill"的部署
+仍然干净，不需要为此切 toolset。
 """
 
 # 工具组定义：toolset 名 → 工具名列表
@@ -12,6 +16,7 @@ TOOLSETS: dict[str, list[str]] = {
         "read_file",
         "write_file",
         "async_demo",
+        "skill_view",
     ],
     "docker": [
         "terminal",
@@ -19,6 +24,7 @@ TOOLSETS: dict[str, list[str]] = {
         "write_file",
         "docker_exec",
         "async_demo",
+        "skill_view",
     ],
 }
 
