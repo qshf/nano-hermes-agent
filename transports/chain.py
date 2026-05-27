@@ -49,6 +49,12 @@ from typing import Any, Callable, Optional
 from transports import get_transport
 from transports.base import ProviderTransport
 from transports.error_classifier import ClassifiedError, ErrorAction, classify_error
+from transports.streaming import (
+    EVENT_DONE,
+    CancelToken,
+    StreamCancelled,
+    StreamIterator,
+)
 from transports.types import NormalizedResponse
 
 logger = logging.getLogger(__name__)
@@ -206,6 +212,91 @@ class TransportChain:
 
             # 失败 — 决策已写入 breaker，继续下一家
             now = self._clock()
+
+        raise FailoverExhausted(attempts)
+
+    # ── V22 流式入口 ──────────────────────────────────────────
+    def stream_call(
+        self,
+        client: Any = None,
+        cancel_token: Optional[CancelToken] = None,
+        **kwargs,
+    ) -> StreamIterator:
+        """链版流式 — 在**首帧到达前**做故障切换；首帧后只负责吐事件。
+
+        策略（仿源项目 ``run_agent.py:7966-8082`` 的 deltas_were_sent 哨兵）：
+        - 主家流挂了但还没 yield 过任何事件 → 走下一家（用户体感是"没反应了一下"）
+        - 主家挂了但已 yield 过 ≥1 个增量事件 → **不切家**，把异常往上抛（上层负责
+          打印 "[failed mid-stream]"）。理由：切家会导致 token 重发 + 改变响应结构，
+          UI 体感非常糟，比一次失败更差
+        - ``StreamCancelled`` 不属于 transport 失败 — 直接透传，上层负责回退到 prompt
+        - 单 entry RETRYABLE 流式不做内部重试（同上：会破坏已发出的 token 流）
+          —— 与 ``_try_with_retry`` 的同步重试策略对齐"流式只切，不重试"
+
+        cache 统计：done 事件携带的 ``NormalizedResponse`` 含完整 usage —
+        与同步 ``call`` 调用相同的 ``_accumulate_cache_stats`` 路径。
+        """
+        del client
+        attempts: list[ClassifiedError] = []
+        now = self._clock()
+
+        for entry in self.entries:
+            if entry.breaker.is_open(now, self.cooldown_seconds):
+                logger.info(
+                    "skip %s: breaker open (last=%s, %.1fs left)",
+                    entry.api_mode, entry.breaker.last_reason,
+                    self.cooldown_seconds - (now - entry.breaker.opened_at),
+                )
+                continue
+
+            half_open = entry.breaker.opened_at != 0.0
+            call_kwargs = dict(kwargs)
+            if entry.model:
+                call_kwargs["model"] = entry.model
+            if self.cache_enabled and "messages" in call_kwargs:
+                call_kwargs["messages"] = entry.transport.apply_prompt_cache(
+                    call_kwargs["messages"], cache_ttl=self.cache_ttl,
+                )
+
+            delivered = False
+            try:
+                gen = entry.transport.stream_call(
+                    entry.client, cancel_token=cancel_token, **call_kwargs,
+                )
+                for ev in gen:
+                    delivered = True
+                    yield ev
+                    if ev.type == EVENT_DONE and ev.response is not None:
+                        self._accumulate_cache_stats(entry, ev.response)
+                # 成功 — 关闭断路器并返回
+                if half_open or entry.breaker.consecutive_failures > 0:
+                    logger.info("breaker closed for %s", entry.api_mode)
+                entry.breaker.consecutive_failures = 0
+                entry.breaker.opened_at = 0.0
+                return
+            except StreamCancelled:
+                # 用户取消 — 不计为失败，直接透传
+                raise
+            except Exception as exc:
+                classified = classify_error(exc)
+                attempts.append(classified)
+                logger.warning(
+                    "stream transport=%s failed: action=%s reason=%s status=%s delivered=%s",
+                    entry.api_mode, classified.action.value,
+                    classified.reason, classified.status_code, delivered,
+                )
+                if classified.action == ErrorAction.FATAL:
+                    raise
+
+                self._record_failure(entry, classified)
+
+                if delivered:
+                    # 已 yield 过事件 — 切家会重复 token，禁止
+                    raise
+
+                # 没 yield 过 — 切下一家
+                now = self._clock()
+                continue
 
         raise FailoverExhausted(attempts)
 

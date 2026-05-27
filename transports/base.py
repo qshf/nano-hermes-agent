@@ -16,6 +16,7 @@
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
+from transports.streaming import CancelToken, StreamIterator
 from transports.types import NormalizedResponse
 
 
@@ -81,6 +82,47 @@ class ProviderTransport(ABC):
         kwargs 透传给 build_kwargs（model, messages, tools, temperature 等）。
         """
         ...
+
+    # ── V22: 流式入口（默认假流式 — 子类可重写为真流式） ────────
+
+    def stream_call(
+        self,
+        client: Any,
+        cancel_token: Optional[CancelToken] = None,
+        **kwargs,
+    ) -> StreamIterator:
+        """流式 LLM 调用 — 返回增量事件迭代器。
+
+        默认实现：调 ``call()`` 拿完整响应后假装流式 — 把 content 一次性
+        作为单个 ``text_delta`` 事件 + ``done`` 事件 yield 出去。**子类应
+        重写本方法为真流式** —— ChatCompletionsTransport / AnthropicTransport
+        在 V22 都重写了。
+
+        默认实现的价值在于：自定义 transport 没实现流式时不会让 agent loop
+        崩溃；但 token-by-token 体感缺失，需要看子类。
+
+        参数:
+            client: SDK 客户端（chat_completions 用 OpenAI client；anthropic 用
+                Anthropic client）
+            cancel_token: 取消标记 — 流式循环每帧检查，命中即抛
+                ``StreamCancelled``。None 表示不可中断（仅默认假流式路径用）。
+            **kwargs: 透传给 ``build_kwargs``（model, messages, tools, ...）
+
+        Yield:
+            ``StreamEvent`` 序列；最后一个事件保证是 ``type=="done"``，
+            ``response`` 字段含完整 ``NormalizedResponse``。
+        """
+        from transports.streaming import (
+            EVENT_DONE, EVENT_TEXT_DELTA, StreamEvent,
+        )
+
+        # 默认实现 = 同步 call + 假装一帧到底
+        if cancel_token is not None:
+            cancel_token.check()
+        resp = self.call(client, **kwargs)
+        if resp.content:
+            yield StreamEvent(type=EVENT_TEXT_DELTA, text=resp.content)
+        yield StreamEvent(type=EVENT_DONE, response=resp)
 
     # ── 可选 hook ───────────────────────────────────────────────
 

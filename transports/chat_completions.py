@@ -21,10 +21,118 @@ DeepSeek / Qwen OpenAI compat 端点 / 任何走 ``chat.completions`` 的家族�
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+from typing import Any, Optional
 
 from transports.base import ProviderTransport
+from transports.streaming import (
+    EVENT_DONE,
+    EVENT_REASONING_DELTA,
+    EVENT_TEXT_DELTA,
+    EVENT_TOOL_CALL_STARTED,
+    CancelToken,
+    StreamEvent,
+    StreamIterator,
+)
 from transports.types import NormalizedResponse, ToolCall, Usage
+
+
+@dataclass
+class _ChatStreamAccumulator:
+    """OpenAI 兼容 SSE chunks → 与非流式 ``ChatCompletion`` 同形态的 SimpleNamespace。
+
+    源项目 ``run_agent.py:7666-7879`` 的同款做法：流式只管"把分片黏起来"，最终
+    构造一个 duck-typed 假对象喂回 ``normalize_response`` — 字段抽取
+    （content / tool_calls / usage / reasoning_content）只在一处定义、不重复。
+
+    provider quirk 集中在 ``absorb``：
+    - ``function.name`` 用赋值而非 ``+=``：MiniMax M2.7 via NVIDIA NIM 会在每帧
+      重发完整 name；``+=`` 会得到 ``"read_fileread_file"``
+    - ``function.arguments`` 必须 concat：OpenAI spec 分片下发
+    - ``usage`` 在最终 ``choices=[]`` 帧带 — 需 ``stream_options.include_usage``
+    """
+
+    content: list[str] = field(default_factory=list)
+    reasoning: list[str] = field(default_factory=list)
+    tool_calls: dict[int, dict[str, Any]] = field(default_factory=dict)
+    started_idx: set[int] = field(default_factory=set)
+    finish_reason: Optional[str] = None
+    usage_obj: Any = None
+
+    def absorb(self, chunk: Any) -> StreamIterator:
+        """消费一个 SSE chunk，按需 yield 增量事件，状态写回 self。"""
+        if not chunk.choices:
+            if getattr(chunk, "usage", None):
+                self.usage_obj = chunk.usage
+            return
+
+        choice0 = chunk.choices[0]
+        delta = choice0.delta
+
+        if delta is not None:
+            rtxt = (
+                getattr(delta, "reasoning_content", None)
+                or getattr(delta, "reasoning", None)
+            )
+            if rtxt:
+                self.reasoning.append(rtxt)
+                yield StreamEvent(type=EVENT_REASONING_DELTA, text=rtxt)
+
+            if getattr(delta, "content", None):
+                self.content.append(delta.content)
+                yield StreamEvent(type=EVENT_TEXT_DELTA, text=delta.content)
+
+            for tcd in getattr(delta, "tool_calls", None) or ():
+                idx = tcd.index if tcd.index is not None else 0
+                entry = self.tool_calls.setdefault(
+                    idx, {"id": "", "name": "", "arguments": ""},
+                )
+                if tcd.id:
+                    entry["id"] = tcd.id
+                fn = getattr(tcd, "function", None)
+                if fn is not None:
+                    if fn.name:
+                        entry["name"] = fn.name  # 赋值，非 +=
+                    if fn.arguments:
+                        entry["arguments"] += fn.arguments
+                if entry["name"] and idx not in self.started_idx:
+                    self.started_idx.add(idx)
+                    yield StreamEvent(
+                        type=EVENT_TOOL_CALL_STARTED,
+                        tool_name=entry["name"],
+                    )
+
+        if choice0.finish_reason:
+            self.finish_reason = choice0.finish_reason
+
+        if getattr(chunk, "usage", None):
+            self.usage_obj = chunk.usage
+
+    def to_chat_completion(self) -> SimpleNamespace:
+        """构造与 ``ChatCompletion`` 同形态的 mock — 喂回 ``normalize_response``。"""
+        tool_calls = None
+        if self.tool_calls:
+            tool_calls = [
+                SimpleNamespace(
+                    id=self.tool_calls[i]["id"],
+                    function=SimpleNamespace(
+                        name=self.tool_calls[i]["name"],
+                        arguments=self.tool_calls[i]["arguments"],
+                    ),
+                )
+                for i in sorted(self.tool_calls)
+            ]
+        msg = SimpleNamespace(
+            content="".join(self.content) or None,
+            tool_calls=tool_calls,
+            reasoning=None,
+            reasoning_content="".join(self.reasoning) or None,
+        )
+        choice = SimpleNamespace(
+            message=msg, finish_reason=self.finish_reason or "stop",
+        )
+        return SimpleNamespace(choices=[choice], usage=self.usage_obj)
 
 
 class ChatCompletionsTransport(ProviderTransport):
@@ -141,6 +249,46 @@ class ChatCompletionsTransport(ProviderTransport):
         if not self.validate_response(response):
             raise ValueError("Invalid response from chat.completions.create")
         return self.normalize_response(response)
+
+    # ── V22 真流式 ──────────────────────────────────────────────────────
+    def stream_call(
+        self,
+        client: Any,
+        cancel_token: Optional[CancelToken] = None,
+        **kwargs,
+    ) -> StreamIterator:
+        """SSE 流式 — 累积分片 → 重建 ``ChatCompletion`` 同形态 → 复用 ``normalize_response``。
+
+        ``_ChatStreamAccumulator`` 藏住分片消费规则与 provider quirk（name 赋值不
+        ``+=`` / args concat / final usage 帧）。此处只串"取流 → 喂分片 → 关流 →
+        normalize"四步，与 ``AnthropicTransport.stream_call`` 形态对称。
+
+        中断：每帧 ``cancel_token.check()``，命中即 raise ``StreamCancelled``，
+        ``finally`` 兜底 close stream。
+        """
+        api_kwargs = self.build_kwargs(**kwargs)
+        api_kwargs["stream"] = True
+        api_kwargs["stream_options"] = {"include_usage": True}
+
+        acc = _ChatStreamAccumulator()
+        stream = client.chat.completions.create(**api_kwargs)
+        try:
+            for chunk in stream:
+                if cancel_token is not None:
+                    cancel_token.check()
+                yield from acc.absorb(chunk)
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+        yield StreamEvent(
+            type=EVENT_DONE,
+            response=self.normalize_response(acc.to_chat_completion()),
+        )
 
     def validate_response(self, response: Any) -> bool:
         """检查 ``response.choices`` 非空。"""

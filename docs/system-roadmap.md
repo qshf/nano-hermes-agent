@@ -274,44 +274,43 @@ v27  Todo / Clarify（可选小尾巴）           ← 协作工具
 
 ---
 
-### V22 流式输出 + 中断
+### V22 流式输出 + 中断（已完成）
 
 **核心问题**：
 - 前 21 档全是 blocking 调用，体感差
 - Transport ABC 只用了同步那半，未真正闭环
 - Ctrl+C 只能杀进程，不能优雅打断流
 
-**最小可教学切片**：
-1. Transport ABC 增加 `stream_response()` 方法，返回迭代器
-2. `ChatCompletionsTransport` 实现 SSE 解析：
-   - 增量拼接 `delta.content`
-   - 增量拼接 tool_call（`arguments` 是分片到达的）
-   - 累计 usage（`finish_reason` 帧才完整）
-3. `AnthropicTransport` 实现 SSE 解析：
-   - `content_block_delta` 事件
-   - `message_delta` 事件（含最终 usage）
-4. 信号注入：
-   - 启动 `signal.signal(SIGINT, ...)` 设 cancel token
-   - 流式循环每帧检查 token，命中就 close stream + 抛 `StreamCancelled`
-   - cancel 后回退到对话 prompt，**不杀进程**
-5. agent.py 改用流式：
-   - 主对话用 `stream_response`，逐帧打印
-   - 第一帧到达前的等待时间打 spinner
+**最小切片**（已落地）：
+1. 新增 `transports/streaming.py`（~150 行）— `StreamEvent` / `CancelToken`（threading.Event）/ `StreamCancelled` / `StreamIterator`
+2. `ProviderTransport` ABC 增加 `stream_call(client, cancel_token, **kwargs)`，默认实现 = `call()` + 1 个 text_delta + done（让未重写流式的 transport 也不至于让 agent loop 崩）
+3. `ChatCompletionsTransport.stream_call`：`stream=True + stream_options={"include_usage": True}`；
+   - 文本 / reasoning concat 实时 emit
+   - tool_call name 用赋值（防 MiniMax M2.7 重发污染）/ arguments 用 += （spec 分片）
+   - usage 在最终 `choices=[]` 帧抓取
+4. `AnthropicTransport.stream_call`：`client.messages.stream()` 上下文管理器
+   - `content_block_start` 中 `tool_use` block → emit started
+   - `content_block_delta` 中 `text_delta` / `thinking_delta` → emit delta
+   - 流尾 `stream.get_final_message()` 复用 `normalize_response`
+5. `TransportChain.stream_call`：**首帧前可切家**，已 yield 后失败禁止切家（避免 token 重发）；`StreamCancelled` 透传不计为失败；done 帧累计 cache 统计与同步一致
+6. `cli/commands/stream.py` — `/stream on|off` 切换；`AgentCtx.stream_enabled` / `cancel_token` 字段
+7. `main.py` 改造：`signal.signal(SIGINT, ...)` 用 `streaming_active` 旗标分流 prompt vs 流式期间；`_stream_one_turn` 辅助函数 emit → stdout 实时打印；`chain.call → ctx.stream_enabled` 三态分发
+8. `scripts/test_v22_streaming.py` — 13 项不变量（CancelToken / SSE 增量 / tool_call 累积 / 默认假流式 / chain failover-before-first-event）
 
-**验证**：
-- 终端可见字符级流出
-- 一次 5s+ 长响应中按 Ctrl+C 可即时打断、回到提示符
-- 流式累计的 usage 与 v20 非流式一致
-- v20 prompt cache 命中率统计在流式模式下仍然准确
+**验证**（已通过）：
+- 13/13 V22 不变量 + 105 项 V17–V21 旧不变量零回归
+- 等待真跑验证：DeepSeek 流式 Ctrl+C 当帧停止 / `/stream off` vs `on` usage 一致 / DashScope thinking_delta 到达
+  → 写入 `docs/todo.md` 的 V22 待办块，留给 V23 启动前手测
 
-**简化掉的**（vs 源项目）：
-- 不做流中切换 transport（chain 流式 failover 推到 v24）
-- 不做服务器 SSE 重连
-- 不做断点续传
-- 不做 reasoning/thinking 字段的流式特殊处理
+**简化掉的**（vs 源项目 ~1500 行）：
+- 不做流中切换 transport（首帧后失败直接抛，不重连）
+- 不做 SSE 重连 / 断点续传
+- 不做 stream diagnostic 计数器（chunks / bytes / first_chunk_at）
+- 不做 partial tool args 修复（``_repair_tool_call_arguments``）
+- 不做 reasoning box 实时回显（仅打个 `[think] ...` 占位）
 - 不做工具结果的流式回灌
 
-**预估规模**：500-700 行（两个 transport 各加一条 stream 路径 + 主循环改造）
+**实际规模**：~600 行核心代码 + ~400 行测试（roadmap 预估 500–700 行，吻合）
 
 ---
 

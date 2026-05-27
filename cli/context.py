@@ -68,6 +68,12 @@ class AgentCtx:
     prompt_builder: Optional[Any] = None   # agent.prompt_builder.PromptBuilder（V21.2+）
     skill_loader: Optional[Any] = None     # agent.skill_loader.SkillLoader（V21.3+）
 
-    # 后续版本扩展位（V22 cancel_token / stream_state 等）
+    # V22 — 流式 + 中断
+    # ``stream_enabled`` 由 ``/stream on|off`` 切换；初始值由启动期 env 决定
+    # ``cancel_token`` 在 main 启动 SIGINT handler 时挂载，slash handler 不动它
+    stream_enabled: bool = True
+    cancel_token: Optional[Any] = None     # transports.streaming.CancelToken
+
+    # 后续版本扩展位
     extras: dict[str, Any] = field(default_factory=dict)
 

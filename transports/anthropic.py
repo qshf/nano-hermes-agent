@@ -30,6 +30,15 @@ import json
 from typing import Any, Dict, List, Optional
 
 from transports.base import ProviderTransport
+from transports.streaming import (
+    EVENT_DONE,
+    EVENT_REASONING_DELTA,
+    EVENT_TEXT_DELTA,
+    EVENT_TOOL_CALL_STARTED,
+    CancelToken,
+    StreamEvent,
+    StreamIterator,
+)
 from transports.types import NormalizedResponse, ToolCall, Usage
 
 
@@ -281,6 +290,82 @@ class AnthropicTransport(ProviderTransport):
         if not self.validate_response(response):
             raise ValueError("Invalid response from messages.create")
         return self.normalize_response(response)
+
+    # ── V22 真流式 ──────────────────────────────────────────────────────
+    def stream_call(
+        self,
+        client: Any,
+        cancel_token: Optional[CancelToken] = None,
+        **kwargs,
+    ) -> StreamIterator:
+        """SSE 流式 — Anthropic SDK ``messages.stream()`` 上下文管理器。
+
+        事件模型（与 ChatCompletions 不同）：
+        - ``message_start`` — 不发增量，只携带初始 usage（input_tokens / cache_*）
+        - ``content_block_start`` — 一个 block 开始；type=tool_use 时含 ``name``/``id``
+        - ``content_block_delta`` — block 内增量；delta.type 决定字段：
+            ``text_delta`` → ``delta.text``  (非 tool_use 走 text_delta 事件)
+            ``thinking_delta`` → ``delta.thinking`` (走 reasoning_delta 事件)
+            ``input_json_delta`` → ``delta.partial_json`` (tool_use 输入参数分片)
+        - ``content_block_stop`` — block 结束
+        - ``message_delta`` — 单帧带 stop_reason 和最终 usage（output_tokens 等）
+        - ``message_stop`` — 流结束
+
+        nano 简化：
+        - 不在流式期间累积 tool_use 的 input — 因 ``stream.get_final_message()``
+          会返回带完整 input 的原生 Message，复用 ``normalize_response`` 即可重建
+        - 不处理 thinking signature（reasoning 增量直接 emit，最终 Message 里也有）
+        - 不做 mid-stream retry / 卡帧检测
+
+        中断：每帧 ``cancel_token.check()``，命中即 raise ``StreamCancelled``，
+        SDK 的 ``with`` 上下文负责关闭底层 SSE 连接。
+        """
+        api_kwargs = self.build_kwargs(**kwargs)
+
+        with client.messages.stream(**api_kwargs) as stream:
+            for event in stream:
+                if cancel_token is not None:
+                    cancel_token.check()
+
+                event_type = getattr(event, "type", None)
+
+                if event_type == "content_block_start":
+                    block = getattr(event, "content_block", None)
+                    if block is not None and getattr(block, "type", None) == "tool_use":
+                        tool_name = getattr(block, "name", None)
+                        if tool_name:
+                            yield StreamEvent(
+                                type=EVENT_TOOL_CALL_STARTED,
+                                tool_name=tool_name,
+                            )
+                    continue
+
+                if event_type == "content_block_delta":
+                    delta = getattr(event, "delta", None)
+                    if delta is None:
+                        continue
+                    delta_type = getattr(delta, "type", None)
+                    if delta_type == "text_delta":
+                        text = getattr(delta, "text", "") or ""
+                        if text:
+                            yield StreamEvent(type=EVENT_TEXT_DELTA, text=text)
+                    elif delta_type == "thinking_delta":
+                        thinking = getattr(delta, "thinking", "") or ""
+                        if thinking:
+                            yield StreamEvent(
+                                type=EVENT_REASONING_DELTA, text=thinking,
+                            )
+                    # input_json_delta 不暴露 — get_final_message 会重建完整 input
+                    continue
+
+                # message_start / content_block_stop / message_delta / message_stop
+                # 在 nano 都不需要单独发事件 — 累积责任交给 SDK。
+
+            # 流结束 — 取原生 Message 并复用 normalize_response 重建
+            final_msg = stream.get_final_message()
+
+        resp = self.normalize_response(final_msg)
+        yield StreamEvent(type=EVENT_DONE, response=resp)
 
     def validate_response(self, response: Any) -> bool:
         """检查 Anthropic 响应结构。"""
