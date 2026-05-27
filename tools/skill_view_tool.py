@@ -18,10 +18,10 @@ agent 看到 ``PromptBuilder`` 注入的 tier 1 索引（仅 name + description�
 
 from __future__ import annotations
 
-import json
 from typing import Optional
 
 from tools.registry import registry
+from tools.result import tool_error, tool_result
 
 
 _skill_loader = None  # type: Optional["SkillLoader"]  # noqa: F821 (forward ref)
@@ -62,26 +62,20 @@ SKILL_VIEW_SCHEMA = {
 def skill_view_handler(args: dict) -> str:
     name = (args.get("name") or "").strip()
     if not name:
-        return json.dumps({"error": "Parameter 'name' is required."}, ensure_ascii=False)
+        return tool_error("Parameter 'name' is required.")
 
     if _skill_loader is None:
-        return json.dumps(
-            {"error": "skill_view: skill loader not initialized (no skills mounted)."},
-            ensure_ascii=False,
-        )
+        return tool_error("skill_view: skill loader not initialized (no skills mounted).")
 
     try:
         content = _skill_loader.view(name)
     except KeyError:
         available = ", ".join(_skill_loader.names()) or "(none)"
-        return json.dumps(
-            {"error": f"unknown skill '{name}'. available: {available}"},
-            ensure_ascii=False,
-        )
+        return tool_error(f"unknown skill '{name}'. available: {available}")
     except FileNotFoundError as exc:
-        return json.dumps({"error": f"skill file vanished: {exc}"}, ensure_ascii=False)
+        return tool_error(f"skill file vanished: {exc}")
 
-    return json.dumps({"output": content}, ensure_ascii=False)
+    return tool_result(output=content)
 
 
 def _check_skill_loader_ready() -> bool:

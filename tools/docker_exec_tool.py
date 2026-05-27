@@ -3,13 +3,14 @@ Docker Exec Tool — 在 Docker 容器中执行命令。
 
 V2 演示：通过 check_fn 实现运行时可用性判断。
 Docker 未安装时，该工具不会暴露给 LLM。
+V21.4：用 tool_result/tool_error 收口返回格式。
 """
 
-import json
 import shutil
 import subprocess
 
 from tools.registry import registry
+from tools.result import tool_error, tool_result
 
 DOCKER_EXEC_SCHEMA = {
     "name": "docker_exec",
@@ -44,7 +45,7 @@ def docker_exec_handler(args: dict) -> str:
     command = args.get("command", "")
 
     if not container or not command:
-        return json.dumps({"error": "container and command are required."}, ensure_ascii=False)
+        return tool_error("container and command are required.")
 
     try:
         result = subprocess.run(
@@ -57,11 +58,11 @@ def docker_exec_handler(args: dict) -> str:
         if result.returncode != 0:
             output += f"\n[stderr]\n{result.stderr}" if result.stderr else ""
             output += f"\n[exit code: {result.returncode}]"
-        return json.dumps({"output": output.strip()}, ensure_ascii=False)
+        return tool_result(output=output.strip())
     except subprocess.TimeoutExpired:
-        return json.dumps({"error": "Command timed out after 30s."}, ensure_ascii=False)
+        return tool_error("Command timed out after 30s.")
     except Exception as exc:
-        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+        return tool_error(str(exc))
 
 
 # 自注册，带 check_fn

@@ -23,6 +23,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from tools.registry import registry
+from tools.result import tool_result
 
 # --- 后台 event loop（与源项目 _ensure_mcp_loop 对齐）---
 
@@ -147,7 +148,13 @@ class MCPConnection:
             self.registered_tools.append(tool_name)
 
     def _make_handler(self, server_tool_name: str):
-        """为 MCP 工具生成 handler（通过后台 loop 调用 call_tool）。"""
+        """为 MCP 工具生成 handler（通过后台 loop 调用 call_tool）。
+
+        V21.4：返回值统一包成 ``{"output": "..."}`` JSON。MCP server 返回的
+        text content 块拼接后是任意文本（可能是 JSON、可能是 markdown、可能
+        是日志输出），过去直接 ``return "\\n".join(parts)`` 是裸字符串，
+        破坏了"工具结果都是 JSON 字符串"的协议假设。
+        """
         connection = self
 
         def handler(args: dict) -> str:
@@ -157,7 +164,7 @@ class MCPConnection:
                 for block in result.content:
                     if hasattr(block, "text"):
                         parts.append(block.text)
-                return "\n".join(parts) if parts else "{}"
+                return tool_result(output="\n".join(parts) if parts else "")
             return _run_on_mcp_loop(_call())
 
         return handler

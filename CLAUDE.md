@@ -9,8 +9,8 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到能挂载长期记忆。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级 AI Agent，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v21.3 已完成 — Skill 系统（progressive disclosure tier 1 索引 + tier 2 `skill_view` 工具 + `/skill` 命令 + plan/TDD/systematic-debugging 三个示例）。
-- **核心叙事**：通过 V0→V21.3 的 24 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减 + 多家族 provider 协议解耦 + 主备故障切换 + 显式 prompt cache + 交互层装饰器注册 + 三段式 prompt + skill 渐进式披露。
+- **当前阶段**：v21.4 已完成 — 工具结果协议收口（`tool_result()` / `tool_error()` 辅助函数 + 6 个工具迁移 + `mcp_client` 裸字符串违例修复 + `registry.dispatch` 最终防线）。
+- **核心叙事**：通过 V0→V21.4 的 25 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减 + 多家族 provider 协议解耦 + 主备故障切换 + 显式 prompt cache + 交互层装饰器注册 + 三段式 prompt + skill 渐进式披露 + 工具结果协议统一。
 
 ---
 
@@ -20,7 +20,7 @@
 |------|---------|-----------|-------|
 | **源项目** | `/Users/qshf/my-project/hermes-agent` | `https://github.com/qshf/hermes-agent` | `main` |
 | **nano 项目** | `/Users/qshf/my-project/nano_hermes_agent` | `git@github.com:qshf/nano-hermes-agent.git` | 多分支 `v0`..`v10.1`，无 main |
-| **当前活跃分支** | `skill/v0.21.3`（V21 系列：v21.1/v21.2 已合并到 transport/v0.20，v21.3 在自身分支待 review） | — | — |
+| **当前活跃分支** | `skill/v0.21.3`（V21 系列：v21.1/v21.2 已合并到 transport/v0.20，v21.3 / v21.4 在自身分支待 review） | — | — |
 
 **跨目录的硬约束**：源项目和 nano 不在同一目录。任何"对照源项目读 X 文件"的操作都必须用源项目的绝对路径，例：
 - 源项目 Hindsight 插件：`/Users/qshf/my-project/hermes-agent/plugins/memory/hindsight/__init__.py`
@@ -28,7 +28,7 @@
 
 ---
 
-## 3. 进度状态（24 档迭代）
+## 3. 进度状态（25 档迭代）
 
 | 版本 | 标题 | 引入概念 | 状态 |
 |------|------|---------|------|
@@ -56,7 +56,8 @@
 | v20 | Prompt Cache 控制（Anthropic ephemeral） | system_and_3 cache_control 注入 / Usage 拆 read+write / chain 累计命中率 / /transport 展示 | ✅ |
 | v21.1 | slash 命令注册表 | 装饰器 + AgentCtx + dispatch / main.py 主循环瘦身 ~200 行 / agent.py → main.py | ✅ |
 | v21.2 | 三段式 PromptBuilder | 骨架 / skill 索引段（占位）/ memory / 工具列表 — 段顺序固定保 V20 cache prefix | ✅ |
-| **v21.3** | **Skill 系统（progressive disclosure）** | **tier 1 索引（name+desc 注入 prompt）+ tier 2 `skill_view` 工具 + `/skill` 命令 + 3 示例** | **✅ 已完成** |
+| v21.3 | Skill 系统（progressive disclosure） | tier 1 索引（name+desc 注入 prompt）+ tier 2 `skill_view` 工具 + `/skill` 命令 + 3 示例 | ✅ |
+| **v21.4** | **工具结果协议收口** | **`tool_result()`/`tool_error()` 辅助函数 + 6 工具迁移 + mcp 裸字符串违例修复 + dispatch 最终防线（异常/非 str/非 JSON 兜底）** | **✅ 已完成** |
 
 **下一档候选**（未启动）：v22 流式输出 + 中断 / v23 多 agent 协作。
 
@@ -168,6 +169,9 @@ ls /Users/qshf/my-project/nano_hermes_agent/skills/
 
 # V21.3 — 跑 skill 系统不变量
 .venv/bin/python /Users/qshf/my-project/nano_hermes_agent/scripts/test_v21_3_skill.py
+
+# V21.4 — 跑工具结果协议不变量（10 项：辅助函数 + 真实工具 + dispatch 兜底）
+.venv/bin/python /Users/qshf/my-project/nano_hermes_agent/scripts/test_v21_4_tool_result_protocol.py
 ```
 
 ---

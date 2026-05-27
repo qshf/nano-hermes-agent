@@ -7,12 +7,14 @@ registry.dispatch() 自动通过 _run_async() 桥接到 sync 上下文。
 对比 MCP 工具：
 - MCP 需要自建 _run_on_mcp_loop 机制（连接是长生命周期，需要持久 event loop）
 - V4 的 async 工具只需声明 is_async=True（一次性协程，用完即走）
+
+V21.4：用 tool_result 收口返回格式。
 """
 
 import asyncio
-import json
 
 from tools.registry import registry
+from tools.result import tool_result
 
 ASYNC_DEMO_SCHEMA = {
     "name": "async_demo",
@@ -39,9 +41,7 @@ async def async_demo_handler(args: dict) -> str:
     seconds = args.get("seconds", 1)
     message = args.get("message", "async operation done")
     await asyncio.sleep(seconds)
-    return json.dumps({
-        "output": f"{message} (waited {seconds}s)",
-    }, ensure_ascii=False)
+    return tool_result(output=f"{message} (waited {seconds}s)")
 
 
 registry.register(ASYNC_DEMO_SCHEMA, async_demo_handler, is_async=True)

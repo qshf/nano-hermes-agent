@@ -116,10 +116,18 @@ class ToolRegistry:
         return self.get_definitions(list(self._tools.keys()))
 
     def dispatch(self, name: str, args: dict) -> str:
-        """根据工具名分发调用。V5: coerce → pre_hook → 执行 → post_hook → transform。"""
+        """根据工具名分发调用。
+
+        V5: coerce → pre_hook → 执行 → post_hook → transform。
+        V21.4: 加最终防线 — 任何工具返回非字符串、抛出异常逃逸出 handler 自身的
+              try/except、或返回非合法 JSON 字符串时，dispatch 兜底成统一格式，
+              确保 messages[]["content"] 永远是合法 JSON 字符串。
+        """
+        from tools.result import tool_error, tool_result
+
         entry = self._tools.get(name)
         if entry is None:
-            return json.dumps({"error": f"Unknown tool: {name}"}, ensure_ascii=False)
+            return tool_error(f"Unknown tool: {name}")
 
         # V4: 类型强制转换
         from tools.coerce import coerce_args
@@ -130,14 +138,18 @@ class ToolRegistry:
         pre_results = hook_manager.invoke("pre_tool_call", tool_name=name, args=coerced)
         for r in pre_results:
             if isinstance(r, dict) and r.get("action") == "block":
-                return json.dumps({"error": f"Blocked: {r.get('message', '')}"}, ensure_ascii=False)
+                return tool_error(f"Blocked: {r.get('message', '')}")
 
-        # 执行 handler（计时）
+        # 执行 handler（计时） — V21.4: 顶层 try 兜底未捕获异常
         start = time.monotonic()
-        if entry.get("is_async"):
-            result = _run_async(entry["handler"](coerced))
-        else:
-            result = entry["handler"](coerced)
+        try:
+            if entry.get("is_async"):
+                result = _run_async(entry["handler"](coerced))
+            else:
+                result = entry["handler"](coerced)
+        except Exception as exc:
+            log.exception("Tool %s dispatch error: %s", name, exc)
+            return tool_error(f"Tool execution failed: {type(exc).__name__}: {exc}")
         duration_ms = int((time.monotonic() - start) * 1000)
 
         # V5: post_tool_call 钩子（观察者，返回值忽略）
@@ -149,6 +161,21 @@ class ToolRegistry:
             if isinstance(r, str):
                 result = r
                 break
+
+        # V21.4 最终防线：保证返回值是合法 JSON 字符串
+        # 三种异常情况：(1) handler 返回非 str；(2) 返回 str 但不是合法 JSON；
+        # (3) 返回合法 JSON 但是 list/数字等非 object 顶层类型 — 也强转。
+        if not isinstance(result, str):
+            log.warning("Tool %s returned non-str (%s); coercing", name, type(result).__name__)
+            return tool_result(output=str(result))
+        try:
+            parsed = json.loads(result)
+            if not isinstance(parsed, dict):
+                log.warning("Tool %s returned non-dict JSON; coercing", name)
+                return tool_result(output=result)
+        except json.JSONDecodeError:
+            log.warning("Tool %s returned non-JSON string; coercing", name)
+            return tool_result(output=result)
 
         return result
 

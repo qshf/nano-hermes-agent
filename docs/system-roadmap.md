@@ -242,6 +242,38 @@ v27  Todo / Clarify（可选小尾巴）           ← 协作工具
 
 ---
 
+### V21.4 工具结果协议收口（已完成）
+
+**核心问题**：
+- V21.3 后审视工具体系，发现 6 个工具各自重复 `json.dumps({...}, ensure_ascii=False)` 拼装结果，字段名虽对齐源项目（`error` / `output` / `content`）但缺统一入口
+- `tools/mcp_client.py:160` 直接 `return "\n".join(parts)` 是裸字符串，破坏"工具结果都是合法 JSON 字符串"的协议假设
+- `registry.dispatch` 没有最终防线：handler 抛异常会冒泡到 agent loop，返回非 str / 非 JSON 也无人兜底
+
+**最小切片**（已落地）：
+1. 新增 `tools/result.py` — `tool_result(data=None, **kwargs)` / `tool_error(msg, **extra)`，仿源项目 `tools/registry.py:537-548`
+2. 6 个工具改用辅助函数（skill_view / read_file / terminal / docker_exec / async_demo / mcp_client）
+3. `mcp_client._make_handler` 把 server text content 拼接结果包成 `{"output": "..."}`
+4. `registry.dispatch` 加最终防线：handler 抛异常 → `tool_error(...)`；返回非 str → `tool_result(output=str(...))`；返回非合法 JSON → `tool_result(output=<原文>)`
+5. `scripts/test_v21_4_tool_result_protocol.py` — 10 项不变量测试覆盖辅助函数 + 真实工具协议 + dispatch 兜底三类
+
+**主动留到后期的"大输出沙箱持久化"**（不在 V21.4 范围）：
+
+源项目 `tools/tool_result_storage.py:122-176` 的 `maybe_persist_tool_result` 提供更彻底的解法 —— 工具结果超过阈值时，把完整内容落盘到 sandbox（`/tmp/hermes-results/{tool_use_id}.txt`），返回给模型的是 `<persisted-output>` 标签包的预览 + 文件路径，模型按需用 `read_file` 再展开。
+
+**为什么先不做**：
+- 当前 nano `skills/` 下 skill 文件都不大（最长 ~80 行），没出现 context 撑爆问题
+- 持久化机制涉及沙箱目录管理、`tool_use_id` 关联、清理策略（TTL / 容量上限）三件独立设计，跟"协议统一"耦合度低
+- 与"每档解决一个具体痛点"的 nano 节奏冲突 —— 强行塞进 V21.4 会让叙事杂糅
+
+**触发条件**：当出现以下任一情况时独立开档（暂记 V21.5 候选）：
+- 单次工具结果（read_file / skill_view / terminal stdout）超过 8 KB 在 messages 里反复留存
+- prompt cache 命中率因工具结果体积大而显著下降
+- 出现需要"工具产出大文件 → 后续 turn 引用"的场景（数据导出 / 大段日志检索）
+
+**预估规模**：辅助 + 重构 + 测试 = ~150 行变更（已完成）
+
+---
+
 ### V22 流式输出 + 中断
 
 **核心问题**：
