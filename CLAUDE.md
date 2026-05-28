@@ -9,8 +9,8 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到能挂载长期记忆。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级 AI Agent，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v22 已完成 — 流式输出 + 中断（``stream_call`` 入口、``CancelToken`` 线程安全取消、Chain "首帧前可切家 / 首帧后必抛"、``/stream on|off``、SIGINT 翻译为 ``StreamCancelled`` 而非杀进程）。
-- **核心叙事**：通过 V0→V22 的 26 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减 + 多家族 provider 协议解耦 + 主备故障切换 + 显式 prompt cache + 交互层装饰器注册 + 三段式 prompt + skill 渐进式披露 + 工具结果协议统一 + 流式输出与优雅中断。
+- **当前阶段**：v23.0 已完成 — 多智能体最小可用版（``delegate_task`` 工具 / 隔离 child_loop / 工具黑名单 ``{delegate_task, memory, memory_*}`` / setter 注入 chain+model+父工具集）。
+- **核心叙事**：通过 V0→V23.0 的 27 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减 + 多家族 provider 协议解耦 + 主备故障切换 + 显式 prompt cache + 交互层装饰器注册 + 三段式 prompt + skill 渐进式披露 + 工具结果协议统一 + 流式输出与优雅中断 + 父子隔离的子 agent。
 
 ---
 
@@ -20,7 +20,7 @@
 |------|---------|-----------|-------|
 | **源项目** | `/Users/qshf/my-project/hermes-agent` | `https://github.com/qshf/hermes-agent` | `main` |
 | **nano 项目** | `/Users/qshf/my-project/nano_hermes_agent` | `git@github.com:qshf/nano-hermes-agent.git` | 多分支 `v0`..`v10.1`，无 main |
-| **当前活跃分支** | `stream/v0.22`（V22 流式输出 + 中断；基于 skill/v0.21.3 起） | — | — |
+| **当前活跃分支** | `delegate/v0.23`（V23.0 多 agent 最小可用版；基于 stream/v0.22 起） | — | — |
 
 **跨目录的硬约束**：源项目和 nano 不在同一目录。任何"对照源项目读 X 文件"的操作都必须用源项目的绝对路径，例：
 - 源项目 Hindsight 插件：`/Users/qshf/my-project/hermes-agent/plugins/memory/hindsight/__init__.py`
@@ -28,7 +28,7 @@
 
 ---
 
-## 3. 进度状态（26 档迭代）
+## 3. 进度状态（27 档迭代）
 
 | 版本 | 标题 | 引入概念 | 状态 |
 |------|------|---------|------|
@@ -58,9 +58,10 @@
 | v21.2 | 三段式 PromptBuilder | 骨架 / skill 索引段（占位）/ memory / 工具列表 — 段顺序固定保 V20 cache prefix | ✅ |
 | v21.3 | Skill 系统（progressive disclosure） | tier 1 索引（name+desc 注入 prompt）+ tier 2 `skill_view` 工具 + `/skill` 命令 + 3 示例 | ✅ |
 | v21.4 | 工具结果协议收口 | `tool_result()`/`tool_error()` 辅助函数 + 6 工具迁移 + mcp 裸字符串违例修复 + dispatch 最终防线（异常/非 str/非 JSON 兜底） | ✅ |
-| **v22** | **流式输出 + 中断** | **`stream_call` 入口 + `StreamEvent`（text/reasoning/tool_call_started/done）+ `CancelToken`（threading.Event 为 V23 多 agent 准备）+ Chain "首帧前可切家 / 首帧后必抛" + `/stream on\|off` + SIGINT→StreamCancelled** | **✅ 已完成** |
+| v22 | 流式输出 + 中断 | **`stream_call` 入口 + `StreamEvent`（text/reasoning/tool_call_started/done）+ `CancelToken`（threading.Event 为 V23 多 agent 准备）+ Chain "首帧前可切家 / 首帧后必抛" + `/stream on\|off` + SIGINT→StreamCancelled** | ✅ |
+| **v23.0** | **多智能体最小可用版（delegate_task）** | **`delegate_task` 工具（goal/context schema）+ 隔离 `run_child_loop`（fresh messages / 父全集减黑名单 ``{delegate_task, memory, memory_*}`` / 同步 chain.call / max_iterations=8 兜底）+ setter 注入 chain+model+父工具集（仿 skill_view_tool）** | **✅ 已完成** |
 
-**下一档候选**（未启动）：v23 多 agent 协作（delegate_task）/ v24 trajectory + insights。
+**下一档候选**（未启动）：v23.1 批量并行 + 工具子集白名单（`tasks: []` + `ThreadPoolExecutor` + `tools` 字段）/ v23.2 流式中继 + 父子 cancel token 桥接（兑现 V22 `threading.Event` 承诺）/ v23.3 结构化结果 + 成本聚合 / v24 trajectory + insights。
 
 ---
 
@@ -185,6 +186,9 @@ ls /Users/qshf/my-project/nano_hermes_agent/skills/
 
 # V22 — 跑流式 + 中断不变量（13 项：CancelToken / SSE 增量 / tool_call 累积 / chain failover）
 .venv/bin/python /Users/qshf/my-project/nano_hermes_agent/scripts/test_v22_streaming.py
+
+# V23.0 — 跑多智能体不变量（10 项：child_loop 隔离 / 黑名单 / check_fn / system prompt / max_iterations）
+.venv/bin/python /Users/qshf/my-project/nano_hermes_agent/scripts/test_v23_0_delegate.py
 
 # V22 — 用户使用文档（输入框按键 / Esc-Enter 多行 / 流式中按 Ctrl+C 取消）
 # docs/usage-input-and-cancel.md

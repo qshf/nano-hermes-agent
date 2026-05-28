@@ -27,5 +27,11 @@
 - [ ] V22 流式 + 工具调用混合：本档主要测了纯文本流和纯工具流，但 "先吐一段文字解释、再调工具" 的混合形态（tool_call_started 在 text_delta 之间穿插）UX 表现没专门 case；上 V23 之前补一个集成测试。
 - [ ] V22 reasoning 实时回显被故意省略 — 仅打个 `[think] ...` 占位。如果要做完整 reasoning box（DeepSeek/Kimi 的 CoT 用户希望看到），延后到 V25/V26 再补。
 
+## 多智能体系统（V23）
+
+- [ ] V23.0 真模型烟测缺失 — 10/10 fake-chain 不变量过了，但还需在真 DeepSeek 上手测：父让子做"读 README 第一行" → 子返回简短 summary、父 messages 里只多了 1 条 tool_call + 1 条 tool_result（不混入子的 read_file 中间步）。
+- [ ] V23.0 父在 STREAM_ENABLED=1 下调 delegate 时，子内部仍走同步 chain.call，父 UI 表现为"等子时一片空白" — 这是预期行为（V23.2 才接流式中继），但需要在真跑里观察一下"空白时长 vs 子任务长度"是否符合直觉。
+- [ ] V23 后续档计划已写在 [docs/Multi-agent-system/iteration-plan.md](Multi-agent-system/iteration-plan.md)：V23.1 批量并行 / V23.2 流式中继 + cancel 桥接 / V23.3 结构化结果 / V23.4 嵌套（可选）。优先级：V23.1 → V23.2 → V23.3 → V24 trajectory，V23.4 仅在 V24 完成且有需求时启动。
+
 ## 文档
 - [x] ~~CLAUDE.md 已超 250 行硬规则上限，下一档完成后应把决策日志按版本拆到 `docs/decisions/v<N>.md`，本文件只留索引。~~ — 已拆分（决策日志移到 [docs/decisions/](decisions/)，待办移到本文件）。

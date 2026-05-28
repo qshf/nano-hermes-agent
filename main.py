@@ -80,6 +80,7 @@ load_dotenv(override=True)
 from model_tools import get_tool_definitions, get_available_tool_names
 from tools.registry import registry
 from tools.skill_view_tool import set_skill_loader as _inject_skill_loader
+from tools.delegate_tool import set_delegate_context as _inject_delegate_context
 from memory import BuiltinMemoryProvider, MemoryManager, RemoteSemanticProvider
 from context_compressor import ContextCompressor
 from transports.chain import FailoverExhausted, build_chain_from_env
@@ -357,6 +358,19 @@ def run_agent():
     # 位置参数兼容签名传入；真正的 LLM 调用统一走 chain.call()）。
     client = chain.primary_client
     model = os.environ.get("MODEL", "gpt-4o-mini")
+
+    # V23.0: 注入 delegate_task 工具的运行期上下文 —— chain 构建完才注入。
+    # 父全集 = registry 注册过的 + memory_manager 暴露的；黑名单（delegate_task /
+    # memory_*）由 ``_resolve_child_toolset`` 自己过滤。check_fn 在注入完成后
+    # 才让 delegate_task 暴露给父 LLM。
+    _parent_full_toolset = sorted(
+        set(registry.tool_names) | set(memory_manager.get_all_tool_names())
+    )
+    _inject_delegate_context(
+        chain=chain,
+        model=model,
+        parent_toolset_names=_parent_full_toolset,
+    )
 
     messages = [{"role": "system", "content": build_system_prompt()}]
 

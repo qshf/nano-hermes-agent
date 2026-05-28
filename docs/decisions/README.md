@@ -21,5 +21,6 @@
 | v21.3 | Skill 系统（progressive disclosure tier 1 + tier 2） | [v21.3.md](./v21.3.md) |
 | v21.4 | 工具结果协议收口（tool_result/tool_error + dispatch 兜底） | [v21.4.md](./v21.4.md) |
 | v22 | 流式输出 + 中断（stream_call / CancelToken / chain failover-before-first-event） | [v22.md](./v22.md) |
+| v23.0 | 多智能体最小可用版（delegate_task / 子 loop / 工具黑名单） | [v23.0.md](./v23.0.md) |
 
 > 注：V8 / V15 的决策记录散落在对应的 commit message 与 [docs/Memory-system/](../Memory-system/) 子目录下，未来如有补录需求再回填本目录。
