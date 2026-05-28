@@ -35,5 +35,13 @@
 - [ ] V23.1 父 LLM 看到批量返回的 JSON 数组字符串后是否会**自动 json.loads**？需要在真模型上观察 — 如果不会，下一档要在 system prompt 里加一句 hint（"the output field of a batch delegate result is a JSON array string; parse it before reasoning over individual tasks"）。
 - [ ] V23 后续档计划已写在 [docs/Multi-agent-system/iteration-plan.md](Multi-agent-system/iteration-plan.md)：V23.2 流式中继 + cancel 桥接 / V23.3 结构化结果 / V23.4 嵌套（可选）。优先级：V23.2 → V23.3 → V24 trajectory，V23.4 仅在 V24 完成且有需求时启动。
 
+## 压缩系统（V15 修复主线）
+
+- [x] ~~`tail_start = 4 / n = 106` 假压缩 — 兜底语义错误导致 middle 1 条假压缩，触发 anti-thrashing 后整个 V15 流水线躺平~~ — v15.1 修复：兜底反向走最大化压缩。
+- [x] ~~`/compress` 报 NoneType.strip 崩 — `_format_messages` 没兜 content=None~~ — v15.1 修复：`content = msg.get("content") or ""` + 类型守卫。
+- [x] ~~assistant content=None 且无 tool_calls 时下一轮 400 — deepseek-v4-flash 把可见正文塞 reasoning_content~~ — v15.1 修复：写入侧 `build_assistant_history_msg` 抢救 + 读出侧 `convert_messages` sanitize 双道防线。
+- [ ] **v15.2 候选**：`_ensure_last_user_message_in_tail`（防活跃任务消失，源项目 #10896）/ `soft_ceiling = budget * 1.5`（超大 tool 输出稳健）/ Prefill retry + `_empty_terminal_sentinel` + `_drop_trailing_empty_response_scaffolding`（接管 reasoning-only 抢救的正确语义，替代 v15.1 的"reasoning 提升 content"）/ Post-tool nudge（防 `tool→user` 非法序列）/ V15 旧测 test_5/test_6 修 transport 签名（V18 重构遗债）。
+- [ ] V15.1 真模型烟测：在真 DeepSeek 长会话（≥ 100 turn）上跑 `/compress` 验证：① middle 不是 1 条假压缩；② tool 群完整不被拆；③ deepseek-v4-flash reasoning-only 响应不再触发 400；④ `/compress` 输出 token 节省百分比看着合理（≥ 50%）。
+
 ## 文档
 - [x] ~~CLAUDE.md 已超 250 行硬规则上限，下一档完成后应把决策日志按版本拆到 `docs/decisions/v<N>.md`，本文件只留索引。~~ — 已拆分（决策日志移到 [docs/decisions/](decisions/)，待办移到本文件）。

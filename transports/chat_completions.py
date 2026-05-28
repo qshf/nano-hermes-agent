@@ -145,8 +145,42 @@ class ChatCompletionsTransport(ProviderTransport):
     def convert_messages(
         self, messages: list[dict[str, Any]], **kwargs
     ) -> list[dict[str, Any]]:
-        """messages 已是 OpenAI 格式 — identity 直通。"""
-        return messages
+        """messages 已是 OpenAI 格式 — identity 直通 + assistant 消息合法性兜底。
+
+        Chat Completions 协议要求每条 ``role: assistant`` 必须满足 ``content``
+        非空 *或* 带 ``tool_calls``。否则 400::
+
+            Invalid assistant message: content or tool_calls must be set
+
+        历史消息可能因为旧版回填代码、provider 协议差异、或 deepseek-v4-flash
+        把可见正文塞 reasoning_content 等原因，留下"纯 reasoning，无 content，
+        无 tool_calls"的脏 assistant 消息。这里在出口处兜一层：
+          - 抢救：reasoning_content 非空 → 提升为 content
+          - 兜底：占位空格 " "（极罕见，仅为让协议过关）
+
+        写入侧（main.py / child_loop.py）的 build_assistant_history_msg 已经做
+        过同样的抢救；这里是"读旧账"的第二道防线。
+        """
+        sanitized: list[dict[str, Any]] = []
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                sanitized.append(msg)
+                continue
+            content = msg.get("content")
+            tool_calls = msg.get("tool_calls")
+            content_empty = content is None or (isinstance(content, str) and not content.strip())
+            if content_empty and not tool_calls:
+                # 抢救：reasoning_content 拉上来当 content
+                rc = msg.get("reasoning_content")
+                fixed = dict(msg)
+                if isinstance(rc, str) and rc.strip():
+                    fixed["content"] = rc
+                else:
+                    fixed["content"] = " "  # 极罕见兜底
+                sanitized.append(fixed)
+            else:
+                sanitized.append(msg)
+        return sanitized
 
     def convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """tools 已是 OpenAI function calling 格式 — identity 直通。"""

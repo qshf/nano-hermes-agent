@@ -13,6 +13,7 @@
 | v12 | 异步 retain（后台 writer 线程） | [v12.md](./v12.md) |
 | v13 | 后台 prefetch 预热（两阶段 recall） | [v13.md](./v13.md) |
 | v14 | 会话切换（on_session_switch 生命周期钩子） | [v14.md](./v14.md) |
+| v15.1 | 压缩边界修复 + assistant 消息合法性兜底 | [v15.1.md](./v15.1.md) |
 | v16 | retain 批量 + 多跳图遍历 + 时间衰减 | [v16.md](./v16.md) |
 | v17 | Transport ABC + ChatCompletionsTransport | [v17.md](./v17.md) |
 | v18 | AnthropicTransport + Registry | [v18.md](./v18.md) |
@@ -24,4 +25,4 @@
 | v23.0 | 多智能体最小可用版（delegate_task / 子 loop / 工具黑名单） | [v23.0.md](./v23.0.md) |
 | v23.1 | 批量并行 + 工具子集白名单（tasks 数组 + ThreadPoolExecutor + 白名单交集） | [v23.1.md](./v23.1.md) |
 
-> 注：V8 / V15 的决策记录散落在对应的 commit message 与 [docs/Memory-system/](../Memory-system/) 子目录下，未来如有补录需求再回填本目录。
+> 注：V8 的决策记录散落在对应的 commit message 与 [docs/Memory-system/](../Memory-system/) 子目录下，未来如有补录需求再回填本目录。V15 主决策（5 阶段压缩流水线）当时未单独建档，本目录从 v15.1 开始接力补完。

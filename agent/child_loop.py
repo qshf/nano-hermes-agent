@@ -167,23 +167,10 @@ def run_child_loop(
                 "iterations": iterations,
             }
 
-        # 回填 assistant 消息（与父 main.py:567-585 同款 shape，包含 reasoning_content
-        # padding）—— 让 DeepSeek/Kimi thinking 模式下下一轮请求不会 400
-        assistant_dump: dict = {"role": "assistant", "content": normalized.content}
-        if normalized.tool_calls:
-            assistant_dump["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {"name": tc.name, "arguments": tc.arguments},
-                }
-                for tc in normalized.tool_calls
-            ]
-        rc = normalized.reasoning_content
-        if rc is not None:
-            assistant_dump["reasoning_content"] = rc
-        elif normalized.tool_calls:
-            assistant_dump["reasoning_content"] = " "
+        # 回填 assistant 消息（与父 main.py 同款 shape，包含 reasoning_content
+        # padding 和 content=None 抢救）—— 让 DeepSeek/Kimi thinking 模式下下一轮请求不会 400
+        from transports.types import build_assistant_history_msg
+        assistant_dump = build_assistant_history_msg(normalized)
         messages.append(assistant_dump)
 
         if not normalized.tool_calls:

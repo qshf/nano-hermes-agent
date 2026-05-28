@@ -9,8 +9,8 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到能挂载长期记忆。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级 AI Agent，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v23.1 已完成 — 批量并行 + 工具子集白名单（``tasks: []`` 数组 / ``ThreadPoolExecutor`` 默认 3 worker / 每条任务可选 ``tools`` 白名单与父全集取交集 + 强制减黑名单 / 主线程 fail-fast 校验绝不半启动）。
-- **核心叙事**：通过 V0→V23.1 的 28 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减 + 多家族 provider 协议解耦 + 主备故障切换 + 显式 prompt cache + 交互层装饰器注册 + 三段式 prompt + skill 渐进式披露 + 工具结果协议统一 + 流式输出与优雅中断 + 父子隔离的子 agent + 批量并行 spawn 与每子工具白名单。
+- **当前阶段**：v15.1 已完成 — 压缩边界修复 + assistant 消息合法性兜底（``_find_tail_boundary`` 兜底反向走最大化压缩 / ``_align_boundary`` 改 backward 不拆 tool 群 / 新增 ``build_assistant_history_msg`` helper 抢救 ``content=None+无 tool_calls`` 脏消息 / ``ChatCompletionsTransport.convert_messages`` 出口 sanitize 兜旧 history / ``/compress`` 输出补节省 token 汇总）。基于 delegate/v0.23.1 分支，作为存量缺陷修复档非递增主线。
+- **核心叙事**：通过 V0→V23.1 的 28 档迭代 + V15.1 修复，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减 + 多家族 provider 协议解耦 + 主备故障切换 + 显式 prompt cache + 交互层装饰器注册 + 三段式 prompt + skill 渐进式披露 + 工具结果协议统一 + 流式输出与优雅中断 + 父子隔离的子 agent + 批量并行 spawn 与每子工具白名单。
 
 ---
 
@@ -60,9 +60,10 @@
 | v21.4 | 工具结果协议收口 | `tool_result()`/`tool_error()` 辅助函数 + 6 工具迁移 + mcp 裸字符串违例修复 + dispatch 最终防线（异常/非 str/非 JSON 兜底） | ✅ |
 | v22 | 流式输出 + 中断 | **`stream_call` 入口 + `StreamEvent`（text/reasoning/tool_call_started/done）+ `CancelToken`（threading.Event 为 V23 多 agent 准备）+ Chain "首帧前可切家 / 首帧后必抛" + `/stream on\|off` + SIGINT→StreamCancelled** | ✅ |
 | v23.0 | 多智能体最小可用版（delegate_task） | `delegate_task` 工具（goal/context schema）+ 隔离 `run_child_loop`（fresh messages / 父全集减黑名单 ``{delegate_task, memory, memory_*}`` / 同步 chain.call / max_iterations=8 兜底）+ setter 注入 chain+model+父工具集（仿 skill_view_tool） | ✅ |
-| **v23.1** | **批量并行 + 工具子集白名单** | **`tasks: []` 数组 schema + 顶层/每条 `tools` 白名单字段 + `ThreadPoolExecutor`（默认 3 worker，env `DELEGATE_MAX_CONCURRENT`）+ `_resolve_child_toolset(requested=...)` 交集语义（白名单 ∩ 父全集 - 黑名单）+ 主线程 fail-fast 校验（任一不合法整体拒绝，绝不半启动）+ `executor.map` 保留输入顺序** | **✅ 已完成** |
+| v23.1 | 批量并行 + 工具子集白名单 | `tasks: []` 数组 schema + 顶层/每条 `tools` 白名单字段 + `ThreadPoolExecutor`（默认 3 worker，env `DELEGATE_MAX_CONCURRENT`）+ `_resolve_child_toolset(requested=...)` 交集语义（白名单 ∩ 父全集 - 黑名单）+ 主线程 fail-fast 校验（任一不合法整体拒绝，绝不半启动）+ `executor.map` 保留输入顺序 | ✅ |
+| **v15.1**（修复档） | **压缩边界 + assistant 消息合法性** | **`_find_tail_boundary` 兜底反向走最大化压缩（修 tail_start=4/n=106 假压缩）+ `_align_boundary` backward 不拆 tool 群 + `transports/types.py` 新增 `build_assistant_history_msg` helper（reasoning 抢救 / DeepSeek thinking padding / 全空兜底）+ `ChatCompletionsTransport.convert_messages` 出口 sanitize（兜旧 history）+ `_format_messages` content=None 兜底 + `/compress` 输出补节省 token 汇总** | **✅ 已完成** |
 
-**下一档候选**（未启动）：v23.2 流式中继 + 父子 cancel token 桥接（兑现 V22 `threading.Event` 承诺）/ v23.3 结构化结果 + 成本聚合（`tokens` / `tool_trace` / `status` 五态） / v24 trajectory + insights。
+**下一档候选**（未启动）：v15.2 prefill retry + post-tool nudge + last-user 锚点 + soft_ceiling 1.5×（修复档延伸）/ v23.2 流式中继 + 父子 cancel token 桥接（兑现 V22 `threading.Event` 承诺）/ v23.3 结构化结果 + 成本聚合（`tokens` / `tool_trace` / `status` 五态） / v24 trajectory + insights。
 
 ---
 
@@ -200,6 +201,9 @@ ls /Users/qshf/my-project/nano_hermes_agent/skills/
 
 # V23.1 — 跑批量并行不变量（9 项：并行加速 / 顺序 / 白名单交集 / 黑名单强制 / 校验 fail-fast / V23.0 回归）
 .venv/bin/python /Users/qshf/my-project/nano_hermes_agent/scripts/test_v23_1_batch.py
+
+# V15.1 — 跑压缩边界 + assistant 合法性不变量（7 项：兜底反向 / tool 群完整 / 真实 106 条 bug 复现 / V15 回归 / _format_messages None 兜底 / build_assistant_history_msg 抢救 / convert_messages sanitize）
+.venv/bin/python /Users/qshf/my-project/nano_hermes_agent/scripts/test_v15_1_compress_boundary.py
 
 # V22 — 用户使用文档（输入框按键 / Esc-Enter 多行 / 流式中按 Ctrl+C 取消）
 # docs/usage-input-and-cancel.md

@@ -93,6 +93,7 @@ from transports.streaming import (
     CancelToken,
     StreamCancelled,
 )
+from transports.types import build_assistant_history_msg
 from agent import PromptBuilder, SkillLoader
 import cli  # 触发 cli/commands 下所有命令的装饰器注册
 
@@ -578,24 +579,9 @@ def run_agent():
                     compressor.update_usage(normalized.usage.prompt_tokens)
 
                 # 把标准化响应回填进对话历史（保持 OpenAI 消息 shape，下一轮 build_kwargs 还能消费）
-                assistant_dump: dict = {"role": "assistant", "content": normalized.content}
-                if normalized.tool_calls:
-                    assistant_dump["tool_calls"] = [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {"name": tc.name, "arguments": tc.arguments},
-                        }
-                        for tc in normalized.tool_calls
-                    ]
-                # DeepSeek/Kimi/Moonshot thinking mode 要求每条 assistant 消息回传 reasoning_content
-                # 否则下一轮请求 400: "The reasoning_content in the thinking mode must be passed back"
-                # 对齐源项目 run_agent.py:9621-9635（pad 一个空格避开 DeepSeek V4 Pro 的非空校验）
-                rc = normalized.reasoning_content
-                if rc is not None:
-                    assistant_dump["reasoning_content"] = rc
-                elif normalized.tool_calls:
-                    assistant_dump["reasoning_content"] = " "
+                # V15.1: 抢救 content=None + 无 tool_calls 的脏 assistant 消息（reasoning 提升为 content）
+                # 对齐源项目 run_agent.py:9621-9635（DeepSeek/Kimi/Moonshot thinking padding）
+                assistant_dump = build_assistant_history_msg(normalized)
                 messages.append(assistant_dump)
 
                 if not normalized.tool_calls:

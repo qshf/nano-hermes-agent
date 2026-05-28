@@ -281,11 +281,13 @@ class ContextCompressor:
         if cut_idx > fallback_cut:
             cut_idx = fallback_cut
 
-        # 不能切进 head 区域
+        # 预算大到能罩住整个会话时，强制最大化压缩 — tail 只留最后 min_tail 条，
+        # middle 拿到所有可摘要消息。否则 cut_idx=head_end+1 会让 middle 只剩 1 条
+        # 假压缩，触发 anti-thrashing 计数（源项目 #10896 同形）。
         if cut_idx <= head_end:
-            cut_idx = head_end + 1
+            cut_idx = max(fallback_cut, head_end + 1)
 
-        # 对齐：不在 tool message 上切割，往前找到 assistant/user
+        # 对齐：tool_call/result 群一起进 middle 摘要 — 避免 sanitize 删孤立 result
         cut_idx = self._align_boundary(messages, cut_idx, head_end)
 
         return max(cut_idx, head_end + 1)
@@ -302,15 +304,30 @@ class ContextCompressor:
         return 0
 
     def _align_boundary(self, messages: list[dict], cut_idx: int, head_end: int) -> int:
-        """将 cut_idx 对齐到非 tool 消息边界。
+        """将 cut_idx 对齐到 tool_call/result 群之外（往前对齐到父 assistant 之前）。
 
-        如果 cut_idx 指向 tool message，往前移动直到找到 assistant 或 user。
-        这避免了孤立的 tool result 出现在 tail 开头（会导致 API 400）。
+        如果 cut_idx 处或前面是 tool 消息，往前退到拥有 tool_calls 的父 assistant
+        消息，把整组 tool_call + tool_results 塞进 middle 摘要，避免 sanitize 阶段
+        删除孤立的 tool result（会静默丢消息）。
+
+        对应源项目 _align_boundary_backward（agent/context_compressor.py:1188）。
         """
-        while cut_idx < len(messages) and messages[cut_idx].get("role") == "tool":
-            cut_idx += 1
-        if cut_idx >= len(messages):
-            cut_idx = len(messages) - 3
+        if cut_idx <= 0 or cut_idx >= len(messages):
+            return max(cut_idx, head_end + 1)
+
+        # 往前跨过连续的 tool result
+        check = cut_idx - 1
+        while check >= 0 and messages[check].get("role") == "tool":
+            check -= 1
+
+        # 落在父 assistant + tool_calls 上时，cut 退到它之前 — 整组进 middle
+        if (
+            check >= head_end
+            and messages[check].get("role") == "assistant"
+            and messages[check].get("tool_calls")
+        ):
+            cut_idx = check
+
         return max(cut_idx, head_end + 1)
 
     # ─── Phase 3: LLM Summary ────────────────────────────────────────────────
@@ -427,7 +444,8 @@ class ContextCompressor:
         parts = []
         for msg in messages:
             role = msg.get("role", "unknown")
-            content = msg.get("content", "")
+            # assistant 带 tool_calls 时 content 合法值是 None；统一兜底成 ""
+            content = msg.get("content") or ""
 
             if role == "tool":
                 if content == _PRUNED_TOOL_PLACEHOLDER:
@@ -441,7 +459,7 @@ class ContextCompressor:
                     if isinstance(tc, dict):
                         fn = tc.get("function", {})
                         names.append(fn.get("name", "?"))
-                text_part = f" — {content[:200]}" if content.strip() else ""
+                text_part = f" — {content[:200]}" if isinstance(content, str) and content.strip() else ""
                 parts.append(f"assistant: [called {', '.join(names)}]{text_part}")
             elif isinstance(content, str) and content.strip():
                 parts.append(f"{role}: {content}")

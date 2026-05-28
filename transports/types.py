@@ -104,3 +104,56 @@ def build_tool_call(
     args_str = json.dumps(arguments) if isinstance(arguments, dict) else str(arguments)
     pd = dict(provider_fields) if provider_fields else None
     return ToolCall(id=id, name=name, arguments=args_str, provider_data=pd)
+
+
+def build_assistant_history_msg(normalized: NormalizedResponse) -> dict[str, Any]:
+    """把 NormalizedResponse 落成下一轮可回传的 OpenAI 历史 assistant 消息。
+
+    Chat Completions 协议合法 assistant 消息必须满足：``content`` 非空 *或*
+    带 ``tool_calls``。否则服务端 400::
+
+        Invalid assistant message: content or tool_calls must be set
+
+    某些 provider（DeepSeek thinking / V4 Pro 偶发）会返回 content=None 且无
+    tool_calls 但有 reasoning_content —— 直接回填会让下一轮请求被拒。
+
+    抢救策略（按优先级）：
+      1. tool_calls 非空 → content=None 合法（OpenAI 正式允许），保留即可
+      2. content 非空 → 直接保留
+      3. content 为空但有 reasoning_content → 把 reasoning 提升为 content（避免活跃任务消失）
+      4. 全空 → 占位空格 " "（极罕见，让协议过关；下游 sanitize 会再处理）
+
+    同时延续 DeepSeek thinking 模式的 reasoning_content padding 约定（带
+    tool_calls 但无 reasoning 时 padding=" "），对应 hermes-agent
+    run_agent.py:9621-9635。
+    """
+    content: Any = normalized.content
+    tool_calls = list(normalized.tool_calls or [])
+    rc = normalized.reasoning_content
+
+    # 第 3/4 步抢救：content 实际为空且无 tool_calls 时把 reasoning 提进 content
+    content_is_empty = content is None or (isinstance(content, str) and not content.strip())
+    if content_is_empty and not tool_calls:
+        if rc and rc.strip():
+            content = rc
+        else:
+            content = " "  # 极罕见兜底；不丢消息，让协议过
+
+    msg: dict[str, Any] = {"role": "assistant", "content": content}
+    if tool_calls:
+        msg["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.name, "arguments": tc.arguments},
+            }
+            for tc in tool_calls
+        ]
+
+    # DeepSeek thinking 模式：每条 assistant 必须回传 reasoning_content
+    if rc is not None:
+        msg["reasoning_content"] = rc
+    elif tool_calls:
+        msg["reasoning_content"] = " "
+
+    return msg
