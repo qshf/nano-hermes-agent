@@ -608,7 +608,22 @@ def run_agent():
 
                 for tool_call in normalized.tool_calls:
                     name = tool_call.function.name
-                    args = json.loads(tool_call.function.arguments)
+                    try:
+                        args = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError as exc:
+                        from tools.result import tool_error
+                        result = tool_error(
+                            f"invalid tool arguments JSON: {exc}",
+                            raw_arguments=tool_call.function.arguments[:500],
+                        )
+                        print(f"  [tool] {name}(<invalid JSON>)")
+                        print(f"  [error] {exc} — asking LLM to retry")
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": result,
+                        })
+                        continue
                     pretty_args = json.dumps(args, ensure_ascii=False)
                     print(f"  [tool] {name}({pretty_args})")
 

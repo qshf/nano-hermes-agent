@@ -9,8 +9,8 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到能挂载长期记忆。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级 AI Agent，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v23.0 已完成 — 多智能体最小可用版（``delegate_task`` 工具 / 隔离 child_loop / 工具黑名单 ``{delegate_task, memory, memory_*}`` / setter 注入 chain+model+父工具集）。
-- **核心叙事**：通过 V0→V23.0 的 27 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减 + 多家族 provider 协议解耦 + 主备故障切换 + 显式 prompt cache + 交互层装饰器注册 + 三段式 prompt + skill 渐进式披露 + 工具结果协议统一 + 流式输出与优雅中断 + 父子隔离的子 agent。
+- **当前阶段**：v23.1 已完成 — 批量并行 + 工具子集白名单（``tasks: []`` 数组 / ``ThreadPoolExecutor`` 默认 3 worker / 每条任务可选 ``tools`` 白名单与父全集取交集 + 强制减黑名单 / 主线程 fail-fast 校验绝不半启动）。
+- **核心叙事**：通过 V0→V23.1 的 28 档迭代，每一档解决前一档暴露的具体痛点，最终从扁平向量存储演进到完整知识图谱 + 读写双异步 + 运行期会话切换 + 上下文压缩 + 多跳召回 + 时间衰减 + 多家族 provider 协议解耦 + 主备故障切换 + 显式 prompt cache + 交互层装饰器注册 + 三段式 prompt + skill 渐进式披露 + 工具结果协议统一 + 流式输出与优雅中断 + 父子隔离的子 agent + 批量并行 spawn 与每子工具白名单。
 
 ---
 
@@ -20,7 +20,7 @@
 |------|---------|-----------|-------|
 | **源项目** | `/Users/qshf/my-project/hermes-agent` | `https://github.com/qshf/hermes-agent` | `main` |
 | **nano 项目** | `/Users/qshf/my-project/nano_hermes_agent` | `git@github.com:qshf/nano-hermes-agent.git` | 多分支 `v0`..`v10.1`，无 main |
-| **当前活跃分支** | `delegate/v0.23`（V23.0 多 agent 最小可用版；基于 stream/v0.22 起） | — | — |
+| **当前活跃分支** | `delegate/v0.23.1`（V23.1 批量并行 + 工具白名单；基于 delegate/v0.23 起） | — | — |
 
 **跨目录的硬约束**：源项目和 nano 不在同一目录。任何"对照源项目读 X 文件"的操作都必须用源项目的绝对路径，例：
 - 源项目 Hindsight 插件：`/Users/qshf/my-project/hermes-agent/plugins/memory/hindsight/__init__.py`
@@ -28,7 +28,7 @@
 
 ---
 
-## 3. 进度状态（27 档迭代）
+## 3. 进度状态（28 档迭代）
 
 | 版本 | 标题 | 引入概念 | 状态 |
 |------|------|---------|------|
@@ -59,9 +59,10 @@
 | v21.3 | Skill 系统（progressive disclosure） | tier 1 索引（name+desc 注入 prompt）+ tier 2 `skill_view` 工具 + `/skill` 命令 + 3 示例 | ✅ |
 | v21.4 | 工具结果协议收口 | `tool_result()`/`tool_error()` 辅助函数 + 6 工具迁移 + mcp 裸字符串违例修复 + dispatch 最终防线（异常/非 str/非 JSON 兜底） | ✅ |
 | v22 | 流式输出 + 中断 | **`stream_call` 入口 + `StreamEvent`（text/reasoning/tool_call_started/done）+ `CancelToken`（threading.Event 为 V23 多 agent 准备）+ Chain "首帧前可切家 / 首帧后必抛" + `/stream on\|off` + SIGINT→StreamCancelled** | ✅ |
-| **v23.0** | **多智能体最小可用版（delegate_task）** | **`delegate_task` 工具（goal/context schema）+ 隔离 `run_child_loop`（fresh messages / 父全集减黑名单 ``{delegate_task, memory, memory_*}`` / 同步 chain.call / max_iterations=8 兜底）+ setter 注入 chain+model+父工具集（仿 skill_view_tool）** | **✅ 已完成** |
+| v23.0 | 多智能体最小可用版（delegate_task） | `delegate_task` 工具（goal/context schema）+ 隔离 `run_child_loop`（fresh messages / 父全集减黑名单 ``{delegate_task, memory, memory_*}`` / 同步 chain.call / max_iterations=8 兜底）+ setter 注入 chain+model+父工具集（仿 skill_view_tool） | ✅ |
+| **v23.1** | **批量并行 + 工具子集白名单** | **`tasks: []` 数组 schema + 顶层/每条 `tools` 白名单字段 + `ThreadPoolExecutor`（默认 3 worker，env `DELEGATE_MAX_CONCURRENT`）+ `_resolve_child_toolset(requested=...)` 交集语义（白名单 ∩ 父全集 - 黑名单）+ 主线程 fail-fast 校验（任一不合法整体拒绝，绝不半启动）+ `executor.map` 保留输入顺序** | **✅ 已完成** |
 
-**下一档候选**（未启动）：v23.1 批量并行 + 工具子集白名单（`tasks: []` + `ThreadPoolExecutor` + `tools` 字段）/ v23.2 流式中继 + 父子 cancel token 桥接（兑现 V22 `threading.Event` 承诺）/ v23.3 结构化结果 + 成本聚合 / v24 trajectory + insights。
+**下一档候选**（未启动）：v23.2 流式中继 + 父子 cancel token 桥接（兑现 V22 `threading.Event` 承诺）/ v23.3 结构化结果 + 成本聚合（`tokens` / `tool_trace` / `status` 五态） / v24 trajectory + insights。
 
 ---
 
@@ -109,6 +110,13 @@ STREAM_ENABLED=1             # 1（默认）/ 0；0 时退化到 V21 同步路�
 # Ctrl+C 期望行为：
 #   - 在 prompt 上按 → 退出 agent（KeyboardInterrupt）
 #   - 流式期间按 → cancel 当前响应回到 prompt（StreamCancelled，不杀进程）
+```
+
+### 4.1.4 V23.1 批量 delegate（可选）
+```bash
+DELEGATE_MAX_CONCURRENT=3    # 批量任务的 ThreadPoolExecutor max_workers；默认 3
+# 不设 / 设非数字 / 设 <=0 → 兜底 3
+# 设大值（如 10）也只是 max_workers 上限；实际 worker 数 = min(此值, len(tasks))
 ```
 
 ### 4.2 v11 新增（mock server 端）
@@ -189,6 +197,9 @@ ls /Users/qshf/my-project/nano_hermes_agent/skills/
 
 # V23.0 — 跑多智能体不变量（10 项：child_loop 隔离 / 黑名单 / check_fn / system prompt / max_iterations）
 .venv/bin/python /Users/qshf/my-project/nano_hermes_agent/scripts/test_v23_0_delegate.py
+
+# V23.1 — 跑批量并行不变量（9 项：并行加速 / 顺序 / 白名单交集 / 黑名单强制 / 校验 fail-fast / V23.0 回归）
+.venv/bin/python /Users/qshf/my-project/nano_hermes_agent/scripts/test_v23_1_batch.py
 
 # V22 — 用户使用文档（输入框按键 / Esc-Enter 多行 / 流式中按 Ctrl+C 取消）
 # docs/usage-input-and-cancel.md

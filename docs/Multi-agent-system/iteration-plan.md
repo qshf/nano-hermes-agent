@@ -185,6 +185,8 @@ V23.3 才把 `summary` 升级到结构化字段；V23.1 仅做"能并行 + 父�
 
 实现位置：构建子 `AIAgent` 时不直接传父 `ToolRegistry`，而是构造一个 `FilteredToolRegistry`（轻量包装：转发 `dispatch`，只重写 `list_schemas`）。
 
+> **落地修订（V23.1 实施时）**：跳过 `FilteredToolRegistry` 类。V23.0 的 `run_child_loop(allowed_tool_names: set[str], ...)` 已经把"per-call 工具过滤"做成了一等参数（`get_definitions` 拉 schema 时 + dispatch 前白名单二次校验两处都过 set），相当于现成的 FilteredToolRegistry 成品。V23.1 直接在 `_resolve_child_toolset(requested=...)` 加一个可选参数实现"白名单 ∩ 父全集 - 黑名单"。详见 [docs/decisions/v23.1.md](../decisions/v23.1.md) 选型 1。
+
 ### 新引入的概念
 
 - **批量 schema 的单 vs 批分支**：源项目同一函数内 if/else 分发，nano 跟进同款写法（教学上明确"两条路径，单是批的退化"）

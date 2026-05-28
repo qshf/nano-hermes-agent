@@ -31,7 +31,9 @@
 
 - [ ] V23.0 真模型烟测缺失 — 10/10 fake-chain 不变量过了，但还需在真 DeepSeek 上手测：父让子做"读 README 第一行" → 子返回简短 summary、父 messages 里只多了 1 条 tool_call + 1 条 tool_result（不混入子的 read_file 中间步）。
 - [ ] V23.0 父在 STREAM_ENABLED=1 下调 delegate 时，子内部仍走同步 chain.call，父 UI 表现为"等子时一片空白" — 这是预期行为（V23.2 才接流式中继），但需要在真跑里观察一下"空白时长 vs 子任务长度"是否符合直觉。
-- [ ] V23 后续档计划已写在 [docs/Multi-agent-system/iteration-plan.md](Multi-agent-system/iteration-plan.md)：V23.1 批量并行 / V23.2 流式中继 + cancel 桥接 / V23.3 结构化结果 / V23.4 嵌套（可选）。优先级：V23.1 → V23.2 → V23.3 → V24 trajectory，V23.4 仅在 V24 完成且有需求时启动。
+- [ ] V23.1 真模型烟测缺失 — 9/9 fake-chain 不变量过了，但还需在真 DeepSeek 上验证："父让子并行分析 3 个文件" → 父 messages 里只多 1 条 tool_call + 1 条 JSON 数组的 tool_result（实测耗时 < 串行 3 倍）。
+- [ ] V23.1 父 LLM 看到批量返回的 JSON 数组字符串后是否会**自动 json.loads**？需要在真模型上观察 — 如果不会，下一档要在 system prompt 里加一句 hint（"the output field of a batch delegate result is a JSON array string; parse it before reasoning over individual tasks"）。
+- [ ] V23 后续档计划已写在 [docs/Multi-agent-system/iteration-plan.md](Multi-agent-system/iteration-plan.md)：V23.2 流式中继 + cancel 桥接 / V23.3 结构化结果 / V23.4 嵌套（可选）。优先级：V23.2 → V23.3 → V24 trajectory，V23.4 仅在 V24 完成且有需求时启动。
 
 ## 文档
 - [x] ~~CLAUDE.md 已超 250 行硬规则上限，下一档完成后应把决策日志按版本拆到 `docs/decisions/v<N>.md`，本文件只留索引。~~ — 已拆分（决策日志移到 [docs/decisions/](decisions/)，待办移到本文件）。
