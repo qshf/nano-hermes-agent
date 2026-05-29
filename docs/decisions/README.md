@@ -24,5 +24,6 @@
 | v22 | 流式输出 + 中断（stream_call / CancelToken / chain failover-before-first-event） | [v22.md](./v22.md) |
 | v23.0 | 多智能体最小可用版（delegate_task / 子 loop / 工具黑名单） | [v23.0.md](./v23.0.md) |
 | v23.1 | 批量并行 + 工具子集白名单（tasks 数组 + ThreadPoolExecutor + 白名单交集） | [v23.1.md](./v23.1.md) |
+| v23.2 | 项目上下文注入 + --cwd 启动（nano-hermes-agent.md / AGENTS.md / 跨项目可用） | [v23.2.md](./v23.2.md) |
 
 > 注：V8 的决策记录散落在对应的 commit message 与 [docs/Memory-system/](../Memory-system/) 子目录下，未来如有补录需求再回填本目录。V15 主决策（5 阶段压缩流水线）当时未单独建档，本目录从 v15.1 开始接力补完。

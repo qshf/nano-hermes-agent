@@ -1,5 +1,18 @@
 """
-Nano Hermes Agent — V22: 流式输出 + 中断
+Nano Hermes Agent — V23.2: 项目上下文注入 + --cwd 启动
+
+V23.2 主题"agent 跨项目可用"。V0–V23.1 强约束"必须在 nano 仓库根目录下启动"
+（skills/ 路径用 ``Path(__file__).parent``，但 system prompt 没有任何"用户项目"
+信息）。本档让 agent 真的能去帮用户写代码：
+
+- ``main.py --cwd /Users/foo/Documents/book`` 启动后 ``os.chdir`` 到该目录 →
+  terminal / read_file 等工具的相对路径全在用户项目下生效
+- ``PromptBuilder`` 注入 cwd → system prompt 自动注入用户项目根的
+  ``nano-hermes-agent.md`` 或 ``AGENTS.md``（首个命中即停，封顶 20000 字符）
+- skills/ 仍绑定在 nano 自己源码目录（``Path(__file__).parent / "skills"``），
+  跨 cwd 启动也能加载 — 这是源项目 hermes-agent 的同向设计：能力（skills）
+  跟 agent 走，规则（AGENTS.md）跟用户项目走
+- env ``NANO_IGNORE_RULES=1`` 跳过项目上下文注入（仿源项目 HERMES_IGNORE_RULES）
 
 V22 主题"transport 弧线收尾 + 多 agent 前置"。前 21 档全部同步 ``chain.call``
 （一次性 5–30s 等响应），V22 在 transport ABC 上补全流式那一半 + 中断：
@@ -26,6 +39,10 @@ V21 系列（向下保留）：
 - V21.3 Skill 系统（progressive disclosure）
 - V21.2 三段式 PromptBuilder
 - V21.1 slash 命令注册表 + AgentCtx
+
+env 开关（V23.2 新增）：
+    NANO_IGNORE_RULES           1/0（默认 0）；1 时跳过 nano-hermes-agent.md /
+                                AGENTS.md 注入，便于诊断 prompt 长度问题
 
 env 开关（V22 新增）：
     STREAM_ENABLED              1（默认）/ 0；0 时退化到 V21 同步路径
@@ -65,9 +82,13 @@ env 开关:
     docker compose down -v && docker compose up -d   # 重建 DB（schema 变了）
     python scripts/mock_memory_server.py
     export MEMORY_SERVICE_URL=http://127.0.0.1:8765
-    python main.py
+    # V23.2 起：在 nano 目录下也行，在用户项目目录下也行
+    python /path/to/nano/main.py --cwd /Users/foo/Documents/book
+    # 或者：
+    cd /Users/foo/Documents/book && python /path/to/nano/main.py
 """
 
+import argparse
 import json
 import os
 import signal
@@ -76,6 +97,43 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
+
+
+def _parse_cli_args() -> argparse.Namespace:
+    """V23.2: ``--cwd PATH`` 让 agent 能在任意目录下启动。
+
+    必须在所有"按 cwd 工作"的代码（PromptBuilder 项目上下文段、terminal /
+    read_file 工具的相对路径）之前 ``os.chdir``。所以解析+chdir 都在模块顶层
+    跑，早于 PromptBuilder 构造。
+
+    --cwd 不传 → 保留 ``os.getcwd()``（V0–V23.1 行为，向下兼容）。
+    --cwd 传了但目录不存在 → 立刻报错退出（fail-fast，避免后续诡异路径错）。
+    """
+    parser = argparse.ArgumentParser(
+        description="Nano Hermes Agent — 教学版多智能体 AI Agent",
+        add_help=True,
+    )
+    parser.add_argument(
+        "--cwd",
+        type=str,
+        default='/Users/qshf/Documents/book',
+        metavar="PATH",
+        help=(
+            "启动后切到此目录工作。terminal / read_file 等工具的相对路径以及 "
+            "system prompt 注入的 nano-hermes-agent.md / AGENTS.md 都从这里找。"
+            "不传则用当前 shell cwd。"
+        ),
+    )
+    return parser.parse_args()
+
+
+_cli_args = _parse_cli_args()
+if _cli_args.cwd is not None:
+    _target = Path(_cli_args.cwd).expanduser().resolve()
+    if not _target.is_dir():
+        print(f"  [error] --cwd {_cli_args.cwd!r} 不存在或不是目录")
+        sys.exit(2)
+    os.chdir(_target)
 
 from model_tools import get_tool_definitions, get_available_tool_names
 from tools.registry import registry
@@ -182,13 +240,16 @@ _inject_skill_loader(skill_loader)
 
 
 # V21.2: 三段式 PromptBuilder 替换 V4 的 SYSTEM_PROMPT.format(...)
-# 段顺序固定（骨架 → skill 索引 → memory → 工具列表），空段自动跳过；
+# 段顺序固定（骨架 → 项目上下文 → skill 索引 → memory → 工具列表），空段自动跳过；
 # V21.3 起 SkillLoader 实际注入，tier 1 索引段开始填充内容。
+# V23.2 起 cwd 注入 → system prompt 自动加用户项目根的 nano-hermes-agent.md /
+# AGENTS.md。``Path.cwd()`` 在 ``--cwd`` 已 chdir 之后捕获，所以等价用户传入值。
 prompt_builder = PromptBuilder(
     get_toolset_tool_names=get_available_tool_names,
     enabled_toolsets=ENABLED_TOOLSETS,
     memory_manager=memory_manager,
     skill_loader=skill_loader,
+    cwd=Path.cwd(),
 )
 
 
@@ -388,7 +449,7 @@ def run_agent():
     stream_enabled = os.environ.get("STREAM_ENABLED", "1") not in ("0", "false", "False", "")
 
     print("=" * 60)
-    print("  Nano Hermes Agent v22 — 流式输出 + 中断")
+    print("  Nano Hermes Agent v23.2 — 项目上下文注入 + --cwd 启动")
     print(f"  Default MODEL (entries 不内联时回退到此): {model}")
     chain_modes = " → ".join(
         f"{e.api_mode}({e.model})" if e.model else e.api_mode
@@ -422,6 +483,18 @@ def run_agent():
         print(f"  Skills: {len(skill_names)} loaded ({', '.join(skill_names)})")
     else:
         print(f"  Skills: 0 loaded (skills/ empty or absent)")
+    # V23.2: 显示 cwd + 命中的项目上下文文件（NANO_IGNORE_RULES=1 时跳过）
+    _cwd_now = Path.cwd()
+    _ignore_rules = os.environ.get("NANO_IGNORE_RULES", "0") not in ("0", "false", "False", "")
+    if _ignore_rules:
+        print(f"  Working dir: {_cwd_now} (project context: skipped via NANO_IGNORE_RULES)")
+    else:
+        from agent.prompt_builder import PROJECT_CONTEXT_FILE_NAMES as _PC_NAMES
+        _hit = next((n for n in _PC_NAMES if (_cwd_now / n).is_file()), None)
+        if _hit:
+            print(f"  Working dir: {_cwd_now} (project context: {_hit})")
+        else:
+            print(f"  Working dir: {_cwd_now} (project context: none — tried {', '.join(_PC_NAMES)})")
     print("  Commands: /help to list all (V21.1: dispatched via cli registry)")
     print("  输入 'quit' 退出")
     print("=" * 60)
