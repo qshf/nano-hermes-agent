@@ -197,7 +197,7 @@ def test_01_parent_cancel_propagates_to_children():
     assert elapsed < 2.0, f"cancel 没有及时传播（{elapsed:.2f}s, 应 < 2s）"
 
     parsed = json.loads(raw)
-    output_arr = json.loads(parsed["output"])
+    output_arr = json.loads(parsed["output"])["results"]
     assert len(output_arr) == 3, f"期望 3 条结果，得到 {len(output_arr)}"
     # 全部应该是 interrupted（cancel 在第一个 check 之后，sleep 之前一定命中）
     interrupted = [r for r in output_arr if r["exit_reason"] == "interrupted"]
@@ -274,7 +274,7 @@ def test_02_cancel_does_not_lose_completed_siblings():
     })
 
     parsed = json.loads(raw)
-    output_arr = json.loads(parsed["output"])
+    output_arr = json.loads(parsed["output"])["results"]
     by_idx = {r["task_index"]: r for r in output_arr}
 
     # task#0 应该完成；它的 summary 不能丢
@@ -349,7 +349,8 @@ def test_04_stream_off_no_callback():
 
     err = err_buf.getvalue()
     parsed = json.loads(raw)
-    assert parsed["output"] == "sync answer", f"单任务 output 异常: {parsed}"
+    inner = json.loads(parsed["output"])
+    assert inner["results"][0]["summary"] == "sync answer", f"单任务 output 异常: {parsed}"
     assert err == "", f"stream_enabled=False 时 stderr 应为空: {err!r}"
 
     # chain.calls 第一条必须是 via=call（不是 stream_call）
@@ -381,7 +382,8 @@ def test_04b_runtime_stream_toggle_reaches_delegate():
         raw = delegate_task_handler({"goal": "say hi"})
 
     parsed = json.loads(raw)
-    assert parsed["output"] == "dynamic sync answer", f"单任务 output 异常: {parsed}"
+    inner = json.loads(parsed["output"])
+    assert inner["results"][0]["summary"] == "dynamic sync answer", f"单任务 output 异常: {parsed}"
     assert err_buf.getvalue() == "", "runtime stream off should suppress progress stderr"
     assert chain.calls[0]["via"] == "call", f"应跟随 runtime 走同步 call: {chain.calls[0]}"
 
@@ -407,8 +409,9 @@ def test_05_v21_4_protocol_unchanged():
 
     parsed = json.loads(raw)  # 1. 本身是合法 JSON
     assert "output" in parsed, f"V21.4 协议要求 output: {parsed}"
-    # 2. 单任务 output 是 plain string（V23.0 兼容）
-    assert parsed["output"] == "hello", f"output 协议改了: {parsed}"
+    # 2. V23.4: output 字段值是 JSON 字符串（含 results 数组）
+    inner = json.loads(parsed["output"])
+    assert inner["results"][0]["summary"] == "hello", f"output 协议改了: {parsed}"
     # 3. progress 行没有混进 output
     assert "[task#" not in parsed["output"]
     assert "[delegate]" not in parsed["output"]

@@ -320,7 +320,16 @@ def test_09_child_rejects_unauthorized_tool_call():
 
 
 def test_10_handler_returns_v21_4_compliant_json():
-    """delegate handler 返回值 — 合法 JSON object，含 'output' 字段。"""
+    """delegate handler 返回值 — 合法 JSON object，含 'output' 字段。
+
+    V23.4 协议升级：output 不再是 plain summary string，而是 ``json.dumps({
+    "results": [<task_result>, ...], "total_duration_seconds": float})`` 的
+    JSON 字符串；单任务也是含 1 条的 results 数组。父 LLM 永远 ``json.loads``
+    二次解析（与源项目 ``tools/delegate_tool.py:2283`` 同向）。
+
+    本断言 V23.0 起被 V23.4 推翻；保留测试编号 #10 + 升级断言到新 schema，
+    决策日志 ``docs/decisions/v23.4.md`` 注明协议演进原因。
+    """
     set_delegate_context(DelegateContext(
         chain=_FakeChain([_stop_response("hello from child")]),
         model="fake",
@@ -330,7 +339,22 @@ def test_10_handler_returns_v21_4_compliant_json():
     parsed = json.loads(raw)  # must be valid JSON
     assert isinstance(parsed, dict), f"expected dict, got {type(parsed)}"
     assert "output" in parsed, f"missing 'output' field: {parsed}"
-    assert parsed["output"] == "hello from child"
+
+    # V23.4: output 字段值是 JSON 字符串 — 二次解析得到 results 数组
+    inner = json.loads(parsed["output"])
+    assert isinstance(inner, dict) and "results" in inner, \
+        f"V23.4 schema: output should be a JSON object with 'results': {inner!r}"
+    results = inner["results"]
+    assert isinstance(results, list) and len(results) == 1, \
+        f"single task should still produce a 1-element results array: {results!r}"
+    only = results[0]
+    assert only["task_index"] == 0
+    assert only["status"] == "completed"
+    assert only["summary"] == "hello from child"
+    # 完整 schema：tokens / tool_trace / iterations / duration_seconds 必填
+    for f in ("tokens", "tool_trace", "iterations", "duration_seconds", "exit_reason"):
+        assert f in only, f"missing v23.4 schema field {f!r}: {only!r}"
+
     # registry.dispatch 兜底不应触发（结果已合法）— 通过 dispatch 走一遍验证
     set_delegate_context(DelegateContext(
         chain=_FakeChain([_stop_response("via dispatch")]),
@@ -340,7 +364,8 @@ def test_10_handler_returns_v21_4_compliant_json():
     registry._check_fn_cache.pop("delegate_task", None)
     dispatched = registry.dispatch("delegate_task", {"goal": "via dispatch path"})
     parsed2 = json.loads(dispatched)
-    assert parsed2.get("output") == "via dispatch", f"got {parsed2}"
+    inner2 = json.loads(parsed2["output"])
+    assert inner2["results"][0]["summary"] == "via dispatch", f"got {inner2}"
 
 
 # ─── 主入口 ─────────────────────────────────────────────────────────────────

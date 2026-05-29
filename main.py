@@ -156,7 +156,7 @@ from transports.streaming import (
 )
 from transports.types import build_assistant_history_msg
 from agent import PromptBuilder, SkillLoader
-from agent.runtime import AgentRuntime
+from agent.runtime import AgentRuntime, SESSION_TOKEN_KEYS
 import cli  # 触发 cli/commands 下所有命令的装饰器注册
 
 # V22 输入体验：用 prompt_toolkit 的 PromptSession 取代内建 ``input()``。
@@ -393,6 +393,30 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token):
     return final_resp
 
 
+def _accumulate_parent_turn_tokens(runtime: AgentRuntime, usage) -> None:
+    """V23.4: 把父 turn LLM usage 累加到 ``runtime.session_tokens``。
+
+    与 ``tools/delegate_tool.py:_accumulate_runtime_tokens`` 镜像 —— 同一份
+    runtime 字典，由父 turn 路径 + 子 worker 路径并发累加；后者已用模块级
+    lock 保护，父 turn 单线程不需要再 lock（main loop 唯一线程）。
+
+    ``usage`` 为 None / 缺字段 时静默跳过 —— 测试 fixture 偶尔构造 partial
+    NormalizedResponse 时不至于崩。
+    """
+    if usage is None:
+        return
+    field_map = {
+        "input": "prompt_tokens",
+        "output": "completion_tokens",
+        "cache_read": "cached_tokens",
+        "cache_write": "cache_creation_tokens",
+    }
+    for key in SESSION_TOKEN_KEYS:
+        v = getattr(usage, field_map[key], 0) or 0
+        if isinstance(v, (int, float)):
+            runtime.session_tokens[key] += int(v)
+
+
 def run_agent():
 
 
@@ -467,7 +491,7 @@ def run_agent():
     compressor = ContextCompressor()
 
     print("=" * 60)
-    print("  Nano Hermes Agent v23.3 — 多智能体流式中继 + 父子 cancel 桥接")
+    print("  Nano Hermes Agent v23.4 — 多智能体结构化结果 + 父子成本聚合")
     print(f"  Default MODEL (entries 不内联时回退到此): {model}")
     chain_modes = " → ".join(
         f"{e.api_mode}({e.model})" if e.model else e.api_mode
@@ -676,6 +700,12 @@ def run_agent():
                         total_tokens — 两者之和
                         '''
                         compressor.update_usage(normalized.usage.prompt_tokens)
+
+                    # V23.4: 把父 turn 的 usage 也累加到 runtime.session_tokens —— 让
+                    # ``/transport`` 看到的 session 累计是"父 + 所有子"的合计。
+                    # compressor 消费 prompt_tokens 用作压缩阈值，runtime 消费完整
+                    # usage 做累计统计，两者语义独立不冲突。
+                    _accumulate_parent_turn_tokens(runtime, normalized.usage)
 
                     # 把标准化响应回填进对话历史（保持 OpenAI 消息 shape，下一轮 build_kwargs 还能消费）
                     # V15.1: 抢救 content=None + 无 tool_calls 的脏 assistant 消息（reasoning 提升为 content）

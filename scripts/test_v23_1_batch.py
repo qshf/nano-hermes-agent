@@ -133,7 +133,7 @@ def test_01_batch_parallel_speedup():
     elapsed = time.monotonic() - t0
 
     parsed = json.loads(raw)
-    output_arr = json.loads(parsed["output"])
+    output_arr = json.loads(parsed["output"])["results"]
     assert len(output_arr) == 3, f"expected 3 results, got {len(output_arr)}"
     # 并行预算：3 个并发 sleep(1s) ≈ 1.0–1.5s（含线程池启动开销）
     # 串行 V23.0 等价路径要 ~3.0s — 我们要求 < 1.8s（留 0.8s 余量）
@@ -165,7 +165,7 @@ def test_02_result_order_matches_input():
         ],
     })
     parsed = json.loads(raw)
-    output_arr = json.loads(parsed["output"])
+    output_arr = json.loads(parsed["output"])["results"]
     indices = [r["task_index"] for r in output_arr]
     assert indices == [0, 1, 2], f"task_index order wrong: {indices}"
     # 每条 summary 形如 "summary_X"，但 X 是被 pop 的顺序，可能与索引无关 —
@@ -288,7 +288,12 @@ def test_06_goal_tasks_mutually_exclusive():
 
 
 def test_07_v23_0_single_task_unchanged():
-    """不传 tasks 时输出仍是 ``{"output": <summary str>}`` —— 协议未升级。"""
+    """V23.4 协议升级：单任务 output 也是 JSON 字符串（含 1 条 results 数组）。
+
+    本测试在 V23.4 之前断言"output == 'hello from child'"（plain string）；
+    V23.4 把单任务也升级为 JSON 数组（与源项目同向 + 父 LLM 看到统一 schema）。
+    决策日志：``docs/decisions/v23.4.md``。
+    """
     chain = _FakeChain([_stop_response("hello from child")])
     set_delegate_context(DelegateContext(
         chain=chain,
@@ -299,16 +304,10 @@ def test_07_v23_0_single_task_unchanged():
     parsed = json.loads(raw)
     assert isinstance(parsed, dict)
     assert "output" in parsed
-    # 关键：单任务的 output 是 plain str，不是 JSON 数组的 str
-    assert parsed["output"] == "hello from child"
-    # 不应该可以再 json.loads（V23.0 语义保持）
-    try:
-        json.loads(parsed["output"])
-    except json.JSONDecodeError:
-        pass  # 期望走这里
-    else:
-        # plain "hello from child" 当然不是合法 JSON — 这条不会触发
-        pass
+    # V23.4: output 字段值是 JSON 字符串 — 二次解析得到 results 数组
+    inner = json.loads(parsed["output"])
+    assert "results" in inner and len(inner["results"]) == 1
+    assert inner["results"][0]["summary"] == "hello from child"
 
 
 def test_07b_single_task_with_tools_field():
@@ -324,7 +323,8 @@ def test_07b_single_task_with_tools_field():
         "tools": ["read_file"],  # 子只能拿到 read_file
     })
     parsed = json.loads(raw)
-    assert parsed.get("output") == "done with limited tools"
+    inner = json.loads(parsed["output"])
+    assert inner["results"][0]["summary"] == "done with limited tools"
     # 检查 chain 收到的 tools schema 只含 read_file
     sent_tools = chain.calls[0]["tools"]
     sent_names = [t["function"]["name"] for t in sent_tools]

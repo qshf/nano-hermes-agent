@@ -1,11 +1,13 @@
 # 多智能体系统（V23）— 迭代拆分计划
 
 > 目标：让 nano agent 从 "单线程串行响应" 演进到 "父 agent 通过工具调用 spawn 多个隔离的子 agent，并行完成子任务再聚合回传"。
-> 规划范围：**V23.0–V23.3 已承诺**，V23.4 标注为可选追加。
+> 规划范围：**V23.0–V23.4 已承诺**，V23.5 标注为可选追加。
 >
 > 上一级：[docs/system-roadmap.md](../system-roadmap.md) 的"V23 多智能体（delegate_task）"小节给出了主线定位（"agent 数量从 1 到 N" 弧线的起点）和"为什么排在 V22 流式之后"的依据。本文档是该小节的展开。
 >
-> 前置版本：V22（流式 + `CancelToken` + `StreamCancelled`）— `CancelToken` 用 `threading.Event` 就是为多 agent 跨线程共享父 token 准备的；本文档 V23.2 将兑现这一前置假设。
+> 前置版本：V22（流式 + `CancelToken` + `StreamCancelled`）— `CancelToken` 用 `threading.Event` 就是为多 agent 跨线程共享父 token 准备的；本文档 V23.3 将兑现这一前置假设。
+>
+> **版本编号说明**：原计划 V23.2 = 流式中继 + 中断传播。实施时插入了"项目上下文注入 + --cwd 启动"档（让 agent 跨项目可用，是多智能体跨项目协作的前提），先到先得占用 V23.2 编号；流式中继顺延到 V23.3。后续版本统一按下表"实际落地编号"为准。
 >
 > 源项目对照：[hermes-agent/tools/delegate_tool.py](https://github.com/qshf/hermes-agent/blob/main/tools/delegate_tool.py)（2767 行）+ [hermes-agent/tools/mixture_of_agents_tool.py](https://github.com/qshf/hermes-agent/blob/main/tools/mixture_of_agents_tool.py)（541 行，独立工具，已在 roadmap 排到 V25）。本文档行号引用以源项目 git 当前 main HEAD 为准。
 
@@ -42,14 +44,15 @@
 |------|------|---------------|---------------|-----------|
 | **V23.0** | 单任务 delegate（最小可用版） | V22 之前 agent 单线程串行；缺少父子隔离的最小教学示例 | `delegate_task` 工具 / 子 `AIAgent` 同步运行 / 工具黑名单 / 隔离 messages | `tools/delegate_tool.py:2626-2743`（schema）+ `865-1158`（构建子）+ `1305-1593`（运行）的最简骨架 |
 | **V23.1** | 批量并行 + 工具子集白名单 | V23.0 一次只能 spawn 一个子；多任务相互独立时仍串行；工具集"全继承"过宽 | `tasks: []` 批量 schema / `ThreadPoolExecutor` + `max_concurrent_children` / 单批分支 / `toolsets` 字段（与父白名单交集） | `tools/delegate_tool.py:2071-2193`（批量分发）+ `940-963`（工具交集） |
-| **V23.2** | 流式中继 + 中断传播 | V23.1 子跑飞父无法 kill；父等待时 UI 哑；父按 Ctrl+C 只能整体退出 | 父 `CancelToken` → 子 `CancelToken` 桥接 / 子 stream event 经 callback 中继到父显示 / 子 `StreamCancelled` 翻译为 `status="interrupted"` | `tools/delegate_tool.py:678-862`（progress callback）+ `2104-2139, 1500-1507`（中断传播） |
-| **V23.3** | 结构化结果 + 成本聚合 | V23.2 父只看到子的 final summary 字符串，黑盒；token / 工具调用次数 / 失败原因都丢了 | 结构化 JSON 返回（`tokens` / `tool_trace` / `duration_seconds` / `exit_reason` / `files_*`）/ 父 `session_estimated_cost_usd` 累加 / `status` 五态枚举 | `tools/delegate_tool.py:1668-1800`（结果 dict）+ `2231-2279`（成本聚合） |
-| V23.4（可选） | 嵌套 delegate + 深度限制 | V23.3 仍是扁平 1 层；需要分两阶段分解的复杂任务（如"先调研再实施"）做不了 | `role: "leaf" \| "orchestrator"` / `max_spawn_depth` / 深度溢出强制降级到 leaf | `tools/delegate_tool.py:899-908`（角色解析）+ `905-908, 389-424`（深度检查） |
+| **V23.2** | 项目上下文注入 + `--cwd` 启动 | nano 必须在仓库根目录启动；system prompt 不知道用户当前项目；多智能体没法在用户项目里跑 | `--cwd PATH` CLI 参数 / 顶层 `os.chdir` 早于 PromptBuilder / `nano-hermes-agent.md` → `AGENTS.md` 优先级 / `NANO_IGNORE_RULES` 关闭注入 | `hermes-agent/hermes_cli/main.py:9822`（`--cwd`）+ `agent/prompt_builder.py:1356`（`AGENTS.md` fallback） |
+| **V23.3** | 流式中继 + 中断传播 | V23.1 子跑飞父无法 kill；父等待时 UI 哑；父按 Ctrl+C 只能整体退出 | 父 `CancelToken` → 子 `CancelToken` 桥接 / 子 stream event 经 callback 中继到父显示 / 子 `StreamCancelled` 翻译为 `status="interrupted"` | `tools/delegate_tool.py:678-862`（progress callback）+ `2104-2139, 1500-1507`（中断传播） |
+| **V23.4** | 结构化结果 + 成本聚合 | V23.3 父只看到子的 final summary 字符串，黑盒；token / 工具调用次数 / 失败原因都丢了 | 结构化 JSON 返回（`tokens` / `tool_trace` / `duration_seconds` / `exit_reason` / `files_*`）/ 父 `session_estimated_cost_usd` 累加 / `status` 五态枚举 | `tools/delegate_tool.py:1668-1800`（结果 dict）+ `2231-2279`（成本聚合） |
+| V23.5（可选） | 嵌套 delegate + 深度限制 | V23.4 仍是扁平 1 层；需要分两阶段分解的复杂任务（如"先调研再实施"）做不了 | `role: "leaf" \| "orchestrator"` / `max_spawn_depth` / 深度溢出强制降级到 leaf | `tools/delegate_tool.py:899-908`（角色解析）+ `905-908, 389-424`（深度检查） |
 
-**承诺范围**：V23.0–V23.3，对应 nano "agent 数量从 1 到 N + 隔离 + 并发 + 可观测" 的完整闭环。V23.4 仅在 V24 trajectory 启动前若有空档时追加；优先级低于 V24，因为：
+**承诺范围**：V23.0–V23.4，对应 nano "agent 数量从 1 到 N + 跨项目可用 + 隔离 + 并发 + 可观测" 的完整闭环。V23.5 仅在 V24 trajectory 启动前若有空档时追加；优先级低于 V24，因为：
 
 - V24 trajectory 是数据飞轮起点，落地越早后续每档实验都自动有训练样本
-- V23.4 只引入"递归 + 深度计数"两个概念，相对增量小
+- V23.5 只引入"递归 + 深度计数"两个概念，相对增量小
 - 真正的多层规划场景在 nano 教学版里凑不出（源项目里 orchestrator 多用于代码库改造这类大任务，nano 暂无对应场景）
 
 **非目标**（明确放进 V25+ 或主动放弃）：
@@ -59,13 +62,13 @@
 - **ACP 传输覆盖**：源项目用 ACP 协议跨进程跑子 agent；nano 同进程线程池，不引入
 - **凭证覆盖**（`delegation.provider/api_key`）：nano 只有 DeepSeek + Qwen 两家，全局 env 已够
 - **暂停 / 恢复**：源项目支持把跑到一半的子 agent 序列化暂停；nano 不引入
-- **活跃 subagent 全局注册表 + TUI 观察层**：V23.4 简化版若做，仅维持一个进程内 dict（用于 `/agents` 命令）；不持久化
+- **活跃 subagent 全局注册表 + TUI 观察层**：V23.5 简化版若做，仅维持一个进程内 dict（用于 `/agents` 命令）；不持久化
 
 ---
 
 ## 2. 各版本详细设计
 
-详见后续小节（V23.0–V23.4 各自独立小节）。每档结构固定为：
+详见后续小节（V23.0–V23.5 各自独立小节）。每档结构固定为：
 
 1. **上一版本痛点**（具体到代码 / 体验细节）
 2. **本档解决方法 + 核心抽象**
@@ -128,9 +131,9 @@ V22 把 `chain.stream_call` 闭环了，但 agent 仍是**单线程顺序响应*
 
 - 不做 `tasks: []` 数组（V23.1）
 - 不做 `toolsets` schema 字段（V23.1）
-- 不做 `role` 字段（V23.4 候选，默认 leaf 即可）
-- 不做超时（这档让用户用 max_iterations 兜底；V23.2 引入 cancel）
-- 不做心跳 / 诊断转储 / 文件读写跟踪 / token 统计 / 工具轨迹（V23.3）
+- 不做 `role` 字段（V23.5 候选，默认 leaf 即可）
+- 不做超时（这档让用户用 max_iterations 兜底；V23.3 引入 cancel）
+- 不做心跳 / 诊断转储 / 文件读写跟踪 / token 统计 / 工具轨迹（V23.4）
 - 不做凭证覆盖（永远用父 chain）
 
 ### 预估规模
@@ -145,7 +148,7 @@ V22 把 `chain.stream_call` 闭环了，但 agent 仍是**单线程顺序响应*
 4. **聚焦 system prompt**：子的 `messages[0]["content"]` 必须包含 `goal` 字面量；不得包含父三段式 prompt 的 "skill 索引" 段标识
 5. **transport 复用**：用 fake transport 计数器验证父子共用同一个 `TransportChain` 实例（cache 统计累计、断路器状态共享）
 6. **stream off 路径**：`STREAM_ENABLED=0` 时，父调 `delegate_task` 走 V21 同步 `chain.call`，全链路无 `stream_call` 出现
-7. **stream on 兜底**：`STREAM_ENABLED=1` 时，父用 `chain.stream_call`，子内部仍走 `chain.call`（V23.0 子不流式），父 UI 表现为"等子 agent 时一片空白"——记录此现象，作为 V23.2 的痛点起点
+7. **stream on 兜底**：`STREAM_ENABLED=1` 时，父用 `chain.stream_call`，子内部仍走 `chain.call`（V23.0 子不流式），父 UI 表现为"等子 agent 时一片空白"——记录此现象，作为 V23.3 的痛点起点
 
 ---
 
@@ -174,7 +177,7 @@ V23.0 完成了"父子隔离 + 单任务" 的最小骨架，但暴露两条具�
 - 单：返回 `tool_result(output=child_summary_text)`
 - 批：返回 `tool_result(output=json.dumps([{"task_index": i, "summary": text_i}, ...]))`
 
-V23.3 才把 `summary` 升级到结构化字段；V23.1 仅做"能并行 + 父能区分单 vs 批"。
+V23.4 才把 `summary` 升级到结构化字段；V23.1 仅做"能并行 + 父能区分单 vs 批"。
 
 **B. 工具子集 schema 字段 `tools`**
 
@@ -192,7 +195,7 @@ V23.3 才把 `summary` 升级到结构化字段；V23.1 仅做"能并行 + 父�
 - **批量 schema 的单 vs 批分支**：源项目同一函数内 if/else 分发，nano 跟进同款写法（教学上明确"两条路径，单是批的退化"）
 - **`ThreadPoolExecutor` 在 agent loop 中的角色**：第一次出现"主线程构建 + worker 线程跑 LLM 调用"的形态。强调"线程安全责任分层"——构建期主线程独占，运行期 worker 不修改父 agent 状态
 - **白名单交集语义**：用户传的 `tools` 是 "**最大允许集合**"，最终生效集 = `min(tools, parent_full) - blacklist`。这与 V3 toolsets 的"挂载式白名单"不同（V3 是 "至少包含"，V23.1 是 "至多包含"）
-- **`FilteredToolRegistry` 包装**：避免改动父 registry；为 V23.4 嵌套（不同层子 agent 的允许集不同）打底
+- **`FilteredToolRegistry` 包装**：避免改动父 registry；为 V23.5 嵌套（不同层子 agent 的允许集不同）打底
 
 ### 对应源项目
 
@@ -201,7 +204,10 @@ V23.3 才把 `summary` 升级到结构化字段；V23.1 仅做"能并行 + 父�
 - 工具白名单交集：`tools/delegate_tool.py:940-963` 的 `_resolve_child_toolsets`
 - 黑名单常量：`tools/delegate_tool.py:40-48` 的 `DELEGATE_BLOCKED_TOOLS`
 
-### 暴露的新问题（引向 V23.2）
+### 暴露的新问题（引向 V23.3）
+
+> 注：V23.2 实施时插入了"项目上下文注入 + --cwd 启动"档解决跨项目部署问题，
+> 不解决 V23.1 暴露的并发体验问题；下面这些痛点继续推到 V23.3 闭环。
 
 - 父跑批 3 个子，其中一个子 agent 进死循环（误用工具反复 retry）—— 父按 Ctrl+C，V22 翻译成 `cancel_token.cancel()`，但 V23.1 父子共用一个 token？还是子各自独立？没设计；当前是**父侧 cancel 不会传给子**，子继续跑到 `max_iterations`
 - 父等批任务的 1–3 分钟里 UI 完全静默，看不到"哪个子已完成、哪个还在跑"
@@ -211,8 +217,8 @@ V23.3 才把 `summary` 升级到结构化字段；V23.1 仅做"能并行 + 父�
 
 - 不做心跳（防网关超时；nano 无 gateway）
 - 不做 `max_concurrent_children` 暴露给 schema（仅 env 调）
-- 不做 0-API-call 超时诊断转储（V23.3 部分覆盖）
-- 不做返回结果按 `task_index` 排序（V23.1 用 `executor.map` 自然有序；V23.2 加进度时再换 `as_completed` 并排序）
+- 不做 0-API-call 超时诊断转储（V23.4 部分覆盖）
+- 不做返回结果按 `task_index` 排序（V23.1 用 `executor.map` 自然有序；V23.3 加进度时再换 `as_completed` 并排序）
 
 ### 预估规模
 
@@ -229,13 +235,126 @@ V23.0 基础上 + ~80 行（批量分发 + ThreadPoolExecutor）+ ~50 行（Filt
 
 ---
 
-## V23.2 — 流式中继 + 中断传播
+## V23.2 — 项目上下文注入 + `--cwd` 启动
 
-> **nano 落地编号**：本规划档的 V23.2，在 nano 主轴里实际落地为 **v23.3**
-> （commit / banner / 测试脚本名 / 决策日志均用 `v23.3`）。原因：编号 v23.2
-> 在并行迭代时被 [项目上下文注入 + --cwd](../decisions/v23.2.md) 先到先得占用。
-> iteration-plan 内部行号保留不变以避免大面积回改；落地详情见
-> [docs/decisions/v23.3.md](../decisions/v23.3.md)。
+> **落地状态**：已完成（commit 80c3de7）。详情见
+> [docs/decisions/v23.2.md](../decisions/v23.2.md)。
+
+### 上一版本痛点（V23.1 暴露）
+
+V23.0–V23.1 把"父子隔离 + 批量并行"骨架闭环了，但留了一条**部署侧硬约束**：
+
+- nano agent 必须在自己的仓库根目录启动（`cd nano_hermes_agent && python main.py`），
+  否则 `read_file` / `terminal` 等工具的相对路径会落在 nano 源码上而不是用户项目里
+- system prompt 完全不包含"用户当前项目"的任何信息——agent 不知道 cwd 是哪个项目、
+  有什么约定、用什么工具链。`book/`、`docs/`、`my-app/` 在 agent 眼里都是同一个空白
+- 多智能体（V23.0/V23.1 已就绪）想真正服务用户场景，必须**先解决"agent 跑在哪"**：
+  父在用户项目根、子也得跟着在同一个 cwd，否则父子读到的相对路径互相错位
+
+这一档不在原 iteration-plan 排期里，是 V23.1 之后、V23.3（流式中继）之前临时插入的，
+原因是只做完 V23.0/V23.1 的多智能体在用户项目里仍然不可用——优先级被现实需求顶上来。
+
+### 解决方法 + 核心抽象
+
+**A. `--cwd PATH` CLI 参数**
+
+`main.py` 顶层 `_parse_cli_args()`：
+
+- `--cwd PATH` 可选，默认沿用 shell cwd
+- argparse 解析后立刻 `Path(PATH).resolve()` + `is_dir()` 校验，失败 `sys.exit(2)` fail-fast
+- 校验通过 → `os.chdir(resolved)`，**早于** `PromptBuilder` 构造（关键顺序）
+
+为什么早于 PromptBuilder：模块顶层就构造了 `prompt_builder = PromptBuilder(...)`（V23.0
+为父子共享留下的形态），如果 chdir 放进 `run_agent()`，PromptBuilder 在 chdir 之前
+就把 `cwd=Path.cwd()` 抓死了，`--cwd` 完全失效。
+
+**B. 项目上下文段（PromptBuilder 新增段）**
+
+`PromptBuilder` 增加 `cwd: Path` 字段 + `_render_project_context()` 段：
+
+- 段位置 = `骨架 → 项目上下文 → skill → memory → tools`
+- 文件优先级：`{cwd}/nano-hermes-agent.md` 命中即停 → 否则 `{cwd}/AGENTS.md` → 否则段为空
+- 段格式：`## 项目上下文（{filename}）\n\n{content}`（无 frontmatter 剥离、无注入扫描）
+- `NANO_IGNORE_RULES=1` 时整段跳过（用于跑测试 / 调试时不想被项目约定干扰）
+
+为什么放骨架之后、skill 之前：项目上下文是 agent 身份的延伸（"在这个项目里你的具体
+角色"），靠近骨架更符合人读 prompt 的认知顺序；放最后会触发 LLM "中间遗忘"。
+
+**C. 文件名优先级 `nano-hermes-agent.md` → `AGENTS.md`**
+
+- 首选 `nano-hermes-agent.md`：nano 专属命名，不和 Claude Code 的 `CLAUDE.md` 冲突
+  （同一项目下两套 agent 各读各的，互不污染）
+- fallback `AGENTS.md`：跨 agent 工具事实标准（Codex / Aider / 源项目 hermes-agent
+  都读这个），同一份 `AGENTS.md` 给所有 agent 用是更经济的常态
+- **不**读 `CLAUDE.md`：避免和 Claude Code 互相污染
+- **不**走到 git root：源项目从 cwd 一路 walk 到 git 根目录（~50 行），nano 教学版
+  只看 cwd 那一层（~15 行），子目录上下文需求建议用 `--cwd <subdir>` 显式指定
+
+### 新引入的概念
+
+- **CLI 参数早于模块顶层构造**：第一次出现"argparse 必须在 import-driven 副作用之前"
+  的设计约束。教学要点：模块顶层不是免费的——任何"抓 cwd / 抓 env"的构造都得排在
+  argparse 之后
+- **项目上下文 vs skill 上下文**：项目上下文是"用户项目的约定"（一次性注入），skill
+  上下文是"agent 自带能力"（按需 progressive disclosure）。两者在 prompt 里相邻但
+  来源完全不同：项目上下文从 cwd 读，skill 从 nano 源码目录 `Path(__file__).parent`
+  读——后者跨 cwd 不变，是 agent 的"内置能力"
+- **专属命名 vs 通用命名的双档优先级**：教学示例如何在生态兼容（`AGENTS.md`）和
+  避免冲突（`nano-hermes-agent.md`）之间取平衡
+- **fail-fast vs 容错**：`--cwd <bad>` 直接 exit 2，不进 agent loop。比"chdir 失败
+  但 agent 继续跑、随后 read_file 找不到文件"更早暴露错误
+
+### 对应源项目
+
+- `--cwd` CLI 入口：[hermes-agent/hermes_cli/main.py:9822](https://github.com/qshf/hermes-agent/blob/main/hermes_cli/main.py#L9822)
+- `AGENTS.md` fallback：[hermes-agent/agent/prompt_builder.py:1356](https://github.com/qshf/hermes-agent/blob/main/agent/prompt_builder.py#L1356)
+- 走 git root 上溯：[hermes-agent/agent/prompt_builder.py:99](https://github.com/qshf/hermes-agent/blob/main/agent/prompt_builder.py#L99)（nano 简化掉）
+
+### 暴露的新问题（引向 V23.3）
+
+V23.2 让 agent 能在用户项目里跑了，但**多智能体并发体验**问题继承自 V23.1 没解决：
+
+- 跨项目场景下 STREAM_ENABLED=1 时父外层流式、子内层同步，父调 delegate 后 UI 冻结
+- 子 agent 死循环没法 kill；父 Ctrl+C 不传给子
+- 批量 3 个子并跑，UI 完全静默看不到哪个跑到哪一步
+
+这些问题是 V23.1 早就暴露的，V23.2 没解决也没让它们更糟——继续推到 V23.3。
+
+### 简化掉的（vs 源项目）
+
+- 不做子目录渐进发现（源项目 `subdirectory_hints.py`：进 `src/` 时追注 `src/AGENTS.md`）
+- 不做 prompt-injection 扫描（源项目 `_scan_context_content`：扫描"忽略前面所有指令"
+  之类的注入串）；用户自己写的项目说明默认可信
+- 不剥 YAML frontmatter（源项目 `_strip_yaml_frontmatter` 给"未来 PR 当结构化配置"
+  预留），教学版还没用上
+- 不读 `CLAUDE.md`（避免和 Claude Code 互相污染）
+- 不走 git root 上溯（只读 cwd 那一层）
+
+### 预估规模
+
+V23.1 基础上 + ~30 行（`--cwd` 解析 + chdir + banner）+ ~25 行（PromptBuilder cwd
+段）+ ~50 行（11 项不变量测试 `scripts/test_v23_2_project_context.py`）。累计
+V23.0+V23.1+V23.2 ≈ 360 行。
+
+### 验证项（`scripts/test_v23_2_project_context.py`，11 项不变量）
+
+1. **`--cwd` 路径校验**：`--cwd /nonexistent` 立即 `sys.exit(2)`，不进 agent loop
+2. **chdir 早于 PromptBuilder**：构造后 `prompt_builder.cwd == resolved_cwd`，**不**等于
+   shell 启动时的 cwd
+3. **`nano-hermes-agent.md` 命中**：cwd 下放 `nano-hermes-agent.md` → system prompt
+   含项目上下文段且 filename 显示为 `nano-hermes-agent.md`
+4. **`AGENTS.md` fallback**：cwd 下只放 `AGENTS.md` → 段命中 `AGENTS.md`
+5. **优先级正确**：两个文件都存在 → 优先 `nano-hermes-agent.md`
+6. **空 cwd 段为空**：cwd 下两文件都不存在 → 项目上下文段不出现（不留空标题）
+7. **`NANO_IGNORE_RULES=1` 跳过**：env 设置时即便文件存在也不注入
+8. **`build()` 是纯函数**：固定 cwd + 固定 messages 多次构造结果字节级一致（cache 友好）
+9. **段顺序固定**：骨架 → 项目上下文 → skill → memory → tools，断言子串出现位置递增
+10. **不读 CLAUDE.md**：cwd 下放 `CLAUDE.md` → 段不命中
+11. **不走 git root**：cwd 是 git 子目录、`AGENTS.md` 在 git root 而非 cwd → 段不命中
+
+---
+
+## V23.3 — 流式中继 + 中断传播
 
 ### 上一版本痛点（V23.1 暴露）
 
@@ -277,8 +396,8 @@ V22 的 `CancelToken` 已经是 `threading.Event`（专门为本档准备）。�
 
 - **跨线程共享 cancel token**：把 V22 提前埋的 `threading.Event` 真正用起来。教学要点："为什么 V22 不用 `bool` 当 cancel 标志？因为多线程下 bool 写入的可见性无保证。"
 - **侧路 progress 输出 vs 主路 tool_result**：第一次出现 "工具有两条输出通道"。主路（tool_result）是给父 LLM 看的、是协议；侧路（stderr progress）是给用户看的、是体验。两条通道独立，互不污染
-- **fan-in lock**：多 worker 并发写一个共享输出流的最朴素同步原语；引出 V23.3 "为什么不用 queue + 单消费者"的问题作为后续优化空间
-- **`StreamCancelled` 在子内层透传 → 工具 handler 翻译为状态字段**：V22 是"父侧抛到顶层回 prompt"，V23.2 是"子侧抛到 delegate handler 翻译成 `interrupted` 状态"。同一异常在不同语义层有不同处理
+- **fan-in lock**：多 worker 并发写一个共享输出流的最朴素同步原语；引出 V23.4 "为什么不用 queue + 单消费者"的问题作为后续优化空间
+- **`StreamCancelled` 在子内层透传 → 工具 handler 翻译为状态字段**：V22 是"父侧抛到顶层回 prompt"，V23.3 是"子侧抛到 delegate handler 翻译成 `interrupted` 状态"。同一异常在不同语义层有不同处理
 
 ### 对应源项目
 
@@ -287,7 +406,7 @@ V22 的 `CancelToken` 已经是 `threading.Event`（专门为本档准备）。�
 - StreamCancelled 翻译：`tools/delegate_tool.py:1802-1824` 的 `status="interrupted"` 分支
 - token 共享设计的源代码注释：源项目用 `child._interrupt_requested = True` 是因为子 agent 不一定支持 streaming；nano 因为 V22 已经统一 `CancelToken`，可以直接共享 token
 
-### 暴露的新问题（引向 V23.3）
+### 暴露的新问题（引向 V23.4）
 
 - 父调 delegate 完，看到子返回 `"已完成 read_file"` 一句话，但**不知道子内部跑了几次 LLM 调用、用了多少 token、读了哪些文件**。复用 V22 cache 后这个信息更重要（要看子是否真的吃到了缓存）
 - 多个子 agent 跑完，父侧 `session_estimated_cost_usd`（如果有）没有把子的 token 算进去，账目不全
@@ -298,33 +417,33 @@ V22 的 `CancelToken` 已经是 `threading.Event`（专门为本档准备）。�
 - progress sink 只支持 stderr 一种，不支持 ACP / gateway / TUI 渲染层
 - 不显示子的 reasoning_delta（V22 的 thinking 内容也只是输出一个 `[think] ...` 占位）
 - 不做"子 agent 死锁检测"（源项目 `_run_single_child` 里有 30s 心跳；nano 同进程线程池不需要）
-- 不做"延迟超过 N 秒的子任务自动 timeout 取消"（V23.3 才考虑）
+- 不做"延迟超过 N 秒的子任务自动 timeout 取消"（V23.4 才考虑）
 
 ### 预估规模
 
-V23.1 基础上 + ~60 行（progress callback 构建 + 中继逻辑）+ ~20 行（cancel token 桥接，主要是参数穿透）+ ~30 行（fan-in lock + status 翻译）+ 测试。累计 V23.0+V23.1+V23.2 ≈ 440 行。
+V23.2 基础上 + ~60 行（progress callback 构建 + 中继逻辑）+ ~20 行（cancel token 桥接，主要是参数穿透）+ ~30 行（fan-in lock + status 翻译）+ 测试。累计 V23.0–V23.3 ≈ 470 行。
 
-### 验证项（`scripts/test_v23_2_streaming.py`）
+### 验证项（`scripts/test_v23_3_streaming.py`）
 
 1. **父子共享 token**：构造一个故意 sleep 5 秒的 fake transport，父启动批量 3 个子任务，0.5 秒后主动 `parent_token.cancel()`。预期：3 个子全部在 1 秒内退出（不是 5 秒），返回结果中 `status="interrupted"`
 2. **取消不影响兄弟子**：用真实 `chain.stream_call` 跑批量 3 个子，其中 task#1 故意构造一个超长 tool 调用（fake `time.sleep(10)` 工具）。模拟 task#0 完成、task#2 还在跑、用户 cancel → task#1 立即 interrupted；task#2 仍能正常完成或被 cancel（取决于 cancel 时机），关键是 task#0 的已完成结果不丢
 3. **progress 中继不交织**：批量 5 个子并发，每个子至少触发 3 个 `tool_call_started`。`stderr` 抓取的 15+ 行进度全部以 `[task#i]` 开头且没有半行截断
 4. **stream off 路径不挂 callback**：`STREAM_ENABLED=0` 时，子 agent 仍走 `chain.call`，progress callback **不**被调用一次（不是空操作 callback，是真的不挂）
 5. **delegate 工具协议未破坏**：V21.4 的 dispatch 兜底（异常 / 非 str / 非 JSON）对 delegate 工具仍生效；progress 输出走 stderr，绝不污染 `tool_result(output=...)` 字符串
-6. **回归 V22 + V23.0/V23.1**：105 项 V17–V21 不变量 + 13 项 V22 + V23.0/V23.1 全部测试零回归
-7. **prompt 上 Ctrl+C 仍走 KeyboardInterrupt**：V22 的语义保留（父在 prompt 上按 Ctrl+C → 退出 agent；流式期间按 → cancel 当前响应回到 prompt）；V23.2 在"父等批量子任务时" Ctrl+C 走 cancel 路径，父 UI 走"用户主动取消"分支返回 prompt
+6. **回归 V22 + V23.0/V23.1/V23.2**：105 项 V17–V21 不变量 + 13 项 V22 + V23.0/V23.1/V23.2 全部测试零回归
+7. **prompt 上 Ctrl+C 仍走 KeyboardInterrupt**：V22 的语义保留（父在 prompt 上按 Ctrl+C → 退出 agent；流式期间按 → cancel 当前响应回到 prompt）；V23.3 在"父等批量子任务时" Ctrl+C 走 cancel 路径，父 UI 走"用户主动取消"分支返回 prompt
 
 ---
 
-## V23.3 — 结构化结果 + 成本聚合
+## V23.4 — 结构化结果 + 成本聚合
 
-### 上一版本痛点（V23.2 暴露）
+### 上一版本痛点（V23.3 暴露）
 
-V23.2 让父 UI 不再静默，子能被 kill，但**结果回传仍是黑盒一行字符串**：
+V23.3 让父 UI 不再静默，子能被 kill，但**结果回传仍是黑盒一行字符串**：
 
 - 父调子 agent 让它"分析三个 transport 文件"，子返回 `"已完成。chat_completions 走 SSE，anthropic 走 SDK，故障切换在 chain"`。父 LLM 后续要决定 "再让谁查源码 / 是否需要补充" 时，**完全不知道子这趟用了多少 token、读了哪些文件、是不是中途有工具失败**
-- V20 引入 prompt cache 后，子 agent 是否真的吃到 cache、命中率多少，无法验证 —— V23.0–V23.2 完全没把子的 usage 累计回父
-- 子 agent 跑超时（V23.2 仍无显式超时，仅靠 cancel）vs 跑到 max_iterations vs 自然完成，三种状态都被混淆为"返回了一个字符串就算完成"
+- V20 引入 prompt cache 后，子 agent 是否真的吃到 cache、命中率多少，无法验证 —— V23.0–V23.3 完全没把子的 usage 累计回父
+- 子 agent 跑超时（V23.3 仍无显式超时，仅靠 cancel）vs 跑到 max_iterations vs 自然完成，三种状态都被混淆为"返回了一个字符串就算完成"
 
 ### 解决方法 + 核心抽象
 
@@ -380,9 +499,9 @@ V23.2 让父 UI 不再静默，子能被 kill，但**结果回传仍是黑盒一
 - tool_trace：`tools/delegate_tool.py:1621-1653`，nano 简化为子 agent 自己维护数组，dispatch 后 append
 - status 枚举：`tools/delegate_tool.py:1802-1824` 的状态分支
 
-### 暴露的新问题（引向 V23.4 / V24）
+### 暴露的新问题（引向 V23.5 / V24）
 
-- 子 agent 自己可以再调 `delegate_task` 吗？V23.0–V23.3 一直在黑名单里，无法多层规划（如父 → orchestrator 子 → leaf 孙）→ 引向 **V23.4 嵌套**
+- 子 agent 自己可以再调 `delegate_task` 吗？V23.0–V23.4 一直在黑名单里，无法多层规划（如父 → orchestrator 子 → leaf 孙）→ 引向 **V23.5 嵌套**
 - 子的完整对话（不止 tool_trace 摘要）没有落盘 → 引向 **V24 trajectory**
 - 跨会话看"过去 7 天 delegate 调用频次 / 平均子 token / 失败率" → 引向 **V24 insights**
 
@@ -396,9 +515,9 @@ V23.2 让父 UI 不再静默，子能被 kill，但**结果回传仍是黑盒一
 
 ### 预估规模
 
-V23.2 基础上 + ~80 行（结果 dict 构造）+ ~40 行（成本聚合）+ ~50 行（tool_trace 收集 + child API）+ 测试。累计 V23.0+V23.1+V23.2+V23.3 ≈ 610 行（与 roadmap 预估"400-600 行"基本吻合，略超是因为 V22 流式集成多花了 ~60 行）。
+V23.3 基础上 + ~80 行（结果 dict 构造）+ ~40 行（成本聚合）+ ~50 行（tool_trace 收集 + child API）+ 测试。累计 V23.0–V23.4 ≈ 640 行（与 roadmap 预估"400-600 行"略超，差额来自 V22 流式集成 ~60 行 + V23.2 项目上下文 ~30 行）。
 
-### 验证项（`scripts/test_v23_3_structured_result.py`）
+### 验证项（`scripts/test_v23_4_structured_result.py`）
 
 1. **结果可解析**：`tool_result["output"]` 是 JSON 字符串，`json.loads` 后符合 schema（`status` / `summary` / `tokens` / `tool_trace` 字段全部存在）
 2. **token 累计**：父发起子任务前 `parent.session_total_tokens["input"] = 0`；子跑完读了 3 个文件，`parent.session_total_tokens["input"] >= sum(child_calls.input)`，差值 ≤ 父自身的 turn 消耗
@@ -410,25 +529,25 @@ V23.2 基础上 + ~80 行（结果 dict 构造）+ ~40 行（成本聚合）+ ~5
 
 ---
 
-## V23.4（可选） — 嵌套 delegate + 深度限制
+## V23.5（可选） — 嵌套 delegate + 深度限制
 
-> **优先级**：低于 V24 trajectory。V23.4 只在以下两种条件满足时启动：
+> **优先级**：低于 V24 trajectory。V23.5 只在以下两种条件满足时启动：
 >
 > 1. V24 已完成（数据飞轮已建好），且
 > 2. 出现真实使用场景（用户/教学需要 "先调研再实施" 这种 2 层任务分解）
 >
 > 否则跳过，留作 V25+ 的可选追加。
 
-### 上一版本痛点（V23.3 暴露）
+### 上一版本痛点（V23.4 暴露）
 
-V23.3 仍是**严格扁平结构**：父能 spawn 多个并行子，但每个子无法再分解任务。
+V23.4 仍是**严格扁平结构**：父能 spawn 多个并行子，但每个子无法再分解任务。
 
 复杂任务比如"梳理 nano 项目所有工具的 schema 一致性"需要分两层：
 
 - 一个 orchestrator 子负责规划（"先列工具清单，再对每个工具检查 schema"）
 - 多个 leaf 子并行执行 schema 检查
 
-V23.3 下，父 LLM 必须自己做规划层，把规划逻辑塞在父的 messages 里 —— 父 context 被规划细节污染，违反 V23 "父子隔离"的初衷。
+V23.4 下，父 LLM 必须自己做规划层，把规划逻辑塞在父的 messages 里 —— 父 context 被规划细节污染，违反 V23 "父子隔离"的初衷。
 
 ### 解决方法 + 核心抽象
 
@@ -436,7 +555,7 @@ V23.3 下，父 LLM 必须自己做规划层，把规划逻辑塞在父的 messa
 
 `delegate_task` 新增可选字段 `role: "leaf" | "orchestrator"`，默认 `"leaf"`：
 
-- `leaf`：子 ToolRegistry 不含 `delegate_task`（V23.0–V23.3 行为）
+- `leaf`：子 ToolRegistry 不含 `delegate_task`（V23.0–V23.4 行为）
 - `orchestrator`：子 ToolRegistry **含** `delegate_task`，子可再 spawn 自己的 leaf
 
 **B. `max_spawn_depth` 限制**
@@ -477,15 +596,15 @@ V23 系列收尾。后续问题归属于其他子系统：
 
 ### 预估规模
 
-V23.3 基础上 + ~40 行（role 字段 + 深度计数 + 降级逻辑）+ 测试。累计 V23.0–V23.4 ≈ 650 行。
+V23.4 基础上 + ~40 行（role 字段 + 深度计数 + 降级逻辑）+ 测试。累计 V23.0–V23.5 ≈ 680 行。
 
-### 验证项（`scripts/test_v23_4_nesting.py`）
+### 验证项（`scripts/test_v23_5_nesting.py`）
 
 1. **leaf 子拿不到 delegate_task**：`role="leaf"` 子的 ToolRegistry list 不含 `delegate_task`
 2. **orchestrator 子能再 spawn**：`role="orchestrator"` 子调 `delegate_task` 成功创建孙 agent，孙 agent 的 messages 不含父或子的对话
 3. **深度溢出降级**：`DELEGATE_MAX_DEPTH=2` 下，孙 agent（depth=2）请求 `role="orchestrator"` → 实际变 `"leaf"` + 结果含 warning
 4. **深度溢出拒绝**：`DELEGATE_MAX_DEPTH=2` 下，孙 agent 直接调 `delegate_task` 创建曾孙 → `tool_error`
-5. **回归 V23.0–V23.3**：默认 `role="leaf"` 不传时，所有前档验证项通过
+5. **回归 V23.0–V23.4**：默认 `role="leaf"` 不传时，所有前档验证项通过
 
 ---
 
@@ -496,22 +615,23 @@ V23.3 基础上 + ~40 行（role 字段 + 深度计数 + 降级逻辑）+ 测试
 | V1 ToolRegistry | `delegate_task` 注册为普通 LLM 工具；`FilteredToolRegistry`（V23.1）包装父 registry |
 | V3 toolsets | V23.1 工具白名单交集语义与 toolsets 挂载语义并存（不冲突，各管一层）|
 | V8 MemoryManager | 子 agent 默认黑名单 `memory_*`，避免子写脏父知识图谱（V23.0 起）|
-| V14 会话切换 | 父 `/new` 时强制 cancel 所有进行中的子（V23.2 cancel 桥接的扩展）|
+| V14 会话切换 | 父 `/new` 时强制 cancel 所有进行中的子（V23.3 cancel 桥接的扩展）|
 | V19 TransportChain | 父子共享同一个 chain 实例：cache 累计、断路器状态全局共享（V23.0 起）|
-| V20 Prompt Cache | 子 agent 透明继承 `apply_prompt_cache` 行为；V23.3 把 cache_read/write 累计回父成本 |
+| V20 Prompt Cache | 子 agent 透明继承 `apply_prompt_cache` 行为；V23.4 把 cache_read/write 累计回父成本 |
 | V21.2 PromptBuilder | 子 system prompt 用骨架段，**不**注入 skill 索引段（避免子滥用 skill_view）|
 | V21.3 Skill | 子默认拿不到 `skill_view` 工具（不在父全集 ∩ 子白名单时被裁掉，且 skill 索引段不注入）— V25+ 若需要再放开 |
-| V21.4 工具结果协议 | `delegate_task` 自身遵守 `tool_result(output=json.dumps(...))` 协议；V23.3 二级 JSON 不破坏协议层 |
-| V22 流式 + CancelToken | 本系列最强前置：V23.2 父子共享 `CancelToken`，子内部直接复用 V22 的 `chain.stream_call` 流式路径 |
+| V21.4 工具结果协议 | `delegate_task` 自身遵守 `tool_result(output=json.dumps(...))` 协议；V23.4 二级 JSON 不破坏协议层 |
+| V22 流式 + CancelToken | 本系列最强前置：V23.3 父子共享 `CancelToken`，子内部直接复用 V22 的 `chain.stream_call` 流式路径 |
+| V23.2 项目上下文 | 子 agent 与父 agent 共享同一个 cwd / `nano-hermes-agent.md` 注入 — 跨项目跑多智能体的部署前提 |
 
 ---
 
 ## 4. 主动延期 / 不做的方向
 
-- **Mixture-of-Agents**（源项目 `tools/mixture_of_agents_tool.py`）：roadmap 已排到 V25。V23 系列做完后，MoA 的实现可以直接复用 V23.1 的 `ThreadPoolExecutor` 和 V23.2 的 `progress callback` 中继 —— 这是 V23 顺序在 MoA 之前的额外好处。
+- **Mixture-of-Agents**（源项目 `tools/mixture_of_agents_tool.py`）：roadmap 已排到 V25。V23 系列做完后，MoA 的实现可以直接复用 V23.1 的 `ThreadPoolExecutor` 和 V23.3 的 `progress callback` 中继 —— 这是 V23 顺序在 MoA 之前的额外好处。
 - **暂停 / 恢复 / 序列化**（源项目 `_spawn_paused` 等）：依赖持久化层；nano 教学版不必要。
 - **ACP 跨进程子 agent**：源项目走 ACP 协议把子 agent 跑在独立进程；nano 同进程线程池足够，不引入跨进程通信。
-- **TUI 观察层 / `/agents` 全局活跃表**：源项目维护进程级活跃 subagent 注册表 + TUI 渲染。如果 V23.4 落地，可顺手做一个内存级 dict + `/agents` 命令（仅显示当前正在跑的子任务索引、goal 摘要、已用秒数），不持久化。
+- **TUI 观察层 / `/agents` 全局活跃表**：源项目维护进程级活跃 subagent 注册表 + TUI 渲染。如果 V23.5 落地，可顺手做一个内存级 dict + `/agents` 命令（仅显示当前正在跑的子任务索引、goal 摘要、已用秒数），不持久化。
 
 ---
 
