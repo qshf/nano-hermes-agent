@@ -15,19 +15,7 @@
   - 子 worker 完成后把 child tokens 累加到 ``ctx.runtime.session_tokens``
     （模块级 ``_SESSION_TOKENS_LOCK`` 保护，与 progress lock 同款模式）
 
-为什么单任务也升级 JSON（v23.0 协议演进）
-----------------------------------------
-v23.0/v23.1 单任务返回 ``tool_result(output="<plain summary text>")``，批量
-返回 JSON 数组字符串 —— 父 LLM 看到两套 schema。v23.4 统一为 ``{"results":[...]}``
-（与源项目 ``tools/delegate_tool.py:2283`` 同向）：
-
-- 父 LLM 永远 ``json.loads → r["results"][i]``，无单/批分支
-- token / tool_trace 在单任务也可见（保 plain string 等于让一半场景拿不到）
-- 为 v23.5 嵌套 delegate 提前对齐协议
-
-代价：v23.0/v23.1/v23.3 测试里 5-8 处"output == 'hello'"断言会回归，需同步
-升级到新 schema —— 这是有意的协议演进，决策日志（``docs/decisions/v23.4.md``）
-注明被推翻原因。
+各档协议升级 / 设计权衡的"为什么"详见 [docs/decisions/](../../docs/decisions/)。
 
 为什么走 setter 注入（仿 skill_view_tool）
 ==========================================
@@ -50,7 +38,6 @@ V23.3 起上下文可挂共享 ``AgentRuntime``（``cancel_token`` / ``stream_en
 - 不做超时 —— max_iterations=8 是唯一兜底；status 暂不暴露 ``timeout`` 态
 - 不做 ``files_read`` / ``files_written`` 跟踪（依赖 file_state，nano 没有）
 - 不做 ``output_tail`` / ``model`` / ``api_calls`` / ``_child_role`` 字段
-  （源项目有；nano 暂无对应价值）
 - **不做 FilteredToolRegistry 包装类** —— V23.0 的 ``run_child_loop``
   已经把 ``allowed_tool_names: set[str]`` 当一等参数传入
 
@@ -62,12 +49,10 @@ V23.3 起上下文可挂共享 ``AgentRuntime``（``cancel_token`` / ``stream_en
 - V23.3 progress callback：``tools/delegate_tool.py:678-862`` 的
   ``_build_child_progress_callback`` → nano 版只保 stderr sink
 - V23.3 中断传播：``tools/delegate_tool.py:2104-2139`` 父 cancel 检测 + 子 token
-  设置 → nano 直接共享 V22 的 CancelToken，不需要 ``_interrupt_requested`` flag
+  设置 → nano 直接共享 V22 的 CancelToken
 - V23.3 StreamCancelled 翻译：``tools/delegate_tool.py:1802-1824``
-- V23.4 result dict：``tools/delegate_tool.py:1668-1800`` → nano 裁掉 file_state /
-  output_tail / model / api_calls / _child_role
-- V23.4 成本聚合：``tools/delegate_tool.py:2231-2279`` → nano 累加到 runtime
-  而不是 parent_agent.session_estimated_cost_usd（nano 当前未做 cost 估算）
+- V23.4 result dict：``tools/delegate_tool.py:1668-1800``
+- V23.4 成本聚合：``tools/delegate_tool.py:2231-2279``
 - 黑名单常量：``tools/delegate_tool.py:40-48`` → nano 取 ``delegate_task /
   memory_*`` 两类
 """
@@ -97,20 +82,15 @@ logger = logging.getLogger(__name__)
 #
 # 多 worker 并发写父 stderr 时必须串行化，否则单行会被对半截断（如
 # ``[task#1] read_file: foo[task#0] read_file: bar`` 这种交织）。
-# 模块级 lock 而不是 setter 注入：测试里多次 ``set_delegate_context`` 不需要
-# 重置 lock；同进程一份 stderr，一份 lock。
+# 模块级 lock —— 同进程一份 stderr，一份 lock，不随 context 重置。
 _PROGRESS_STDERR_LOCK = threading.Lock()
 
 
 # ── V23.4 session_tokens 累加 lock ───────────────────────────────────────
 #
-# 与 ``_PROGRESS_STDERR_LOCK`` 同款模式：多 worker 完成后并发累加到
-# ``runtime.session_tokens`` 时必须串行化，否则两个 worker 的 ``+=`` 会读到
-# 同一个旧值并各自写回，丢一次累加。dict 在 CPython 单条 ``d[k] += n`` 不是
-# 原子的（GIL 仅保单字节字节码原子，``+=`` 是 LOAD/ADD/STORE 三步）。
-#
-# 模块级 lock 而不是注入式：lock 与 token dict 不绑定，所有 runtime 共享一把
-# —— 教学版同进程只有一个 runtime 实例，不会因为多 runtime 互锁。
+# 多 worker 完成后并发累加 ``runtime.session_tokens`` 时必须串行化：dict 在
+# CPython 单条 ``d[k] += n`` 不是原子的（GIL 仅保单字节字节码原子，``+=`` 是
+# LOAD/ADD/STORE 三步），两个 worker 同时累加同一键会丢一次。
 _SESSION_TOKENS_LOCK = threading.Lock()
 
 
@@ -383,12 +363,12 @@ def _run_one_task(
 ) -> dict:
     """跑一个子任务，返回内部 result dict。
 
-    V23.4 内部 dict shape::
+    返回 dict shape::
 
         {
             "task_index": int,                  # 单任务=0；批量=输入序
             "status": str,                      # completed|max_iterations|interrupted|error
-            "exit_reason": str,                 # 同 status（保留双字段，v23.5+ 可分化）
+            "exit_reason": str,                 # 同 status（双字段为后续档保留分化空间）
             "summary": str,
             "iterations": int,
             "duration_seconds": float,
@@ -400,8 +380,8 @@ def _run_one_task(
     主线程完成（``_resolve_child_toolset`` / 校验 / system prompt 渲染都
     不在这），worker 只做"调 LLM + 跑工具"的纯逻辑，不修改父 agent 状态。
 
-    V23.4 新增：worker 完成后立即把 child tokens 累加到 ``ctx.runtime.session_tokens``
-    （``_SESSION_TOKENS_LOCK`` 保护）—— 即便后续 worker 因 cancel 中断聚合，
+    worker 完成后立即把 child tokens 累加到 ``ctx.runtime.session_tokens``：
+    每子单独 finalize（不等批量整体结束），即使后续 worker 因 cancel 中断，
     本子已写入的部分不丢失。
     """
     from agent.child_loop import run_child_loop  # 局部 import，见 handler 注释
@@ -410,8 +390,7 @@ def _run_one_task(
     ctx = _delegate_context
     assert ctx is not None, "delegate_task: context missing — handler must guard"
 
-    # 单任务统一也用 task_index=0（与 batch 数组结构对齐 —— 父 LLM 看到的
-    # ``results`` 永远是数组，单任务退化为含 1 条的数组）
+    # 单任务也用 task_index=0 —— 父 LLM 看到的 ``results`` 永远是数组
     effective_task_index = 0 if task_index is None else task_index
 
     goal = entry["goal"].strip()
@@ -453,8 +432,8 @@ def _run_one_task(
         progress_callback=progress_cb,
     )
 
-    # V23.4: 累加 child tokens 到父 runtime —— 每子单独 finalize，不等批量整体
-    # 结束（cancel 时已写入的不丢）。lock 与 progress lock 同款模式。
+    # 累加 child tokens 到父 runtime —— worker 线程内立即 finalize，
+    # 不等批量整体结束（保证 cancel 时已写入的不丢）。
     _accumulate_runtime_tokens(ctx.runtime, child_result.get("tokens"))
 
     exit_reason = child_result["exit_reason"]
@@ -467,7 +446,7 @@ def _run_one_task(
     )
     return {
         "task_index": effective_task_index,
-        "status": exit_reason,         # V23.4: status / exit_reason 1:1（双字段为 v23.5+ 留扩展位）
+        "status": exit_reason,
         "exit_reason": exit_reason,
         "summary": child_result["summary"],
         "iterations": child_result["iterations"],
@@ -484,8 +463,8 @@ def _accumulate_runtime_tokens(
 ) -> None:
     """把 child token dict 累加到 ``runtime.session_tokens``（lock 保护）。
 
-    ``child_tokens`` 为 None / 缺字段 时静默跳过对应键 —— 比硬抛便于 fake
-    transport 测试场景（手工构造 partial child_result 不需要把 4 维补全）。
+    ``child_tokens`` 为 None / 缺字段 时静默跳过对应键 —— 让 fake transport
+    测试场景手工构造 partial child_result 时不必补全 4 维。
     """
     if child_tokens is None:
         return
@@ -585,11 +564,9 @@ def delegate_task_handler(args: dict) -> str:
 
     logger.info("[delegate] batch done tasks=%d", len(results))
 
-    # V23.4: 单任务 + 批量统一为 ``tool_result(output=json.dumps({"results":[...]}))``。
-    # 父 LLM 看到的 output 字段值是合法 JSON 字符串（V21.4 协议层不变 —— 外层
-    # ``tool_result`` 仍是 ``{"output": <json_string>}``）；子层结构化数据由父
-    # LLM ``json.loads(parsed["output"])`` 二次解析得到 ``results`` 数组 + 每条
-    # 完整 schema（status / tokens / tool_trace 等）。
+    # 单任务 + 批量统一返回 ``{"results":[...]}``；外层 ``tool_result`` 仍是
+    # V21.4 协议（``{"output": <json_string>}``），父 LLM 二次 ``json.loads`` 拿
+    # results 数组。
     return tool_result(output=json.dumps(
         _build_handler_payload(results=results, started_at=overall_started_at),
         ensure_ascii=False,
@@ -619,11 +596,6 @@ def _build_handler_payload(
             ],
             "total_duration_seconds": float,
         }
-
-    与源项目 ``tools/delegate_tool.py:2283`` 同向（``{"results": [...],
-    "total_duration_seconds": ...}``），裁掉 ``model`` / ``api_calls`` /
-    ``_child_role`` / ``_child_cost_usd`` / ``files_*`` / ``output_tail``
-    （见模块顶 docstring "不做的事"）。
     """
     return {
         "results": results,

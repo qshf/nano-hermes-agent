@@ -13,28 +13,7 @@ B. 写一个**裁剪版** child loop，只保留"调 LLM → 跑工具 → 拼 m
 nano 走 B —— 子的能力本就受限（黑名单 memory、不进 UI），裁剪版让"父子的差异
 在哪里"在代码层就一目了然，而不是埋在 ``role == "leaf"`` 这种 if 分支里。
 
-V23.3 演进
-----------
-- 加入 ``cancel_token`` / ``stream_enabled`` / ``progress_callback`` 三个可选参数
-- ``stream_enabled`` 且 chain 支持 ``stream_call`` 时走流式：每个 ``StreamEvent``
-  调一次 ``progress_callback``（侧路给父 stderr 用）；done 帧 ``response`` 字段
-  即等价 ``NormalizedResponse``，与同步路径下游处理统一
-- ``StreamCancelled`` 在子层被翻译为 ``exit_reason="interrupted"`` —— **不**重抛
-  到父，让 delegate handler 能继续聚合还在跑的兄弟子的结果
-- 工具循环 / LLM 调用前都 check ``cancel_token``，让父 cancel 能尽早 kill 子
-
-V23.4 演进（本档）
-------------------
-- 返回 dict 新增 ``tokens`` / ``tool_trace`` / ``duration_seconds`` 字段
-  - ``tokens``: 子内层每次 LLM 调用后从 ``normalized.usage`` 累加，4 维
-    （input / output / cache_read / cache_write），与 ``Usage`` 同语义
-  - ``tool_trace``: 工具循环里每条 dispatch 后追加一条
-    ``{tool, args_preview, result_bytes, status}``；轻量摘要，不存完整结果
-  - ``duration_seconds``: 子内层 wall-clock 用时（``time.monotonic`` 差值，
-    不含父侧调度 / GIL 等待开销）
-- ``status`` 字段由 ``exit_reason`` 1:1 映射后由 delegate handler 输出
-  （child_loop 自己只负责 ``exit_reason``，不输出 ``status`` —— 让 child_loop
-  对"层级语义"无知）
+各档新增字段 / 路径的"为什么"详见 [docs/decisions/](../../docs/decisions/)。
 
 不做的事（vs 父 loop）
 ----------------------
@@ -93,10 +72,9 @@ GOAL:
 {goal}{context_block}"""
 
 
-# V23.4: tool_trace.args_preview 截断长度 —— 200 字符 + 省略号开销 ≤10 字符
-# = 总长 ≤ 210 字节（验证项 #6）。截断点选 200 是和源项目同款（``tools/
-# delegate_tool.py:1633`` 的 ``args_bytes`` 上限语境），让 trace 数组在 8 轮
-# 工具调用下也只占 ~2KB，不撑爆父 LLM context。
+# tool_trace.args_preview 截断长度。8 轮工具调用 × 200 字节 ≈ 2KB —— 8x
+# 这个数会撑爆父 LLM 的 tool_result 上下文预算。改这个常数前先看 trace 总
+# 大小是否仍可控。
 _ARGS_PREVIEW_MAX = 200
 
 
@@ -113,12 +91,12 @@ def _classify_tool_status(result: str) -> str:
     """从 V21.4 协议字符串判断工具调用是 ok 还是 error。
 
     V21.4 ``tool_result(output=...)`` 一定是 ``{"output": ...}``；
-    ``tool_error(...)`` 一定是 ``{"error": ..., ...}``。所以 json.loads 后看
+    ``tool_error(...)`` 一定是 ``{"error": ..., ...}``。json.loads 后看
     顶层是否含 ``"error"`` 键即可。
 
-    兜底：JSON 解析失败 → 视作 ok（保守策略：把 trace 噪音降到最小，让
-    "已经合法返回的工具"不被误判 error；真正破坏协议的字符串会被
-    ``registry.dispatch`` 自身的 V21.4 兜底转换成合法 JSON）。
+    JSON 解析失败 → 视作 ok（保守策略：让"已经合法返回的工具"不被误判
+    error；真正破坏协议的字符串会被 ``registry.dispatch`` 自身的 V21.4
+    兜底转换成合法 JSON）。
     """
     if not result:
         return "ok"
@@ -139,9 +117,6 @@ def _accumulate_usage(target: dict[str, int], usage: Optional[Usage]) -> None:
     - completion_tokens      → output
     - cached_tokens          → cache_read（Anthropic 命中 cache 的 input）
     - cache_creation_tokens  → cache_write（Anthropic 写 cache 的 input）
-
-    OpenAI 兼容路径下 cache_read / cache_write 总是 0（transport 层已经
-    标准化），不做特判。
     """
     if usage is None:
         return
@@ -160,12 +135,7 @@ def _build_result(
     tool_trace: list[dict],
     started_at: float,
 ) -> dict[str, Any]:
-    """构造 child loop 返回 dict —— 让 7 处 return 共用同一处字段填充。
-
-    把这一步集中到 helper 是为了：所有 return 路径必填同一组字段，新加字段
-    时漏一处的概率为 0；测试 #1（"返回 dict schema 字段齐备"）一次断言
-    就覆盖所有终止路径。
-    """
+    """构造 child loop 返回 dict —— 7 处 return 路径共用，避免新加字段漏填。"""
     return {
         "summary": summary,
         "exit_reason": exit_reason,
@@ -191,7 +161,7 @@ def run_child_loop(
 ) -> dict[str, Any]:
     """跑一个隔离的子 agent loop，返回结果 dict。
 
-    V23.4 返回值（最小集）::
+    返回值 schema::
 
         {
             "summary": str,             # 子最后一条 assistant 文本
@@ -210,7 +180,7 @@ def run_child_loop(
             "duration_seconds": float,  # 子内层 wall-clock 时长
         }
 
-    每条 ``return`` 都走 ``_build_result`` 统一构造 —— 7 处终止路径填同一组字段。
+    每条 ``return`` 都走 ``_build_result`` 统一构造，避免 7 处终止路径漏字段。
 
     流式路径
     --------

@@ -394,14 +394,13 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token):
 
 
 def _accumulate_parent_turn_tokens(runtime: AgentRuntime, usage) -> None:
-    """V23.4: 把父 turn LLM usage 累加到 ``runtime.session_tokens``。
+    """把父 turn LLM usage 累加到 ``runtime.session_tokens``。
 
     与 ``tools/delegate_tool.py:_accumulate_runtime_tokens`` 镜像 —— 同一份
     runtime 字典，由父 turn 路径 + 子 worker 路径并发累加；后者已用模块级
     lock 保护，父 turn 单线程不需要再 lock（main loop 唯一线程）。
 
-    ``usage`` 为 None / 缺字段 时静默跳过 —— 测试 fixture 偶尔构造 partial
-    NormalizedResponse 时不至于崩。
+    ``usage`` 为 None / 缺字段 时静默跳过 —— 容忍 partial NormalizedResponse。
     """
     if usage is None:
         return
@@ -701,10 +700,8 @@ def run_agent():
                         '''
                         compressor.update_usage(normalized.usage.prompt_tokens)
 
-                    # V23.4: 把父 turn 的 usage 也累加到 runtime.session_tokens —— 让
-                    # ``/transport`` 看到的 session 累计是"父 + 所有子"的合计。
-                    # compressor 消费 prompt_tokens 用作压缩阈值，runtime 消费完整
-                    # usage 做累计统计，两者语义独立不冲突。
+                    # 累加父 turn 用量到 runtime.session_tokens（独立于
+                    # compressor —— 后者只用 prompt_tokens 做压缩阈值）
                     _accumulate_parent_turn_tokens(runtime, normalized.usage)
 
                     # 把标准化响应回填进对话历史（保持 OpenAI 消息 shape，下一轮 build_kwargs 还能消费）

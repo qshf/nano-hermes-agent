@@ -33,9 +33,8 @@ def cmd_transport(args: str, ctx: AgentCtx) -> None:
                 f"hit_rate={s['cache_hit_rate']:.1%}"
             )
 
-    # V23.4: 父子合计 session tokens —— 让用户在跑完几轮 delegate 后能直接看
-    # 累加结果（避免"数据有了但没人能验证"的状态）。命名 / 字段 v24 insights
-    # 时再统一升级，此处朴素打印。
+    # 父子合计 session tokens —— 由父 turn + 子 worker 双路径累加（见
+    # ``main.py:_accumulate_parent_turn_tokens`` / ``tools/delegate_tool.py:_accumulate_runtime_tokens``）
     st = ctx.runtime.session_tokens
     print(
         f"  [session_tokens] input={st['input']} output={st['output']} "
