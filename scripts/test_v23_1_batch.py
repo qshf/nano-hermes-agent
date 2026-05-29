@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools.registry import registry
 from tools.delegate_tool import (
+    DelegateContext,
     delegate_task_handler,
     set_delegate_context,
     _resolve_child_toolset,
@@ -116,11 +117,11 @@ def test_01_batch_parallel_speedup():
         responses=[_stop_response(f"done#{i}") for i in range(3)],
         per_call_sleep=1.0,
     )
-    set_delegate_context(
+    set_delegate_context(DelegateContext(
         chain=chain,
         model="fake",
         parent_toolset_names=["read_file"],
-    )
+    ))
     t0 = time.monotonic()
     raw = delegate_task_handler({
         "tasks": [
@@ -151,11 +152,11 @@ def test_02_result_order_matches_input():
 
     # 直接用真实并发 — sleep 在 chain.call 里没法按 task 区分（共享 chain），
     # 改用"3 个子任务每个内部各 1 次调用"的等延迟场景，验证顺序而不是验速度
-    set_delegate_context(
+    set_delegate_context(DelegateContext(
         chain=chain,
         model="fake",
         parent_toolset_names=["read_file"],
-    )
+    ))
     raw = delegate_task_handler({
         "tasks": [
             {"goal": "first"},
@@ -178,11 +179,11 @@ def test_02_result_order_matches_input():
 
 def test_03_whitelist_intersect_parent():
     """用户传 ``tools=["read_file", "nonexistent"]`` → 子拿到 ``{read_file}``。"""
-    set_delegate_context(
+    set_delegate_context(DelegateContext(
         chain=_FakeChain(),
         model="fake",
         parent_toolset_names=["read_file", "terminal", "skill_view"],
-    )
+    ))
     allowed = _resolve_child_toolset(requested=["read_file", "nonexistent"])
     assert allowed == {"read_file"}, f"got {allowed}"
 
@@ -201,13 +202,13 @@ def test_03_whitelist_intersect_parent():
 
 def test_04_blacklist_overrides_whitelist():
     """用户白名单含 ``delegate_task``/``memory`` → 仍被强制剔除。"""
-    set_delegate_context(
+    set_delegate_context(DelegateContext(
         chain=_FakeChain(),
         model="fake",
         parent_toolset_names=[
             "read_file", "delegate_task", "memory", "memory_recall_v2",
         ],
-    )
+    ))
     # 用户故意写黑名单
     allowed = _resolve_child_toolset(
         requested=["read_file", "delegate_task", "memory", "memory_recall_v2"],
@@ -221,11 +222,11 @@ def test_04_blacklist_overrides_whitelist():
 def test_05_validation_failure_aborts_all():
     """tasks[2] 不合法 → 整体 tool_error，0 个子启动（chain.calls 必须为 0）。"""
     chain = _FakeChain([_stop_response("should_not_run")] * 5)
-    set_delegate_context(
+    set_delegate_context(DelegateContext(
         chain=chain,
         model="fake",
         parent_toolset_names=["read_file"],
-    )
+    ))
     raw = delegate_task_handler({
         "tasks": [
             {"goal": "ok 0"},
@@ -244,11 +245,11 @@ def test_05_validation_failure_aborts_all():
 def test_05b_validation_tools_field():
     """tools 字段类型错（不是 list[str]）也要在主线程被拦下。"""
     chain = _FakeChain([_stop_response("nope")] * 3)
-    set_delegate_context(
+    set_delegate_context(DelegateContext(
         chain=chain,
         model="fake",
         parent_toolset_names=["read_file"],
-    )
+    ))
     raw = delegate_task_handler({
         "tasks": [
             {"goal": "ok"},
@@ -265,11 +266,11 @@ def test_05b_validation_tools_field():
 
 
 def test_06_goal_tasks_mutually_exclusive():
-    set_delegate_context(
+    set_delegate_context(DelegateContext(
         chain=_FakeChain([_stop_response("nope")]),
         model="fake",
         parent_toolset_names=["read_file"],
-    )
+    ))
     # 同时给
     raw = delegate_task_handler({"goal": "x", "tasks": [{"goal": "y"}]})
     parsed = json.loads(raw)
@@ -289,11 +290,11 @@ def test_06_goal_tasks_mutually_exclusive():
 def test_07_v23_0_single_task_unchanged():
     """不传 tasks 时输出仍是 ``{"output": <summary str>}`` —— 协议未升级。"""
     chain = _FakeChain([_stop_response("hello from child")])
-    set_delegate_context(
+    set_delegate_context(DelegateContext(
         chain=chain,
         model="fake",
         parent_toolset_names=["read_file"],
-    )
+    ))
     raw = delegate_task_handler({"goal": "say hi"})
     parsed = json.loads(raw)
     assert isinstance(parsed, dict)
@@ -313,11 +314,11 @@ def test_07_v23_0_single_task_unchanged():
 def test_07b_single_task_with_tools_field():
     """单任务路径也支持 V23.1 新增的 ``tools`` 白名单字段。"""
     chain = _FakeChain([_stop_response("done with limited tools")])
-    set_delegate_context(
+    set_delegate_context(DelegateContext(
         chain=chain,
         model="fake",
         parent_toolset_names=["read_file", "terminal", "skill_view"],
-    )
+    ))
     raw = delegate_task_handler({
         "goal": "limited",
         "tools": ["read_file"],  # 子只能拿到 read_file

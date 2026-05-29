@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # 触发命令注册
 import cli  # noqa: F401
+from agent.runtime import AgentRuntime
 from cli.context import AgentCtx
 from cli.registry import (
     CommandDef,
@@ -60,6 +61,7 @@ def _make_ctx(messages=None) -> AgentCtx:
         registry=MagicMock(),
         enabled_toolsets=["core"],
         build_system_prompt=lambda: "system prompt",
+        runtime=AgentRuntime(stream_enabled=True, cancel_token=None),
     )
 
 

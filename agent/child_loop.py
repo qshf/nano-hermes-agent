@@ -1,4 +1,4 @@
-"""V23.0 — 子 agent loop（最小可用版）。
+"""V23.0 / V23.3 — 子 agent loop。
 
 教学定位
 ========
@@ -10,40 +10,49 @@ B. 写一个**裁剪版** child loop，只保留"调 LLM → 跑工具 → 拼 m
 
 源项目走 A（``run_agent.py:run_conversation`` 同时被父和子调用，1300+ 行），
 因为生产环境父子的所有特性都要等价（流式、cache、failover、trajectory 等）。
-nano 走 B —— 子的能力本就受限（黑名单 memory、不流式、不进 UI），裁剪版让
-"父子的差异在哪里"在代码层就一目了然，而不是埋在 ``role == "leaf"`` 这种 if 分支里。
+nano 走 B —— 子的能力本就受限（黑名单 memory、不进 UI），裁剪版让"父子的差异
+在哪里"在代码层就一目了然，而不是埋在 ``role == "leaf"`` 这种 if 分支里。
 
-V23.2 接入流式 + cancel 时再考虑：
-    - 子是否要走 ``chain.stream_call`` —— 如果走，progress callback 中继到父
-      stderr；不走，仍是同步 ``chain.call``。
-V23.3 加结构化结果 + tool_trace 时，本函数返回值从只含 summary 升级为含
+V23.3 演进（本档）
+------------------
+- 加入 ``cancel_token`` / ``stream_enabled`` / ``progress_callback`` 三个可选参数
+- ``stream_enabled`` 且 chain 支持 ``stream_call`` 时走流式：每个 ``StreamEvent``
+  调一次 ``progress_callback``（侧路给父 stderr 用）；done 帧 ``response`` 字段
+  即等价 ``NormalizedResponse``，与同步路径下游处理统一
+- ``StreamCancelled`` 在子层被翻译为 ``exit_reason="interrupted"`` —— **不**重抛
+  到父，让 delegate handler 能继续聚合还在跑的兄弟子的结果
+- 工具循环 / LLM 调用前都 check ``cancel_token``，让父 cancel 能尽早 kill 子
+
+V23.4 加结构化结果 + tool_trace 时，本函数返回值从只含 summary 升级为含
 ``tokens`` / ``tool_trace`` / ``status`` 的完整 dict（已预留 ``exit_reason`` 字段）。
 
 不做的事（vs 父 loop）
 ----------------------
 - 不调 ``memory_manager.*`` —— 子默认拿不到 memory 工具（隔离原则）
 - 不调 ``compressor.*`` —— 子任务短小，max_iterations=8 兜底，不需要压缩
-- 不调 ``stream_call`` —— V23.0 同步路径；V23.2 才接流式
-- 不打印任何 UI —— stdout/stderr 静默；调试用 logger.debug
+- 不打印任何 UI —— stdout 静默；progress 仅经 callback 走 stderr 侧路
 - 不做 prefetch / sync_turn / on_session_switch —— 子无会话生命周期
 
 对应源项目
 ----------
 - 子 loop 主体：``tools/delegate_tool.py:1305-1593`` 的 ``_run_single_child``
-  → nano 版裁掉 ThreadPoolExecutor、心跳、tool_progress_callback、ACP transport、
-    诊断 dump、文件读写跟踪 ~6 块，只剩同步串行 LLM ↔ tool 循环
+  → nano 版裁掉 ThreadPoolExecutor、心跳、ACP transport、诊断 dump、
+    文件读写跟踪 ~6 块，只剩"调 LLM ↔ 跑工具"循环 + V23.3 流式中继 + cancel
 - 子 system prompt：``tools/delegate_tool.py:564-637`` 的 ``_build_child_system_prompt``
-  → nano 版固定模板（不读 config、不按 role 分支、不注入 skill 索引）
+- V23.3 cancel 桥接：``tools/delegate_tool.py:2104-2139`` 的中断检测
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Callable, Optional
 
+from tools.registry import ToolRegistry
 from tools.result import tool_error
-from transports.chain import FailoverExhausted
+from transports.chain import FailoverExhausted, TransportChain
+from transports.streaming import EVENT_DONE, CancelToken, StreamCancelled, StreamEvent
+from transports.types import build_assistant_history_msg
 
 logger = logging.getLogger(__name__)
 
@@ -91,11 +100,14 @@ def run_child_loop(
     *,
     goal: str,
     context: str,
-    chain: Any,                      # transports.chain.TransportChain
+    chain: TransportChain,
     model: str,
-    registry: Any,                   # tools.registry.ToolRegistry
+    registry: ToolRegistry,
     allowed_tool_names: set[str],
     max_iterations: int = 8,
+    cancel_token: Optional[CancelToken] = None,            # V23.3
+    stream_enabled: bool = False,                          # V23.3: 启用 chain.stream_call 路径
+    progress_callback: Optional[Callable[[StreamEvent], None]] = None,  # V23.3
 ) -> dict:
     """跑一个隔离的子 agent loop，返回结果 dict。
 
@@ -103,21 +115,41 @@ def run_child_loop(
 
         {
             "summary": str,         # 子最后一条 assistant 文本（或失败 / 截断说明）
-            "exit_reason": str,     # "completed" | "max_iterations" | "error"
+            "exit_reason": str,     # "completed" | "max_iterations" | "error" | "interrupted"
             "iterations": int,      # 实际跑了多少轮 LLM 调用
         }
 
-    V23.3 起会扩展 ``tokens`` / ``tool_trace`` / ``status`` 字段，但
+    V23.3 新增 ``"interrupted"`` 状态（父 cancel 桥接到子时翻译而来）。
+    V23.4 起会扩展 ``tokens`` / ``tool_trace`` / ``status`` 字段，但
     ``summary`` / ``exit_reason`` 是稳定承诺。
+
+    流式路径（V23.3）
+    -----------------
+    - ``stream_enabled=True`` + ``chain.stream_call`` 可用 → 走流式：每收到
+      ``StreamEvent`` 就调一次 ``progress_callback``（侧路给父 stderr 用），
+      ``done`` 帧的 ``response`` 字段就是等价的 ``NormalizedResponse``，
+      与同步路径下游处理统一。
+    - ``stream_enabled=False`` 或 chain 没有 ``stream_call`` → 走 V23.0 同步
+      ``chain.call``。这条退化路径让 V23.0/V23.1 测试的 fake chain 仍然能跑
+      （fake chain 没实现 ``stream_call``）。
+
+    中断路径（V23.3）
+    -----------------
+    - 父子共享同一个 ``cancel_token`` —— ``set_delegate_context`` 阶段已经
+      把父侧 token 透到这里。
+    - 子内层每次调 LLM 前先 ``check()``，命中即抛 ``StreamCancelled``。
+    - **不**重抛到父：`StreamCancelled` 在子层被 catch 后翻译为
+      ``exit_reason="interrupted"``，让父 ``delegate_task`` handler 能继续
+      聚合其他还在跑的兄弟子的结果（cancel 是"软取消"，不是"硬抛错"）。
+    - 同步路径里也做 cancel 检查（每轮 LLM 前 + tool 执行前），让 V23.0
+      不变更测试用例的同时仍能被父 cancel kill。
 
     隔离保证（V23.0 测试覆盖）
     --------------------------
     - 调用方传入的 ``messages`` 不被 mutate —— 子在内部新建 list
     - 子 system prompt 不含父的 skill 索引段（构造时就不注入）
     - 子工具白名单 = ``allowed_tool_names`` ∩ ``registry.available_tool_names``
-      —— 子永远拿不到父没装的工具，更拿不到黑名单工具
-    - 子不持有 ``memory_manager`` 引用 —— 即便 LLM 幻觉调用 memory_*，
-      registry.dispatch 会返回 "Unknown tool"，**不会**写到父 memory bank
+    - 子不持有 ``memory_manager`` 引用
     """
     # 构建子工具集：白名单 ∩ 当前可用 —— 同时过滤掉 check_fn 失败的工具
     available = set(registry.available_tool_names)
@@ -131,22 +163,71 @@ def run_child_loop(
     ]
 
     # 子 tools schema —— 直接复用 registry.get_definitions，但只传白名单
-    # 注意：get_definitions 内部还会过 check_fn（registry 已实现 30s TTL 缓存）
     tools_schema = registry.get_definitions(effective_tools)
+
+    # V23.3: 流式路径只在两个条件都成立时启用 —— ``stream_enabled`` 且 chain 有
+    # ``stream_call`` 方法。fake chain（V23.0/V23.1 测试用）默认没实现 stream_call，
+    # 所以即便测试里漏传 stream_enabled=False 也能优雅退化。
+    use_stream = bool(stream_enabled) and hasattr(chain, "stream_call")
+
+    def _is_cancelled() -> bool:
+        return cancel_token is not None and cancel_token.is_cancelled()
 
     iterations = 0
     last_text = ""
 
     while iterations < max_iterations:
         iterations += 1
-        logger.debug("[child_loop] iter=%d goal_prefix=%r", iterations, goal[:60])
+        logger.debug(
+            "[child_loop] iter=%d goal_prefix=%r stream=%s",
+            iterations, goal[:60], use_stream,
+        )
+
+        # 每轮 LLM 前先 check cancel —— 让"父 cancel 时 worker 已经在跑下一轮"的
+        # 场景能在 LLM 调用前就退出，省一次 token
+        if _is_cancelled():
+            return {
+                "summary": "sub-agent cancelled before LLM call",
+                "exit_reason": "interrupted",
+                "iterations": iterations - 1,  # 这一轮没真跑
+            }
 
         try:
-            normalized = chain.call(
-                model=model,
-                messages=messages,
-                tools=tools_schema,
-            )
+            if use_stream:
+                # 流式路径 —— 转发事件到 progress_callback，最后一个 done 帧
+                # 的 ``response`` 就是等价 NormalizedResponse
+                normalized = None
+                for ev in chain.stream_call(
+                    cancel_token=cancel_token,
+                    model=model,
+                    messages=messages,
+                    tools=tools_schema,
+                ):
+                    if progress_callback is not None:
+                        try:
+                            progress_callback(ev)
+                        except Exception:  # noqa: BLE001 — callback 不能炸 loop
+                            logger.exception("[child_loop] progress_callback raised")
+                    if ev.type == EVENT_DONE:
+                        normalized = ev.response
+                if normalized is None:
+                    return {
+                        "summary": "sub-agent stream ended without DONE event",
+                        "exit_reason": "error",
+                        "iterations": iterations,
+                    }
+            else:
+                normalized = chain.call(
+                    model=model,
+                    messages=messages,
+                    tools=tools_schema,
+                )
+        except StreamCancelled:
+            return {
+                "summary": "sub-agent cancelled mid-stream",
+                "exit_reason": "interrupted",
+                "iterations": iterations,
+            }
         except FailoverExhausted as exc:
             return {
                 "summary": f"sub-agent transport failover exhausted: {exc}",
@@ -169,7 +250,6 @@ def run_child_loop(
 
         # 回填 assistant 消息（与父 main.py 同款 shape，包含 reasoning_content
         # padding 和 content=None 抢救）—— 让 DeepSeek/Kimi thinking 模式下下一轮请求不会 400
-        from transports.types import build_assistant_history_msg
         assistant_dump = build_assistant_history_msg(normalized)
         messages.append(assistant_dump)
 
@@ -183,7 +263,15 @@ def run_child_loop(
 
         # 跑工具 —— 子永远走 registry.dispatch，绕过 memory_manager
         # 白名单二次校验：防 LLM 幻觉调用未授权工具（罕见但要兜底）
+        # V23.3: 每个 tool 跑前先 check cancel —— 父 cancel 时让长时工具
+        # （如 terminal 跑 `sleep 100`）不再继续执行
         for tool_call in normalized.tool_calls:
+            if _is_cancelled():
+                return {
+                    "summary": "sub-agent cancelled between tool calls",
+                    "exit_reason": "interrupted",
+                    "iterations": iterations,
+                }
             name = tool_call.function.name
             if name not in allowed_tool_names:
                 result = tool_error(

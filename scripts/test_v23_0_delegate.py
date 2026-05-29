@@ -36,6 +36,7 @@ from tools.registry import registry
 from tools.delegate_tool import (
     _DELEGATE_BLACKLIST_NAMES,
     _DELEGATE_BLACKLIST_PREFIXES,
+    DelegateContext,
     _resolve_child_toolset,
     delegate_task_handler,
     set_delegate_context,
@@ -154,11 +155,11 @@ def test_02_blacklist_resolution():
         "memory_recall_v2",            # 模拟未来 hindsight 拆分（前缀匹配）
         "delegate_task",
     ]
-    set_delegate_context(
+    set_delegate_context(DelegateContext(
         chain=_FakeChain(),
         model="fake",
         parent_toolset_names=parent_full,
-    )
+    ))
     allowed = _resolve_child_toolset()
     assert allowed == {"terminal", "read_file", "skill_view"}, f"got {allowed}"
     # 黑名单常量本身正确（教学保证 — 如果有人改 frozenset，立即失败）
@@ -173,18 +174,18 @@ def test_02_blacklist_resolution():
 def test_03_check_fn_hides_before_inject():
     """注入前 check_fn 返回 False / 注入后 True。"""
     # 重置注入状态
-    set_delegate_context(chain=_FakeChain(), model="fake", parent_toolset_names=[])
+    set_delegate_context(DelegateContext(chain=_FakeChain(), model="fake", parent_toolset_names=set()))
     registry._check_fn_cache.pop("delegate_task", None)
     available_no_tools = set(registry.available_tool_names)
     assert "delegate_task" not in available_no_tools, \
         "delegate_task visible when child toolset is empty"
 
     # 注入有效父全集后
-    set_delegate_context(
+    set_delegate_context(DelegateContext(
         chain=_FakeChain(),
         model="fake",
         parent_toolset_names=["terminal", "read_file"],
-    )
+    ))
     registry._check_fn_cache.pop("delegate_task", None)
     available_with_tools = set(registry.available_tool_names)
     assert "delegate_task" in available_with_tools, \
@@ -227,11 +228,11 @@ def test_05_context_section_conditional():
 
 def test_06_handler_validates_goal():
     """goal 缺失 / 空白 / 非字符串 → tool_error，子 loop 不启动。"""
-    set_delegate_context(
+    set_delegate_context(DelegateContext(
         chain=_FakeChain([_stop_response("should not be reached")]),
         model="fake",
         parent_toolset_names=["read_file"],
-    )
+    ))
 
     for bad_args in ({}, {"goal": ""}, {"goal": "   "}):
         result = delegate_task_handler(bad_args)
@@ -320,22 +321,22 @@ def test_09_child_rejects_unauthorized_tool_call():
 
 def test_10_handler_returns_v21_4_compliant_json():
     """delegate handler 返回值 — 合法 JSON object，含 'output' 字段。"""
-    set_delegate_context(
+    set_delegate_context(DelegateContext(
         chain=_FakeChain([_stop_response("hello from child")]),
         model="fake",
         parent_toolset_names=["read_file"],
-    )
+    ))
     raw = delegate_task_handler({"goal": "say hi"})
     parsed = json.loads(raw)  # must be valid JSON
     assert isinstance(parsed, dict), f"expected dict, got {type(parsed)}"
     assert "output" in parsed, f"missing 'output' field: {parsed}"
     assert parsed["output"] == "hello from child"
     # registry.dispatch 兜底不应触发（结果已合法）— 通过 dispatch 走一遍验证
-    set_delegate_context(
+    set_delegate_context(DelegateContext(
         chain=_FakeChain([_stop_response("via dispatch")]),
         model="fake",
         parent_toolset_names=["read_file"],
-    )
+    ))
     registry._check_fn_cache.pop("delegate_task", None)
     dispatched = registry.dispatch("delegate_task", {"goal": "via dispatch path"})
     parsed2 = json.loads(dispatched)

@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent import PromptBuilder, SKELETON_PROMPT
 from agent.prompt_builder import PromptBuilder as PromptBuilderClass
+from agent.runtime import AgentRuntime
 import cli  # noqa: F401  触发命令注册（test 15 需要 /new handler）
 from cli.context import AgentCtx
 from cli.registry import dispatch
@@ -236,6 +237,7 @@ def test_agent_ctx_prompt_builder_field_optional() -> None:
         registry=MagicMock(),
         enabled_toolsets=[],
         build_system_prompt=lambda: "fallback-sys",
+        runtime=AgentRuntime(stream_enabled=True, cancel_token=None),
     )
     assert ctx.prompt_builder is None
 
@@ -270,6 +272,7 @@ def test_new_command_uses_prompt_builder_when_set() -> None:
         enabled_toolsets=[],
         build_system_prompt=_fallback,
         prompt_builder=_StubBuilder(),
+        runtime=AgentRuntime(stream_enabled=True, cancel_token=None),
     )
     handled = dispatch("/new", ctx)
     assert handled is True

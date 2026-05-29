@@ -1,18 +1,27 @@
-"""V23.0 / V23.1 — ``delegate_task`` 工具：父 agent 派发隔离的子 agent。
+"""V23.0 / V23.1 / V23.3 — ``delegate_task`` 工具：父 agent 派发隔离的子 agent。
 
-教学定位（V23.0 起点）
-======================
-前 22 档全部是单 agent loop。V23.0 第一次引入"父子两个 loop 同进程共存"，
-作为多智能体系列的最小可用切片。V23.1 在它之上新增两个能力：
+教学定位（V23.0 → V23.3 弧线）
+==============================
+- V23.0 父子隔离最小切片（单任务、同步、黑名单写死）
+- V23.1 批量并行 + per-task 工具白名单（``ThreadPoolExecutor`` + ``tools`` 字段）
+- V23.3 流式中继 + 父子 ``CancelToken`` 桥接（**本档**）
+  - 父子共享同一份 ``cancel_token``：父 Ctrl+C → 所有子立刻退出
+  - 子 ``chain.stream_call`` 的事件经 ``progress_callback`` 中继到父 stderr
+  - ``StreamCancelled`` 在子内层被翻译成 ``exit_reason="interrupted"``
+    （**不**重抛，让父继续处理还在跑的兄弟子）
+  - 用 ``threading.Lock`` 串行化多 worker 的 stderr 写，杜绝行交织
 
-- **批量并行**：``tasks: [{goal, context, tools?}, ...]`` 数组 + 主线程构建
-  + ``ThreadPoolExecutor`` 并跑（默认 3 worker，env ``DELEGATE_MAX_CONCURRENT``）
-- **per-task 工具白名单**：每个任务可选 ``tools: [...]``，与父全集取交集
-  并强制减黑名单（即便父 LLM 在 ``tools`` 里写 ``delegate_task``，子也拿不到）
+为什么把流式 + 中断绑在同一档
+----------------------------
+中断不接，UI 哑这件事自己就让流式中继毫无价值（父等 1-3 分钟才有输出，
+进度行打了也没人看）；流式不接，cancel 桥接也只能让"卡死的子"提前停而
+看不见正在干什么。两件事一起做才形成"父 UI 不静默 + 子可立即 kill"的闭环。
 
-V23.0 的语义保持不变：不传 ``tasks`` 时仍是单任务同步路径；返回值仍是
-``tool_result(output=summary_str)``。批量模式返回 JSON 数组，每条带
-``task_index``（让父 LLM 不依赖位置去匹配）。
+V23.0/V23.1 协议保持不变
+------------------------
+返回值仍是 V21.4 工具协议（``tool_result(output=...)``）—— 单任务 ``output``
+是子的 summary 字符串，批量是 JSON 数组的字符串。``progress_callback`` 走的是
+**侧路 stderr 输出**，不污染主路 ``tool_result``（与源项目同向）。
 
 为什么走 setter 注入（仿 skill_view_tool）
 ==========================================
@@ -22,42 +31,60 @@ parent toolsets。我们需要 handler 在被调用时拿到这些运行期对�
 模块级 singleton + ``set_delegate_context()``：
 
     main.py 启动顺序里在构建完 chain 后调一次 ``set_delegate_context(...)``，
-    把 chain / model / parent_tool_names 注入。注入前 handler 返回 error
+    把 ``DelegateContext`` 注入。注入前 handler 返回 error
     （让"父没启用 delegate"的部署仍能跑而不崩）。
 
-不做的事（V23.1 范围内仍延期）
-------------------------------
-- 不做流式 / cancel token 桥接（V23.2）
-- 不做结构化结果 / 成本聚合（V23.3：``tokens`` / ``tool_trace`` / ``status``）
-- 不做 ``role: orchestrator`` / max_spawn_depth（V23.4）
+V23.3 起上下文可挂共享 ``AgentRuntime``（``cancel_token`` / ``stream_enabled``）。
+没挂 → 子走 V23.0 同步路径（向下兼容；测试里 fake chain 不需要也能跑）。
+
+不做的事（V23.4+ 仍延期）
+------------------------
+- 不做结构化结果 / 成本聚合（V23.4：``tokens`` / ``tool_trace`` / ``status``）
+- 不做 ``role: orchestrator`` / max_spawn_depth（V23.5）
 - 不做超时 —— max_iterations=8 是唯一兜底
 - **不做 FilteredToolRegistry 包装类** —— V23.0 的 ``run_child_loop``
-  已经把 ``allowed_tool_names: set[str]`` 当一等参数传入，相当于现成的
-  per-call filter，再开一个类是名词包装
+  已经把 ``allowed_tool_names: set[str]`` 当一等参数传入
 
 对应源项目
 ----------
 - V23.0 单任务 schema：``tools/delegate_tool.py:2626-2743`` 极简子集
-- V23.1 批量分发：``tools/delegate_tool.py:2071-2193`` 主线程构建 →
-  ThreadPoolExecutor 提交 → 收集排序
-- V23.1 工具白名单交集：``tools/delegate_tool.py:940-963`` 的
-  ``_resolve_child_toolsets``
-- 黑名单常量：``tools/delegate_tool.py:40-48`` 的 ``DELEGATE_BLOCKED_TOOLS``
-  → nano 取 ``delegate_task / memory_*`` 两类（``clarify / send_message /
-    execute_code`` 在 nano 不存在）
+- V23.1 批量分发：``tools/delegate_tool.py:2071-2193``
+- V23.1 工具白名单交集：``tools/delegate_tool.py:940-963``
+- V23.3 progress callback：``tools/delegate_tool.py:678-862`` 的
+  ``_build_child_progress_callback`` → nano 版只保 stderr sink
+- V23.3 中断传播：``tools/delegate_tool.py:2104-2139`` 父 cancel 检测 + 子 token
+  设置 → nano 直接共享 V22 的 CancelToken，不需要 ``_interrupt_requested`` flag
+- V23.3 StreamCancelled 翻译：``tools/delegate_tool.py:1802-1824``
+- 黑名单常量：``tools/delegate_tool.py:40-48`` → nano 取 ``delegate_task /
+  memory_*`` 两类
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
 
+from agent.runtime import AgentRuntime
 from tools.registry import registry
 from tools.result import tool_error, tool_result
+from transports.chain import TransportChain
+from transports.streaming import EVENT_DONE, EVENT_TOOL_CALL_STARTED, StreamEvent
 
 logger = logging.getLogger(__name__)
+
+
+# ── V23.3 stderr fan-in lock ─────────────────────────────────────────────
+#
+# 多 worker 并发写父 stderr 时必须串行化，否则单行会被对半截断（如
+# ``[task#1] read_file: foo[task#0] read_file: bar`` 这种交织）。
+# 模块级 lock 而不是 setter 注入：测试里多次 ``set_delegate_context`` 不需要
+# 重置 lock；同进程一份 stderr，一份 lock。
+_PROGRESS_STDERR_LOCK = threading.Lock()
 
 
 # ── V23.1 并发上限（env 可调，schema 不暴露 — 防父 LLM 滥用并发）─────────
@@ -87,35 +114,51 @@ _DELEGATE_BLACKLIST_NAMES = frozenset({"delegate_task", "memory"})
 _DELEGATE_BLACKLIST_PREFIXES = ("memory_",)
 
 
+@dataclass
+class DelegateContext:
+    """Runtime dependencies needed by ``delegate_task``.
+
+    ``runtime`` 是父子共享的真理源（``cancel_token`` / ``stream_enabled``）。
+    缺省构造一个全关的 runtime —— 让"父没启用流式 / 中断"的测试与部署仍能跑。
+    """
+
+    chain: TransportChain
+    model: str
+    parent_toolset_names: set[str]
+    runtime: AgentRuntime = field(
+        default_factory=lambda: AgentRuntime(stream_enabled=False, cancel_token=None)
+    )
+
+    def __post_init__(self) -> None:
+        # 容忍 list / tuple — 调用方常以列表形式构造，set 化让黑名单逻辑统一
+        if not isinstance(self.parent_toolset_names, set):
+            self.parent_toolset_names = set(self.parent_toolset_names)
+
+
 # ── 模块级注入上下文（main.py 启动时填）────────────────────────────────────
-_chain: Optional[Any] = None     # transports.chain.TransportChain
-_model: Optional[str] = None
-_parent_toolset_names: Optional[list[str]] = None  # 父全集（含 memory_*）
+_delegate_context: Optional[DelegateContext] = None
 
 
-def set_delegate_context(
-    *,
-    chain: Any,
-    model: str,
-    parent_toolset_names: list[str],
-) -> None:
+def set_delegate_context(context: DelegateContext, /) -> None:
     """main.py 在构建完 chain + 决定 ENABLED_TOOLSETS 后调一次。
 
-    ``parent_toolset_names`` 应该是父全集（含 ``memory_*`` —— 让黑名单逻辑
-    自己过滤）。子 agent 收到的工具白名单 = 父全集 - 黑名单。
+    传入一个 ``DelegateContext``，其中 ``parent_toolset_names`` 应是父全集
+    （含 ``memory_*`` —— 让黑名单逻辑自己过滤）。子 agent 收到的工具白名单
+    = 父全集 - 黑名单。
+
+    流式 / 中断由 ``context.runtime`` 控制；不挂 runtime（默认全关）即走
+    V23.0 同步路径，向下兼容旧 fake chain。
     """
-    global _chain, _model, _parent_toolset_names
-    _chain = chain
-    _model = model
-    _parent_toolset_names = list(parent_toolset_names)
+    global _delegate_context
+    _delegate_context = context
 
 
 def _resolve_child_toolset(requested: Optional[list[str]] = None) -> set[str]:
     """从父全集 - 黑名单（精确名 + 前缀）得到子允许集；可选传入 ``requested``
     白名单做交集。
 
-    分离成函数是为了让测试能直接 mock ``_parent_toolset_names`` 后验证
-    黑名单逻辑 —— 不必跑完整 set_delegate_context + chain 构建。
+    分离成函数是为了让测试能直接注入轻量 context 后验证黑名单逻辑 ——
+    不必跑完整 main.py 启动流程。
 
     V23.1 新增 ``requested`` 参数（来自 schema ``tools`` 字段）：
 
@@ -126,9 +169,9 @@ def _resolve_child_toolset(requested: Optional[list[str]] = None) -> set[str]:
       - 用户写了黑名单（如 ``"delegate_task"``）→ 强制减去
       - 用户传空 list ``[]`` → 子拿到空集，handler 上层会拒绝 spawn
     """
-    if _parent_toolset_names is None:
+    if _delegate_context is None:
         return set()
-    parent_full = set(_parent_toolset_names)
+    parent_full = _delegate_context.parent_toolset_names
     if requested is None:
         candidates = parent_full
     else:
@@ -249,7 +292,68 @@ def _validate_task_entry(entry: Any, idx: Optional[int] = None) -> Optional[str]
     return None
 
 
-def _run_one_task(entry: dict, task_index: Optional[int] = None) -> dict:
+def _build_child_progress_callback(
+    task_index: Optional[int],
+    is_batch: bool,
+    stream_enabled: bool,
+) -> Optional[Callable[[StreamEvent], None]]:
+    """构造一个 stderr progress 中继 callback —— 仅在父侧流式开启时用。
+
+    教学要点（V23.3）
+    -----------------
+    - 这是工具的**侧路输出通道**：写父 stderr，给"用户"看；
+      ``tool_result(output=...)`` 是**主路输出**：返回 JSON，给"父 LLM"看。
+      两通道独立，progress 噪音不会污染对话历史。
+    - ``text_delta`` / ``reasoning_delta`` **不**逐字符回显（多 worker 并发
+      时刷屏 + 行交织都会让人无法读）。只在 ``tool_call_started`` / ``done``
+      两个里程碑事件回显一行。
+    - 单任务模式不显示 ``[task#N]`` 前缀；批量模式才带索引（避免单任务的
+      stderr 看起来突兀）。
+
+    返回 None 表示"不挂 callback" —— 子 loop 会跳过整个 stream 路径走同步
+    ``chain.call``（与 V23.0 行为一致）。这样：
+
+    - ``stream_enabled=False`` 部署/测试场景：callback 是 None，子完全走 V23.0
+    - 测试代码里完全不需要构造 fake callback，能把"流式中继"和"工具协议"
+      两件事的测试解耦
+    """
+    if not stream_enabled:
+        return None
+
+    prefix = f"[task#{task_index}]" if (is_batch and task_index is not None) else "[delegate]"
+
+    def _cb(ev: StreamEvent) -> None:
+        # 仅取里程碑事件 —— delta 噪音不打
+        if ev.type == EVENT_TOOL_CALL_STARTED:
+            line = f"  {prefix} tool: {ev.tool_name}\n"
+        elif ev.type == EVENT_DONE:
+            # 子完成（无论是文本回答还是要再跑工具，都给父用户一个 hint）
+            resp = ev.response
+            if resp is None:
+                line = f"  {prefix} done\n"
+            elif resp.tool_calls:
+                line = f"  {prefix} llm-turn done (will run {len(resp.tool_calls)} tool(s))\n"
+            else:
+                # 终态文本回答 —— 只显示前 60 字符，避免长 summary 刷屏
+                head = (resp.content or "").strip().replace("\n", " ")
+                if len(head) > 60:
+                    head = head[:60] + "..."
+                line = f"  {prefix} answer: {head}\n"
+        else:
+            return  # text_delta / reasoning_delta — 噪音不打
+
+        with _PROGRESS_STDERR_LOCK:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+
+    return _cb
+
+
+def _run_one_task(
+    entry: dict,
+    task_index: Optional[int] = None,
+    is_batch: bool = False,
+) -> dict:
     """跑一个子任务，返回内部 result dict。
 
     内部 dict shape（V23.1 临时版）::
@@ -271,10 +375,15 @@ def _run_one_task(entry: dict, task_index: Optional[int] = None) -> dict:
     """
     from agent.child_loop import run_child_loop  # 局部 import，见 handler 注释
 
+    # handler 已在入口处保证 _delegate_context 非空，这里直接断言而不是再 fallback
+    ctx = _delegate_context
+    assert ctx is not None, "delegate_task: context missing — handler must guard"
+
     goal = entry["goal"].strip()
     context = entry.get("context") or ""
     requested = entry.get("tools")  # None 或 list[str]
     allowed = _resolve_child_toolset(requested=requested)
+    stream_enabled = ctx.runtime.stream_enabled
 
     if not allowed:
         return {
@@ -288,16 +397,20 @@ def _run_one_task(entry: dict, task_index: Optional[int] = None) -> dict:
         }
 
     logger.info(
-        "[delegate] spawn task_index=%s goal=%r tools=%d",
-        task_index, goal[:80], len(allowed),
+        "[delegate] spawn task_index=%s goal=%r tools=%d stream=%s",
+        task_index, goal[:80], len(allowed), stream_enabled,
     )
+    progress_cb = _build_child_progress_callback(task_index, is_batch, stream_enabled)
     result = run_child_loop(
         goal=goal,
         context=context,
-        chain=_chain,
-        model=_model,
+        chain=ctx.chain,
+        model=ctx.model,
         registry=registry,
         allowed_tool_names=allowed,
+        cancel_token=ctx.runtime.cancel_token,
+        stream_enabled=stream_enabled,
+        progress_callback=progress_cb,
     )
     logger.info(
         "[delegate] done task_index=%s exit=%s iters=%d summary_len=%d",
@@ -327,7 +440,7 @@ def delegate_task_handler(args: dict) -> str:
     delegate 失败应该是"工具返回 error"而不是"工具崩了"，让父 LLM 能在
     下一轮自然处理 —— 比如改换策略或道歉）。
     """
-    if _chain is None or _model is None or _parent_toolset_names is None:
+    if _delegate_context is None:
         return tool_error(
             "delegate_task: not initialized "
             "(set_delegate_context() must be called by main.py before use)"
@@ -357,7 +470,7 @@ def delegate_task_handler(args: dict) -> str:
         err = _validate_task_entry(single_entry, idx=None)
         if err:
             return tool_error(err)
-        result = _run_one_task(single_entry, task_index=None)
+        result = _run_one_task(single_entry, task_index=None, is_batch=False)
         # V23.0 协议：单任务仍只把 summary 字符串塞进 output，**不**包 JSON 嵌套
         # （让父 LLM 看到的就是一段文本，与 V23.0 行为完全一致）
         return tool_result(output=result["summary"])
@@ -383,10 +496,13 @@ def delegate_task_handler(args: dict) -> str:
 
     # ``executor.map`` 保留输入顺序（无论 worker 完成快慢），刚好与
     # iteration-plan §V23.1 验证项 #2"结果顺序与 tasks 数组对齐"对齐。
-    # V23.2 接进度中继时再换 ``as_completed``。
+    # V23.3 进度中继走侧路 stderr，与主路 tool_result 顺序无关，仍可继续用 map。
     indexed = list(enumerate(tasks))
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        results = list(pool.map(lambda it: _run_one_task(it[1], task_index=it[0]), indexed))
+        results = list(pool.map(
+            lambda it: _run_one_task(it[1], task_index=it[0], is_batch=True),
+            indexed,
+        ))
 
     logger.info("[delegate] batch done tasks=%d", len(results))
 
@@ -414,7 +530,7 @@ def _check_delegate_ready() -> bool:
     main.py 不调 set_delegate_context 即可，agent 启动 banner / 工具列表自然
     不显示 delegate_task。
     """
-    if _chain is None or _parent_toolset_names is None:
+    if _delegate_context is None:
         return False
     return len(_resolve_child_toolset()) > 0
 

@@ -38,6 +38,7 @@ from agent import (
     parse_frontmatter,
     skill_matches_platform,
 )
+from agent.runtime import AgentRuntime
 from tools.registry import registry
 from tools.skill_view_tool import (
     SKILL_VIEW_SCHEMA,
@@ -270,6 +271,7 @@ def test_12_skill_slash_subcommands():
             build_system_prompt=lambda: "",
             prompt_builder=None,
             skill_loader=loader,
+            runtime=AgentRuntime(stream_enabled=True, cancel_token=None),
         )
 
         # /skill list

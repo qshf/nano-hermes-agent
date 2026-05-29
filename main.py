@@ -138,7 +138,10 @@ if _cli_args.cwd is not None:
 from model_tools import get_tool_definitions, get_available_tool_names
 from tools.registry import registry
 from tools.skill_view_tool import set_skill_loader as _inject_skill_loader
-from tools.delegate_tool import set_delegate_context as _inject_delegate_context
+from tools.delegate_tool import (
+    DelegateContext,
+    set_delegate_context as _inject_delegate_context,
+)
 from memory import BuiltinMemoryProvider, MemoryManager, RemoteSemanticProvider
 from context_compressor import ContextCompressor
 from transports.chain import FailoverExhausted, build_chain_from_env
@@ -153,6 +156,7 @@ from transports.streaming import (
 )
 from transports.types import build_assistant_history_msg
 from agent import PromptBuilder, SkillLoader
+from agent.runtime import AgentRuntime
 import cli  # 触发 cli/commands 下所有命令的装饰器注册
 
 # V22 输入体验：用 prompt_toolkit 的 PromptSession 取代内建 ``input()``。
@@ -276,7 +280,11 @@ def _esc_listener(cancel_token, stop_event):
     (Esc) 就 ``cancel_token.cancel()``，与 SIGINT handler 同样的"语义层取消"
     路径汇合。Ctrl+C (SIGINT) 仍保留作为备用通路。
 
-    退出条件二选一：读到 Esc / ``stop_event.set()``（主线程在流结束时通知）。
+    V23.4: listener 生命周期上提到整个 tool loop（含 delegate 子 agent
+    执行期间）。命中 Esc **不退出**循环 —— 因为后续可能还有多轮 LLM /
+    工具调用，每次 cancel 后 main loop 会 ``token.reset()`` 让下一轮可中断。
+    退出唯一靠 ``stop_event.set()``。
+
     退出时还原 termios，否则 prompt_toolkit 下一次 prompt 会继承 cbreak 模式。
 
     非 tty 环境（pytest / 管道 / CI）跳过 — ``termios.tcgetattr`` 抛
@@ -308,7 +316,8 @@ def _esc_listener(cancel_token, stop_event):
                 break
             if ch == b"\x1b":
                 cancel_token.cancel()
-                return
+                # 不 return —— tool loop 可能多轮，每轮前 main reset token，
+                # 再次按 Esc 仍可中断下一轮。退出 listener 由 stop_event 控制。
     finally:
         try:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
@@ -328,21 +337,14 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token):
 
     cancel：调用方负责在 stream_call 之前重置 token；本函数捕获
     ``StreamCancelled`` 后打印 ``[cancelled]`` 并返回 None，让上层回到 prompt。
+
+    V23.4: Esc/Ctrl+C 监听器的启停**不**在本函数内 —— 由外层 tool loop 统一
+    管理（覆盖 LLM 流式 + tool 执行的整段时间，含 delegate_task 子 agent）。
     """
     printed_prefix = False  # 是否已经写过 "Agent > "（仅 text 流时写）
     has_text = False
     saw_reasoning = False
     final_resp = None
-
-    # V22: 启动 Esc 监听后台线程（仅在 tty 上有效）
-    import threading as _threading
-    _stop = _threading.Event()
-    _listener = _threading.Thread(
-        target=_esc_listener,
-        args=(cancel_token, _stop),
-        daemon=True,
-    )
-    _listener.start()
 
     try:
         for ev in chain.stream_call(
@@ -387,10 +389,6 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token):
         sys.stdout.write("\n  [cancelled] (Esc / Ctrl+C — back to prompt)\n\n")
         sys.stdout.flush()
         return None
-    finally:
-        # 无论流正常结束 / cancel / 异常，都通知 listener 退出并恢复 termios
-        _stop.set()
-        _listener.join(timeout=1.0)
 
     return final_resp
 
@@ -421,18 +419,41 @@ def run_agent():
     client = chain.primary_client
     model = os.environ.get("MODEL", "gpt-4o-mini")
 
+    # V22: 流式开关 — env 默认开；运行期 /stream on|off 切换
+    stream_enabled = os.environ.get("STREAM_ENABLED", "1") not in ("0", "false", "False", "")
+
+    # V22: 全局 cancel token + SIGINT handler — V23.3 起也注入到 delegate
+    # 上下文，让父子共享同一个 token（父 Ctrl+C → 所有子下一帧退出）
+    # prompt 上 SIGINT → 走 KeyboardInterrupt 退出（Python 默认行为）
+    # LLM 调用期间 SIGINT → 设置 token，stream_call 内部循环 check 后 raise
+    #   StreamCancelled，main 捕获后回到 prompt 不退出
+    # 用一个布尔 `streaming_active` 区分两种语境 — handler 只在流式期间
+    # 翻译为 cancel；prompt 期间让 KeyboardInterrupt 自然抛出
+    cancel_token = CancelToken()
+    runtime = AgentRuntime(
+        stream_enabled=stream_enabled,
+        cancel_token=cancel_token,
+    )
+    # V23.4: agent_busy 覆盖整轮 tool loop（含 delegate 子 agent 执行期间），
+    # 取代仅在父流式期间为 True 的 streaming_active。SIGINT / Esc listener 据此
+    # 判断"现在按取消是取消 agent，还是退出 prompt"。
+    agent_busy = {"flag": False}
+
     # V23.0: 注入 delegate_task 工具的运行期上下文 —— chain 构建完才注入。
     # 父全集 = registry 注册过的 + memory_manager 暴露的；黑名单（delegate_task /
     # memory_*）由 ``_resolve_child_toolset`` 自己过滤。check_fn 在注入完成后
     # 才让 delegate_task 暴露给父 LLM。
+    # V23.3: delegate 注入共享 runtime —— 子 agent 与父共享同一个 cancel_token；
+    # stream_enabled 也动态读取，让 /stream on|off 能同时影响父 loop 和子 loop。
     _parent_full_toolset = sorted(
         set(registry.tool_names) | set(memory_manager.get_all_tool_names())
     )
-    _inject_delegate_context(
+    _inject_delegate_context(DelegateContext(
         chain=chain,
         model=model,
-        parent_toolset_names=_parent_full_toolset,
-    )
+        parent_toolset_names=set(_parent_full_toolset),
+        runtime=runtime,
+    ))
 
     messages = [{"role": "system", "content": build_system_prompt()}]
 
@@ -445,11 +466,8 @@ def run_agent():
     # V15: 上下文压缩器
     compressor = ContextCompressor()
 
-    # V22: 流式开关 — env 默认开；运行期 /stream on|off 切换
-    stream_enabled = os.environ.get("STREAM_ENABLED", "1") not in ("0", "false", "False", "")
-
     print("=" * 60)
-    print("  Nano Hermes Agent v23.2 — 项目上下文注入 + --cwd 启动")
+    print("  Nano Hermes Agent v23.3 — 多智能体流式中继 + 父子 cancel 桥接")
     print(f"  Default MODEL (entries 不内联时回退到此): {model}")
     chain_modes = " → ".join(
         f"{e.api_mode}({e.model})" if e.model else e.api_mode
@@ -502,19 +520,17 @@ def run_agent():
 
     turn_count = 0  # V9: 每轮递增，传给 on_turn_start
 
-    # V22: 全局 cancel token + SIGINT handler
-    # prompt 上 SIGINT → 走 KeyboardInterrupt 退出（Python 默认行为）
-    # LLM 调用期间 SIGINT → 设置 token，stream_call 内部循环 check 后 raise
-    #   StreamCancelled，main 捕获后回到 prompt 不退出
-    # 用一个布尔 `streaming_active` 区分两种语境 — handler 只在流式期间
-    # 翻译为 cancel；prompt 期间让 KeyboardInterrupt 自然抛出
-    cancel_token = CancelToken()
-    streaming_active = {"flag": False}
-
+    # V22 cancel_token / agent_busy 已在 delegate 注入前提前构造（见上方）。
+    # 这里仅注册 SIGINT handler —— 用 agent_busy['flag'] 区分两种语境：
+    # - prompt 期间 SIGINT → 还原默认行为，让 input() 抛 KeyboardInterrupt 退出
+    # - tool loop 期间 SIGINT → cancel_token.cancel()，stream_call / 子 agent
+    #   下一帧 check 后 raise StreamCancelled，main 捕获后回到 prompt 不退出
+    # V23.4: 把判定从"父正在流式"扩到"父在跑 tool loop"，覆盖 delegate 子 agent
+    # 执行期间的 Ctrl+C —— 否则按下后会走 KeyboardInterrupt 退出整个进程。
     def _sigint_handler(signum, frame):
-        if streaming_active["flag"]:
+        if agent_busy["flag"]:
             cancel_token.cancel()
-            # 不抛异常 — stream_call 检查 token 自己 raise StreamCancelled
+            # 不抛异常 — stream_call / 子 loop 检查 token 自己 raise StreamCancelled
         else:
             # prompt 期间 — 还原默认 SIGINT 行为，让 input() 抛 KeyboardInterrupt
             raise KeyboardInterrupt
@@ -538,8 +554,7 @@ def run_agent():
         build_system_prompt=build_system_prompt,
         prompt_builder=prompt_builder,
         skill_loader=skill_loader,
-        stream_enabled=stream_enabled,
-        cancel_token=cancel_token,
+        runtime=runtime,
     )
 
     try:
@@ -587,130 +602,148 @@ def run_agent():
             # 收集本轮 assistant 的最终文本响应（不含 tool call），用于 sync
             final_assistant_text = ""
 
-            while True:
-                # V15: 压缩检查 — API 调用前判断是否需要压缩上下文
-                if compressor.should_compress(messages):
-                    print("  [compress] context exceeds threshold, compacting...")
-                    head_end = compressor.protect_first_n
-                    memory_manager.on_pre_compress_all(messages[head_end:])
-                    # V19: 摘要 LLM 调用也走 chain，享受 failover
-                    # V21.1: 用 in-place 替换避免局部 messages 与 ctx.messages 引用分歧
-                    compacted = compressor.compress(messages, client, model, transport=chain)
-                    messages[:] = compacted
-                    print(f"  [compress] compacted to {len(messages)} messages")
+            # V23.4: 整个 tool loop 期间挂 Esc 监听 + 把 agent_busy 置 True ——
+            # 这样 Ctrl+C / Esc 在父流式、tool 执行、delegate 子 agent 跑任何
+            # 阶段都走 cancel_token.cancel()（不退出进程）。
+            import threading as _threading
+            _esc_stop = _threading.Event()
+            _esc_thread = _threading.Thread(
+                target=_esc_listener,
+                args=(cancel_token, _esc_stop),
+                daemon=True,
+            )
+            cancel_token.reset()
+            agent_busy["flag"] = True
+            _esc_thread.start()
 
-                # 每轮重新计算：check_fn 结果可能变化（如用户中途装了 Docker）
-                tools_schema = get_tool_definitions(ENABLED_TOOLSETS)
-                # V8: 通过 manager 收集所有 provider 的 tool schema
-                provider_schemas = memory_manager.get_all_tool_schemas()
-                all_tools_schema = tools_schema + [
-                    {"type": "function", "function": s} for s in provider_schemas
-                ]
+            try:
+                while True:
+                    # V15: 压缩检查 — API 调用前判断是否需要压缩上下文
+                    if compressor.should_compress(messages):
+                        print("  [compress] context exceeds threshold, compacting...")
+                        head_end = compressor.protect_first_n
+                        memory_manager.on_pre_compress_all(messages[head_end:])
+                        # V19: 摘要 LLM 调用也走 chain，享受 failover
+                        # V21.1: 用 in-place 替换避免局部 messages 与 ctx.messages 引用分歧
+                        compacted = compressor.compress(messages, client, model, transport=chain)
+                        messages[:] = compacted
+                        print(f"  [compress] compacted to {len(messages)} messages")
 
-                # V19: 统一 LLM 调用走 chain — 主家失败自动切备家。
-                # V22: ctx.stream_enabled=True 走流式路径 — 实时打印 token、可中断
-                #      False 退化到 V21 行为 — 一次性返回后整段打印
-                # ValueError 仍按"响应不合法"处理，FailoverExhausted 表示链全挂。
-                normalized = None
-                streamed_text_already = False  # 流式路径已打印过 final text，不再二次打印
-                try:
-                    if ctx.stream_enabled:
-                        cancel_token.reset()
-                        streaming_active["flag"] = True
-                        try:
+                    # 每轮重新计算：check_fn 结果可能变化（如用户中途装了 Docker）
+                    tools_schema = get_tool_definitions(ENABLED_TOOLSETS)
+                    # V8: 通过 manager 收集所有 provider 的 tool schema
+                    provider_schemas = memory_manager.get_all_tool_schemas()
+                    all_tools_schema = tools_schema + [
+                        {"type": "function", "function": s} for s in provider_schemas
+                    ]
+
+                    # V19: 统一 LLM 调用走 chain — 主家失败自动切备家。
+                    # V22: ctx.stream_enabled=True 走流式路径 — 实时打印 token、可中断
+                    #      False 退化到 V21 行为 — 一次性返回后整段打印
+                    # ValueError 仍按"响应不合法"处理，FailoverExhausted 表示链全挂。
+                    normalized = None
+                    streamed_text_already = False  # 流式路径已打印过 final text，不再二次打印
+                    try:
+                        if runtime.stream_enabled:
+                            cancel_token.reset()
                             normalized = _stream_one_turn(
                                 chain, model, messages, all_tools_schema, cancel_token,
                             )
-                        finally:
-                            streaming_active["flag"] = False
-                        if normalized is None:
-                            # StreamCancelled — 用户取消，跳出 tool loop 回到 prompt
-                            # 注意：messages 还没 append assistant，对话历史保持干净
-                            break
-                        # 标记：本轮如果是纯文本响应，已经在 _stream_one_turn 里打印过
-                        streamed_text_already = not normalized.tool_calls
-                    else:
-                        normalized = chain.call(
-                            model=model,
-                            messages=messages,
-                            tools=all_tools_schema,
-                        )
-                except FailoverExhausted as e:
-                    print(f"  [error] all transports failed: {e}")
-                    break
-                except ValueError:
-                    print("  [warn] invalid response shape, skipping turn")
-                    break
+                            if normalized is None:
+                                # StreamCancelled — 用户取消，跳出 tool loop 回到 prompt
+                                # 注意：messages 还没 append assistant，对话历史保持干净
+                                break
+                            # 标记：本轮如果是纯文本响应，已经在 _stream_one_turn 里打印过
+                            streamed_text_already = not normalized.tool_calls
+                        else:
+                            normalized = chain.call(
+                                model=model,
+                                messages=messages,
+                                tools=all_tools_schema,
+                            )
+                    except FailoverExhausted as e:
+                        print(f"  [error] all transports failed: {e}")
+                        break
+                    except ValueError:
+                        print("  [warn] invalid response shape, skipping turn")
+                        break
 
-                # 用 API 返回的真实 token 数更新压缩器（下一轮触发判断用）
-                if normalized.usage and normalized.usage.prompt_tokens:
-                    '''
-                    prompt_tokens — 输入（所有 messages + tools schema）的 token 数
-                    completion_tokens — 本次 assistant 生成的 token 数
-                    total_tokens — 两者之和
-                    '''
-                    compressor.update_usage(normalized.usage.prompt_tokens)
+                    # 用 API 返回的真实 token 数更新压缩器（下一轮触发判断用）
+                    if normalized.usage and normalized.usage.prompt_tokens:
+                        '''
+                        prompt_tokens — 输入（所有 messages + tools schema）的 token 数
+                        completion_tokens — 本次 assistant 生成的 token 数
+                        total_tokens — 两者之和
+                        '''
+                        compressor.update_usage(normalized.usage.prompt_tokens)
 
-                # 把标准化响应回填进对话历史（保持 OpenAI 消息 shape，下一轮 build_kwargs 还能消费）
-                # V15.1: 抢救 content=None + 无 tool_calls 的脏 assistant 消息（reasoning 提升为 content）
-                # 对齐源项目 run_agent.py:9621-9635（DeepSeek/Kimi/Moonshot thinking padding）
-                assistant_dump = build_assistant_history_msg(normalized)
-                messages.append(assistant_dump)
+                    # 把标准化响应回填进对话历史（保持 OpenAI 消息 shape，下一轮 build_kwargs 还能消费）
+                    # V15.1: 抢救 content=None + 无 tool_calls 的脏 assistant 消息（reasoning 提升为 content）
+                    # 对齐源项目 run_agent.py:9621-9635（DeepSeek/Kimi/Moonshot thinking padding）
+                    assistant_dump = build_assistant_history_msg(normalized)
+                    messages.append(assistant_dump)
 
-                if not normalized.tool_calls:
-                    final_assistant_text = normalized.content or ""
-                    if not streamed_text_already:
-                        # 同步路径或流式但从未拿到 text_delta（罕见 — provider 把
-                        # 整段塞 done 帧）— 在 break 前补打一次
-                        print(f"\nAgent > {final_assistant_text}\n")
-                    break
+                    if not normalized.tool_calls:
+                        final_assistant_text = normalized.content or ""
+                        if not streamed_text_already:
+                            # 同步路径或流式但从未拿到 text_delta（罕见 — provider 把
+                            # 整段塞 done 帧）— 在 break 前补打一次
+                            print(f"\nAgent > {final_assistant_text}\n")
+                        break
 
-                for tool_call in normalized.tool_calls:
-                    name = tool_call.function.name
-                    try:
-                        args = json.loads(tool_call.function.arguments)
-                    except json.JSONDecodeError as exc:
-                        from tools.result import tool_error
-                        result = tool_error(
-                            f"invalid tool arguments JSON: {exc}",
-                            raw_arguments=tool_call.function.arguments[:500],
-                        )
-                        print(f"  [tool] {name}(<invalid JSON>)")
-                        print(f"  [error] {exc} — asking LLM to retry")
+                    for tool_call in normalized.tool_calls:
+                        name = tool_call.function.name
+                        try:
+                            args = json.loads(tool_call.function.arguments)
+                        except json.JSONDecodeError as exc:
+                            from tools.result import tool_error
+                            result = tool_error(
+                                f"invalid tool arguments JSON: {exc}",
+                                raw_arguments=tool_call.function.arguments[:500],
+                            )
+                            print(f"  [tool] {name}(<invalid JSON>)")
+                            print(f"  [error] {exc} — asking LLM to retry")
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": result,
+                            })
+                            continue
+                        pretty_args = json.dumps(args, ensure_ascii=False)
+                        print(f"  [tool] {name}({pretty_args})")
+
+                        # V8: 路由 — manager 接管的工具走 manager，其余走 registry
+                        if memory_manager.has_tool(name):
+                            result = memory_manager.handle_tool_call(name, args)
+                        else:
+                            result = registry.dispatch(name, args)
+
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tool_call.id,
                             "content": result,
                         })
-                        continue
-                    pretty_args = json.dumps(args, ensure_ascii=False)
-                    print(f"  [tool] {name}({pretty_args})")
 
-                    # V8: 路由 — manager 接管的工具走 manager，其余走 registry
-                    if memory_manager.has_tool(name):
-                        result = memory_manager.handle_tool_call(name, args)
-                    else:
-                        result = registry.dispatch(name, args)
-
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": result,
-                    })
-
-                    try:
-                        parsed = json.loads(result)
-                        if "error" in parsed:
-                            print(f"  [error] {parsed['error']}")
-                        elif "output" in parsed:
-                            output = parsed["output"]
-                            if len(output) > 200:
-                                output = output[:200] + "..."
-                            print(f"  [result] {output}")
-                        else:
-                            print(f"  [result] (ok)")
-                    except json.JSONDecodeError:
-                        print(f"  [result] {result[:100]}")
+                        try:
+                            parsed = json.loads(result)
+                            if "error" in parsed:
+                                print(f"  [error] {parsed['error']}")
+                            elif "output" in parsed:
+                                output = parsed["output"]
+                                if len(output) > 200:
+                                    output = output[:200] + "..."
+                                print(f"  [result] {output}")
+                            else:
+                                print(f"  [result] (ok)")
+                        except json.JSONDecodeError:
+                            print(f"  [result] {result[:100]}")
+            finally:
+                # V23.4: 收回 busy 状态 + 通知 Esc listener 退出、恢复 termios。
+                # 放 finally 是因为 tool loop 中途任何 break / 异常都得保证 termios
+                # 被还原 —— 否则 prompt_toolkit 下一次 prompt 会继承 cbreak 模式。
+                agent_busy["flag"] = False
+                _esc_stop.set()
+                _esc_thread.join(timeout=1.0)
 
             # V9 生命周期：tool loop 结束后持久化对话
             # sync 用原始 user 输入（不含围栏），保持后端记录干净
