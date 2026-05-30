@@ -8,8 +8,10 @@ ContextCompressor — V15 上下文压缩器（1:1 复现源项目核心设计�
   4. Summarize middle — 用结构化模板 LLM 摘要中间消息
   5. Sanitize tool pairs — 修复孤立的 tool_call/tool_result 对
 
-触发策略：字符数 / 4 近似 token 数，阈值默认 context_window * 0.75。
-Anti-thrashing：连续 2 次压缩节省 <10% 就停止。
+触发策略：只看 API 返回的真实 ``prompt_tokens``（``update_usage`` 喂入）；
+首轮没有真实值前不触发压缩。
+Anti-thrashing：压缩节省比例由"下一轮真实 prompt_tokens"结算（pre 真实 →
+post 真实），连续 2 次 <10% 就停止。
 Iterative update：多次压缩时增量更新旧 summary，不重新摘要全部。
 
 对应源项目：agent/context_compressor.py
@@ -121,37 +123,45 @@ class ContextCompressor:
         self._ineffective_count: int = 0
         self.compression_count: int = 0
         self._last_prompt_tokens: int | None = None
+        # 上一次 compress() 触发时的真实 prompt_tokens；下一次 update_usage 用它
+        # 与新的真实值算"压缩节省了多少"，喂给 anti-thrashing 计数。
+        self._pending_pre_tokens: int | None = None
 
     # ─── 公开 API ────────────────────────────────────────────────────────────
 
     def update_usage(self, prompt_tokens: int) -> None:
-        """接收 API 返回的真实 prompt token 数，用于下一轮触发判断。"""
-        self._last_prompt_tokens = prompt_tokens
+        """接收 API 返回的真实 prompt token 数。
 
-    def estimate_tokens(self, messages: list[dict]) -> int:
-        """粗略估算 messages 的 token 数（字符数 / 4）。"""
-        total_chars = 0
-        for msg in messages:
-            content = msg.get("content")
-            if isinstance(content, str):
-                total_chars += len(content)
-            elif isinstance(content, list):
-                for part in content:
-                    if isinstance(part, dict) and "text" in part:
-                        total_chars += len(part["text"])
-            for tc in msg.get("tool_calls") or []:
-                if isinstance(tc, dict):
-                    args = tc.get("function", {}).get("arguments", "")
-                    total_chars += len(args)
-        return total_chars // _CHARS_PER_TOKEN
+        两件事：
+        1. 缓存为下一轮触发判断的依据（``should_compress`` 只看真实值）
+        2. 若上一轮做过压缩（``_pending_pre_tokens`` 非空），用本次真实值结算
+           节省比例，更新 anti-thrashing 计数
+        """
+        if self._pending_pre_tokens is not None:
+            pre = self._pending_pre_tokens
+            post = prompt_tokens
+            savings_pct = ((pre - post) / pre * 100) if pre > 0 else 0
+            if savings_pct < 10:
+                self._ineffective_count += 1
+            else:
+                self._ineffective_count = 0
+            logger.info(
+                "Compression real savings: ~%d → ~%d tokens (%.0f%% saved, ineffective_count=%d)",
+                pre, post, savings_pct, self._ineffective_count,
+            )
+            self._pending_pre_tokens = None
+
+        self._last_prompt_tokens = prompt_tokens
 
     def should_compress(self, messages: list[dict]) -> bool:
         """判断是否需要压缩。
 
-        条件：
-        1. token 数超过阈值（优先用 API 返回的真实值，无则粗估）
-        2. 消息数足够多（至少 head + 2 条中间 + 3 条 tail）
-        3. anti-thrashing：连续 2 次低效压缩后停止
+        条件（全部满足）：
+        1. 已收到至少一次 API 返回的真实 prompt_tokens（没有就不触发 —
+           不再用 chars/4 粗估）
+        2. 真实值 ≥ 阈值
+        3. 消息数足够多（至少 head + 2 条中间 + 3 条 tail）
+        4. anti-thrashing：连续 2 次低效压缩后停止
         """
         if self._ineffective_count >= 2:
             logger.warning(
@@ -164,19 +174,21 @@ class ContextCompressor:
         if len(messages) < min_messages:
             return False
 
-        token_count = (
-            self._last_prompt_tokens
-            if self._last_prompt_tokens is not None
-            else self.estimate_tokens(messages)
-        )
-        return token_count >= self.threshold_tokens
+        if self._last_prompt_tokens is None:
+            return False
+
+        return self._last_prompt_tokens >= self.threshold_tokens
 
     def compress(self, messages: list[dict], client, model: str, transport) -> list[dict]:
         """五阶段压缩流水线。
 
         返回压缩后的 messages 列表。LLM 调用失败时返回原始 messages。
+
+        Anti-thrashing 节省比例由"下一轮 ``update_usage`` 拿到的真实
+        prompt_tokens"结算 — 不在压缩当下用 chars/4 粗估前后大小。
         """
-        pre_tokens = self.estimate_tokens(messages)
+        # 触发 compress 必走 should_compress=True 路径，_last_prompt_tokens 必非空
+        pre_tokens = self._last_prompt_tokens
 
         # Phase 1: Prune old tool results
         messages = self._prune_old_tool_results(messages)
@@ -210,18 +222,17 @@ class ContextCompressor:
         # Phase 5: Sanitize tool pairs
         compressed = self._sanitize_tool_pairs(compressed)
 
-        # Anti-thrashing tracking
-        post_tokens = self.estimate_tokens(compressed)
-        savings_pct = ((pre_tokens - post_tokens) / pre_tokens * 100) if pre_tokens > 0 else 0
-        if savings_pct < 10:
-            self._ineffective_count += 1
-        else:
-            self._ineffective_count = 0
+        # 把"压缩前真实 prompt_tokens"挂起 — 下一轮 update_usage 拿到压缩后
+        # 真实值时结算节省比例 + ineffective_count
+        self._pending_pre_tokens = pre_tokens
+        # 压缩后 _last_prompt_tokens 仍是旧值，但已经不再代表当前 messages —
+        # 清空让 should_compress 在下一次真实 update_usage 之前不会重复触发
+        self._last_prompt_tokens = None
 
         self.compression_count += 1
         logger.info(
-            "Context compressed: %d → %d messages, ~%d → ~%d tokens (%.0f%% saved)",
-            len(messages), len(compressed), pre_tokens, post_tokens, savings_pct,
+            "Context compressed: %d → %d messages (pre_real=~%d, post awaiting next API call)",
+            len(messages), len(compressed), pre_tokens or 0,
         )
         return compressed
 
@@ -431,7 +442,12 @@ class ContextCompressor:
     # ─── 内部辅助 ────────────────────────────────────────────────────────────
 
     def _msg_tokens(self, msg: dict) -> int:
-        """估算单条消息的 token 数。"""
+        """单条消息的 token 数 — chars/4 近似。
+
+        API 只回总 ``prompt_tokens``，没有 per-message 拆分；切 tail 边界
+        必须按消息分配，所以这里仍走粗估。这条粗估与触发 / 节省判断
+        分离（后两者全用真实值）。
+        """
         content = msg.get("content", "")
         chars = len(content) if isinstance(content, str) else 0
         for tc in msg.get("tool_calls") or []:

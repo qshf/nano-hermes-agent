@@ -1,7 +1,7 @@
 """V15 上下文压缩行为验证脚本。
 
-验证九个关键不变量：
-1. should_compress 阈值判断（低于不触发、超过触发）
+验证关键不变量：
+1. should_compress 阈值判断（只看 API 真实 prompt_tokens；首轮无值不触发）
 2. anti-thrashing — 连续低效压缩后停止
 3. Phase 1 — prune old tool results（大 tool output 被替换）
 4. Phase 2 — tail boundary by token budget（不在 tool msg 上切割）
@@ -10,6 +10,7 @@
 7. Phase 5 — sanitize tool pairs（孤立 result 被删、缺失 result 补 stub）
 8. on_pre_compress_all 广播到 provider
 9. RemoteSemanticProvider 的 on_pre_compress 入队 retain
+10. 真实 token 节省结算（pre 真实 → 下一轮 update_usage 结算 ineffective）
 """
 
 from __future__ import annotations
@@ -71,27 +72,45 @@ def _mock_client(summary_text: str = "## Active Task\nTest task") -> MagicMock:
     return mock
 
 
+class _FakeTransport:
+    """V19+: compressor 走 transport.call(...) 拿摘要。"""
+    def __init__(self, summary_text: str = "## Active Task\nTest task") -> None:
+        self.summary_text = summary_text
+        self.last_messages: list[dict] | None = None
+
+    def call(self, client=None, *, model: str, messages: list[dict], **_):
+        self.last_messages = list(messages)
+        normalized = MagicMock()
+        normalized.content = self.summary_text
+        return normalized
+
+
+def _fake_transport(summary_text: str = "## Active Task\nTest task") -> _FakeTransport:
+    return _FakeTransport(summary_text)
+
+
 # ─── Tests ───
 
 
 def test_1_should_compress_threshold():
-    """低于阈值不触发，超过阈值触发；update_usage 优先于粗估。"""
+    """触发只看 API 真实 prompt_tokens；首轮没有真实值前不触发。"""
     compressor = ContextCompressor(context_window=2000, threshold_percent=0.5)
     # threshold = 1000 tokens
 
-    short_msgs = _make_messages(8, char_per_msg=50)  # ~100 tokens
-    assert not compressor.should_compress(short_msgs), "Should NOT compress below threshold"
+    short_msgs = _make_messages(8, char_per_msg=50)
+    long_msgs = _make_messages(30, char_per_msg=200)
 
-    long_msgs = _make_messages(30, char_per_msg=200)  # ~1500 tokens
-    assert compressor.should_compress(long_msgs), "Should compress above threshold"
+    # 首轮没有 update_usage —— 不论消息长短都不触发
+    assert not compressor.should_compress(short_msgs), "no Usage yet → no trigger"
+    assert not compressor.should_compress(long_msgs), "no Usage yet → no trigger (even if long)"
 
-    # update_usage 优先：即使消息短，API 报告的 token 数超阈值也触发
+    # update_usage 喂入超阈值的真实值 —— 触发
     compressor.update_usage(1200)
-    assert compressor.should_compress(short_msgs), "Should use real usage over estimation"
+    assert compressor.should_compress(short_msgs), "real prompt_tokens above threshold → trigger"
 
-    # update_usage 优先：即使消息长，API 报告的 token 数低于阈值也不触发
+    # update_usage 喂入低于阈值 —— 不触发
     compressor.update_usage(500)
-    assert not compressor.should_compress(long_msgs), "Real usage below threshold should skip"
+    assert not compressor.should_compress(long_msgs), "real prompt_tokens below threshold → skip"
 
     print("  [PASS] test_1_should_compress_threshold")
 
@@ -100,6 +119,7 @@ def test_2_anti_thrashing():
     """连续 2 次低效压缩后 should_compress 返回 False。"""
     compressor = ContextCompressor(context_window=2000, threshold_percent=0.5)
     compressor._ineffective_count = 2
+    compressor.update_usage(1500)  # 真实值超阈值
 
     long_msgs = _make_messages(30, char_per_msg=200)
     assert not compressor.should_compress(long_msgs), "Should skip after 2 ineffective compressions"
@@ -172,25 +192,20 @@ def test_5_iterative_update():
     """Phase 3: 第二次压缩使用 iterative update（prompt 包含 PREVIOUS SUMMARY）。"""
     compressor = ContextCompressor(context_window=2000, threshold_percent=0.3, tail_token_budget=200)
 
-    mock = _mock_client("## Active Task\nFirst summary")
+    transport = _fake_transport("## Active Task\nFirst summary")
     messages = _make_messages(20, char_per_msg=100)
-    compressor.compress(messages, mock, "test-model")
+    compressor.update_usage(1500)
+    compressor.compress(messages, client=None, model="test-model", transport=transport)
 
     assert compressor._previous_summary == "## Active Task\nFirst summary"
 
-    # 第二次压缩
-    mock2 = _mock_client("## Active Task\nUpdated summary")
+    # 第二次压缩 —— update_usage 既结算上一次 pending，又喂入超阈值新真实值
+    transport2 = _fake_transport("## Active Task\nUpdated summary")
     messages2 = _make_messages(20, char_per_msg=100)
-    compressor.compress(messages2, mock2, "test-model")
+    compressor.update_usage(1500)
+    compressor.compress(messages2, client=None, model="test-model", transport=transport2)
 
-    # 验证第二次调用的 prompt 包含 PREVIOUS SUMMARY
-    call_args = mock2.chat.completions.create.call_args
-    prompt_content = call_args[1]["messages"][0]["content"] if call_args[1] else call_args[0][0]
-    if hasattr(call_args, "kwargs"):
-        prompt_content = call_args.kwargs["messages"][0]["content"]
-    else:
-        prompt_content = mock2.chat.completions.create.call_args[1]["messages"][0]["content"]
-
+    prompt_content = transport2.last_messages[0]["content"]
     assert "PREVIOUS SUMMARY" in prompt_content, "Second compression should use iterative update"
     assert "First summary" in prompt_content, "Should include previous summary content"
 
@@ -202,14 +217,14 @@ def test_6_compress_structure():
     compressor = ContextCompressor(context_window=2000, threshold_percent=0.3, tail_token_budget=300)
 
     messages = _make_messages(20, char_per_msg=100)
-    mock = _mock_client()
-    result = compressor.compress(messages, mock, "test-model")
+    transport = _fake_transport()
+    compressor.update_usage(1500)
+    result = compressor.compress(messages, client=None, model="test-model", transport=transport)
 
     # 第一条应该是 system
     assert result[0]["role"] == "system"
     assert result[0]["content"] == messages[0]["content"]
 
-    # 应该有一条 summary message 带 COMPACTION 前缀
     summary_found = False
     for msg in result:
         if isinstance(msg.get("content"), str) and SUMMARY_PREFIX in msg["content"]:
@@ -217,7 +232,6 @@ def test_6_compress_structure():
             break
     assert summary_found, "Should contain summary with COMPACTION prefix"
 
-    # 总长度应该远小于原始
     assert len(result) < len(messages), "Compressed should be shorter"
 
     print("  [PASS] test_6_compress_structure")
@@ -324,6 +338,41 @@ def test_9_remote_provider_enqueues_retain():
     print("  [PASS] test_9_remote_provider_enqueues_retain")
 
 
+def test_10_real_token_savings_settlement():
+    """真实 token 节省结算：compress 挂起 _pending_pre_tokens，下一轮
+    update_usage 用真实 prompt_tokens 计算节省比例 + 更新 ineffective_count。"""
+    compressor = ContextCompressor(context_window=2000, threshold_percent=0.3, tail_token_budget=200)
+
+    # 第一次：节省 50%（pre=1500 → post=750）
+    transport = _fake_transport()
+    messages = _make_messages(20, char_per_msg=100)
+    compressor.update_usage(1500)
+    assert compressor.should_compress(messages)
+    compressor.compress(messages, client=None, model="m", transport=transport)
+    assert compressor._pending_pre_tokens == 1500, "compress should stash real pre"
+    assert compressor._last_prompt_tokens is None, "compress should clear stale last value"
+
+    compressor.update_usage(750)  # 模拟下一次 API 真实回报
+    assert compressor._ineffective_count == 0, "50% savings → effective"
+    assert compressor._pending_pre_tokens is None, "settled"
+    assert compressor._last_prompt_tokens == 750
+
+    # 第二次：节省 5%（低效）—— 计数 +1
+    compressor.update_usage(1600)
+    compressor.compress(messages, client=None, model="m", transport=_fake_transport())
+    compressor.update_usage(1520)
+    assert compressor._ineffective_count == 1, "5% savings → ineffective"
+
+    # 第三次：再次低效 —— 累计到 2，触发 anti-thrashing
+    compressor.update_usage(1600)
+    compressor.compress(messages, client=None, model="m", transport=_fake_transport())
+    compressor.update_usage(1530)
+    assert compressor._ineffective_count == 2
+    assert not compressor.should_compress(messages), "anti-thrashing kicks in"
+
+    print("  [PASS] test_10_real_token_savings_settlement")
+
+
 # ─── 运行 ───
 
 if __name__ == "__main__":
@@ -341,6 +390,7 @@ if __name__ == "__main__":
         test_7_sanitize_tool_pairs,
         test_8_on_pre_compress_all_broadcasts,
         test_9_remote_provider_enqueues_retain,
+        test_10_real_token_savings_settlement,
     ]
 
     passed = 0
