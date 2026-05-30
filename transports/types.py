@@ -63,10 +63,10 @@ class Usage:
     chain 能准确区分"省了多少钱"和"花了多少钱写入缓存"。
     """
 
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-    cached_tokens: int = 0
+    prompt_tokens: int = 0 #  输入规模
+    completion_tokens: int = 0 # 输出规模
+    total_tokens: int = 0 # 总规模（prompt + completion）
+    cached_tokens: int = 0 # 从缓存读取的 token 数（V20: Anthropic cache_read_tokens）
     cache_creation_tokens: int = 0  # V20: Anthropic cache_creation_input_tokens
 
 
