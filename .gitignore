@@ -8,7 +8,7 @@ docs/social
 .vscode
 
 skills/novel-writing
-
+test-deepseek-模型幻觉.py
 # V24.0 会话持久化库（SQLite + WAL 旁路文件）—— 本地状态不入库
 sessions/
 *.db

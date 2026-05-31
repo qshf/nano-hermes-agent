@@ -27,5 +27,7 @@
 | v23.2 | 项目上下文注入 + --cwd 启动（nano-hermes-agent.md / AGENTS.md / 跨项目可用） | [v23.2.md](./v23.2.md) |
 | v23.3 | 多智能体流式中继 + 父子 cancel 桥接（progress 走 stderr / 父子共享 CancelToken / interrupted 状态） | [v23.3.md](./v23.3.md) |
 | v23.4 | 多智能体结构化结果 + 父子成本聚合（统一 results JSON / runtime.session_tokens / tool_trace） | [v23.4.md](./v23.4.md) |
+| v24.0 | 会话状态持久化（SQLite 会话子系统 + 真 resume / 全量删重插 / `/sessions`） | [v24.0.md](./v24.0.md) |
+| v24.1 | append-only 写入迁移 + 压缩链（会话分裂 + resume 重定向到 tip + 列表折叠） | [v24.1.md](./v24.1.md) |
 
 > 注：V8 的决策记录散落在对应的 commit message 与 [docs/Memory-system/](../Memory-system/) 子目录下，未来如有补录需求再回填本目录。V15 主决策（5 阶段压缩流水线）当时未单独建档，本目录从 v15.1 开始接力补完。

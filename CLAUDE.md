@@ -8,7 +8,7 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到挂载长期记忆 + 多智能体 + 跨项目可用。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v24.0 — 会话状态持久化（SQLite 会话子系统 + 真 resume）。详见 [docs/decisions/v24.0.md](docs/decisions/v24.0.md)。
+- **当前阶段**：v24.1 — append-only 写入迁移 + 压缩链（会话分裂 + resume 重定向到 tip + 列表折叠）。详见 [docs/decisions/v24.1.md](docs/decisions/v24.1.md)。
 - **演进主轴**：内存（v6→v16）→ transport（v17→v20）→ 交互层（v21.x）→ 流式（v22）→ 多智能体（v23.x）→ 会话持久化（v24.x）。
 
 ---
@@ -19,13 +19,13 @@
 |------|---------|-----------|
 | 源项目 | `/Users/qshf/my-project/hermes-agent` | `https://github.com/qshf/hermes-agent` |
 | nano | `/Users/qshf/my-project/nano_hermes_agent` | `git@github.com:qshf/nano-hermes-agent.git` |
-| 当前分支 | `delegate/v0.23.4`（基于 v0.23.1 + v15.1 修复档；v23.3/v23.4 已各建同名分支指针，均推远端） | — |
+| 当前分支 | `session/v0.24.1`（基于 `session/v0.24.0`；v24.0/v24.1 均建同名分支指针） | — |
 
 **跨目录硬约束**：源项目和 nano 不在同一目录。"对照源项目读 X 文件"的操作必须用源项目绝对路径，例如 `/Users/qshf/my-project/hermes-agent/plugins/memory/hindsight/__init__.py`。
 
 ---
 
-## 3. 进度状态（29 档）
+## 3. 进度状态（30 档）
 
 每档"引入概念"只列关键词；细节看 [docs/decisions/v<N>.md](docs/decisions/README.md)。
 
@@ -47,9 +47,10 @@
 | v23.2 | 跨项目可用 | `--cwd PATH` + nano-hermes-agent.md / AGENTS.md 注入 / NANO_IGNORE_RULES |
 | v23.3 | 多智能体流式中继 + 父子 cancel | stream_enabled 透传到 child_loop / progress 走 stderr / 共享 CancelToken / interrupted 状态 |
 | v23.4 | 多智能体结构化结果 + 成本聚合 | 统一 `{"results":[...]}` JSON / runtime.session_tokens 4 维 / tool_trace + duration / `/transport` 末尾 session 行 |
-| **v24.0** | **会话状态持久化（SQLite + 真 resume）** | **`agent/session_store.py`：sessions + messages 两表 / WAL / 全量删重插 / 剔除 system / 轮末+退出 save / `/resume` 真 load / `/sessions` 列表** |
+| v24.0 | 会话状态持久化（SQLite + 真 resume） | `agent/session_store.py`：sessions + messages 两表 / WAL / 全量删重插 / 剔除 system / 轮末+退出 save / `/resume` 真 load / `/sessions` 列表 |
+| **v24.1** | **append-only + 压缩链** | **`append()` 无状态游标（`COUNT(*)`）只增不删 / 压缩点会话分裂（`end_session`+`create_session`+换 id）抽到 `agent/compaction.py::apply_compaction`（自动压缩 + 手动 `/compress` 共用）/ `resolve_resume_tip` 无条件走到 tip / `list_sessions(fold_chains)` 折叠 + `/sessions --all` 展开** |
 
-**下一档候选**：v24.1 append-only 游标 + 压缩链（会话分裂 + parent 串链 + resume 重定向到 tip）/ v15.2 prefill retry / v23.5 嵌套 delegate（role: orchestrator + max_spawn_depth）。
+**下一档候选**：v15.2 prefill retry / v23.5 嵌套 delegate（role: orchestrator + max_spawn_depth）/ v24.2 会话级锁修 last-write-wins / FTS5 全文检索。
 
 ---
 
@@ -139,7 +140,8 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 # 现有：v12_e2e/writer, v13_prefetch, v14_session_switch, v15_compress, v15_1_compress_boundary,
 #       v16_batch_decay/leiyu_recall_trace, v17_transport, v18_anthropic, v19_failover,
 #       v20_prompt_cache, v21_slash, v21_2_prompt_builder, v21_3_skill, v21_4_tool_result_protocol,
-#       v22_streaming, v23_0_delegate, v23_1_batch, v23_2_project_context, v23_3_streaming, v23_4_structured_result
+#       v22_streaming, v23_0_delegate, v23_1_batch, v23_2_project_context, v23_3_streaming, v23_4_structured_result,
+#       v24_0_session_store, v24_1_compaction_chain
 
 # 看当前装了几个 skill
 ls /Users/qshf/my-project/nano_hermes_agent/skills/

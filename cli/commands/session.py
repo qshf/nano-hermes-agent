@@ -9,8 +9,12 @@ V21.2 起：system prompt 重建优先走 ``ctx.prompt_builder.build()``；
 往往不构造完整 PromptBuilder）。
 
 V24.0 起：``/resume`` 真 load —— 从 ``ctx.session_store`` 读回历史 messages，
-而非 v14 那样只清成 system prompt（假 resume）。``/new`` 切走前先 ``save``
-固化旧会话，避免半截对话蒸发。新增 ``/sessions`` 列出所有已存会话。
+而非 v14 那样只清成 system prompt（假 resume）。``/new`` 切走前先固化旧会话，
+避免半截对话蒸发。新增 ``/sessions`` 列出所有已存会话。
+
+V24.1 起：固化改走 ``append``（append-only，只增不删）；``/resume`` 先
+``resolve_resume_tip`` 把旧 id 重定向到压缩链最新 tip（重定向时打提示）；
+``/sessions`` 默认折叠压缩链（一条逻辑对话一行），``--all`` 展开看压缩前节点。
 """
 
 import time
@@ -34,10 +38,14 @@ def _restore_session_tokens(ctx: AgentCtx, tokens: dict) -> None:
 
 
 def _persist_current(ctx: AgentCtx) -> None:
-    """切走前固化当前会话 —— /new / /resume 共用。store 缺失（单测 mock）则跳过。"""
+    """切走前固化当前会话 —— /new / /resume 共用。store 缺失（单测 mock）则跳过。
+
+    V24.1：用 append（append-only，只增不删）取代 v24.0 的 save。幂等 —— 已写的
+    不重插，游标自动续上；切走前把当前会话最新增量落底。
+    """
     if ctx.session_store is None:
         return
-    ctx.session_store.save(
+    ctx.session_store.append(
         ctx.current_session_id,
         ctx.messages,
         turn_count=ctx.turn_count,
@@ -89,7 +97,7 @@ def cmd_new(args: str, ctx: AgentCtx) -> None:
 
 @command(
     "/resume",
-    description="Resume an existing session by id (real load — V24.0)",
+    description="Resume an existing session by id (real load — V24.0; redirects to compaction tip — V24.1)",
     args_hint="<session_id>",
     category="session",
 )
@@ -102,45 +110,63 @@ def cmd_resume(args: str, ctx: AgentCtx) -> None:
         print("  [session] no session store (persistence disabled)")
         return
 
+    # V24.1: 先沿压缩链重定向到最新 tip —— 用户敲的旧 id 若已被压缩分裂封存，
+    # 跳到压缩后连续点（旧 root 虽留全文但 resume 它会立刻触发重压）。无链则原样。
+    tip = ctx.session_store.resolve_resume_tip(target)
+
     # V24.0: 先真 load —— 不存在则友好报错，**不动当前对话**（不像 v14 直接清空）
-    data = ctx.session_store.load(target)
+    data = ctx.session_store.load(tip)
     if data is None:
         print(f"  [session] No saved session: {target}")
         return
 
-    # 命中后：先固化当前会话，再切到 target
+    # 命中后：先固化当前会话，再切到 tip
     _persist_current(ctx)
-    ctx.memory_manager.on_session_switch_all(target, reset=False)
-    ctx.current_session_id = target
+    ctx.memory_manager.on_session_switch_all(tip, reset=False)
+    ctx.current_session_id = tip
     ctx.messages[:] = (
         [{"role": "system", "content": _rebuild_system_prompt(ctx)}] + data["messages"]
     )
     ctx.turn_count = data["turn_count"]
     _restore_session_tokens(ctx, data["session_tokens"])
-    print(
-        f"  [session] Resumed: {target} "
-        f"({len(data['messages'])} msgs, turn {data['turn_count']})"
-    )
+    if tip != target:
+        print(
+            f"  [session] Resumed: {tip} "
+            f"(redirected from {target} — compacted, {len(data['messages'])} msgs)"
+        )
+    else:
+        print(
+            f"  [session] Resumed: {tip} "
+            f"({len(data['messages'])} msgs, turn {data['turn_count']})"
+        )
 
 
 @command(
     "/sessions",
-    description="List all saved sessions (most-recent first)",
+    description="List saved sessions (most-recent first; --all unfolds compaction chains — V24.1)",
+    args_hint="[--all]",
     category="session",
 )
 def cmd_sessions(args: str, ctx: AgentCtx) -> None:
     if ctx.session_store is None:
         print("  [session] no session store (persistence disabled)")
         return
-    rows = ctx.session_store.list_sessions()
+    # V24.1: 默认折叠压缩链（一条逻辑对话只显示 tip 一行）；--all 展开看压缩前节点
+    fold = "--all" not in args.split()
+    rows = ctx.session_store.list_sessions(fold_chains=fold)
     if not rows:
         print("  [sessions] (none)")
         return
-    print(f"  [sessions] {len(rows)} saved")
+    suffix = "" if fold else " (--all: chains unfolded)"
+    print(f"  [sessions] {len(rows)} saved{suffix}")
     for s in rows:
         marker = "*" if s["session_id"] == ctx.current_session_id else " "
+        # --all 模式下标出压缩链子节点（有 parent）
+        chain = ""
+        if not fold and s.get("parent_session_id"):
+            chain = f"  ↳parent={s['parent_session_id']}"
         print(
             f"  {marker} {s['session_id']}  "
             f"{s['turn_count']}turns  {s['msg_count']}msgs  "
-            f"{_fmt_age(s['updated_at'])}  {s['preview']}"
+            f"{_fmt_age(s['updated_at'])}  {s['preview']}{chain}"
         )

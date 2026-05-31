@@ -156,6 +156,7 @@ from transports.streaming import (
 )
 from transports.types import build_assistant_history_msg
 from agent import PromptBuilder, SkillLoader
+from agent.compaction import apply_compaction
 from agent.runtime import AgentRuntime, SESSION_TOKEN_KEYS
 from agent.session_store import SessionStore
 import cli  # 触发 cli/commands 下所有命令的装饰器注册
@@ -495,8 +496,11 @@ def run_agent():
     # 存档，把历史挂回 messages（system 重建在前 + 历史在后），并恢复
     # turn_count / runtime.session_tokens —— 这一步就是 v24.0 修掉假 resume 的
     # 核心：进程重启后同一 MEMORY_SESSION_ID 能续上对话。
+    # V24.1: 启动先 resolve_resume_tip —— 若该 session 曾被压缩分裂（成了链 root），
+    # 跳到压缩后最新 tip，避免重载压缩前超长 root 后下一轮立刻重压。
     session_store = SessionStore()
     resumed_note = "new"
+    current_session_id = session_store.resolve_resume_tip(current_session_id)
     _saved = session_store.load(current_session_id)
     if _saved is not None and _saved["messages"]:
         messages.extend(_saved["messages"])
@@ -659,15 +663,24 @@ def run_agent():
             try:
                 while True:
                     # V15: 压缩检查 — API 调用前判断是否需要压缩上下文
+                    # V24.1: 压缩 + 会话分裂统一走 agent.compaction.apply_compaction
+                    # （与手动 /compress 共用同一实现，避免两条路径行为漂移 / 丢数据）。
+                    # apply_compaction 全程读写 ctx：调用前把局部 session_id/turn_count
+                    # 同步进 ctx，调用后读回（auto 路径的 turn_count 此刻已 +1，ctx 直到
+                    # 轮末才同步，所以这里手动对齐一次）。
                     if compressor.should_compress(messages):
                         print("  [compress] context exceeds threshold, compacting...")
-                        head_end = compressor.protect_first_n
-                        memory_manager.on_pre_compress_all(messages[head_end:])
-                        # V19: 摘要 LLM 调用也走 chain，享受 failover
-                        # V21.1: 用 in-place 替换避免局部 messages 与 ctx.messages 引用分歧
-                        compacted = compressor.compress(messages, client, model, transport=chain)
-                        messages[:] = compacted
-                        print(f"  [compress] compacted to {len(messages)} messages")
+                        ctx.current_session_id = current_session_id
+                        ctx.turn_count = turn_count
+                        did = apply_compaction(ctx)
+                        current_session_id = ctx.current_session_id
+                        if did:
+                            print(
+                                f"  [compress] split → {current_session_id} "
+                                f"({len(messages)} msgs live, pre-compaction archived)"
+                            )
+                        else:
+                            print("  [compress] skipped (no effective compaction)")
 
                     # 每轮重新计算：check_fn 结果可能变化（如用户中途装了 Docker）
                     tools_schema = get_tool_definitions(ENABLED_TOOLSETS)
@@ -799,12 +812,12 @@ def run_agent():
             # V21.1: 同步本轮 turn_count 到 ctx（messages / session_id 已通过引用共享）
             ctx.turn_count = turn_count
 
-            # V24.0: 轮末持久化 —— 全量删重插当前 messages 视图（剔除 system）。
-            # 放在 sync_all 之后，保证即使进程随后 crash，也只丢"未走到这里"的
-            # 当轮（轮末写的不变量：crash 最多丢一轮）。current_session_id 可能被
-            # 本轮 slash 改过（理论上 slash 在 tool loop 前 continue 了，不会到
-            # 这里），用 ctx 上的当前值最稳妥。
-            session_store.save(
+            # V24.1: 轮末持久化 —— append-only 只追加游标之后的新消息（剔除
+            # system）。放在 sync_all 之后，保证即使进程随后 crash 也只丢"未走到
+            # 这里"的当轮。current_session_id 可能被压缩分裂改过（见 tool loop 内
+            # 的分裂回调），用 ctx 上的当前值最稳妥。append 取代 v24.0 的 save：
+            # 只增不删，压缩前全文永久留在被分裂封存的旧 session 里。
+            session_store.append(
                 ctx.current_session_id,
                 messages,
                 turn_count=turn_count,
@@ -812,11 +825,12 @@ def run_agent():
                 session_tokens=runtime.session_tokens,
             )
     finally:
-        # V24.0: 退出兜底 —— 固化当前会话最后状态 + 关库。覆盖"轮中途按 quit /
-        # Ctrl+D 退出"的边界（轮末写没走到）。close() 让 WAL checkpoint 回主库。
-        # 包 try 防 save 失败遮蔽 memory shutdown（两者都要尽力跑完）。
+        # V24.1: 退出兜底 —— append 当前会话残余 + 关库。覆盖"轮中途按 quit /
+        # Ctrl+D 退出"的边界（轮末写没走到）。append 幂等：已写的不重插，游标自动
+        # 续上。close() 让 WAL checkpoint 回主库。包 try 防 save 失败遮蔽 memory
+        # shutdown（两者都要尽力跑完）。
         try:
-            session_store.save(
+            session_store.append(
                 ctx.current_session_id,
                 messages,
                 turn_count=ctx.turn_count,

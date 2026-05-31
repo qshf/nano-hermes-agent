@@ -1,4 +1,4 @@
-"""V24.0 — 会话状态持久化（SQLite 会话子系统 + 真 resume）。
+"""V24.0/V24.1 — 会话状态持久化（SQLite 会话子系统 + 真 resume + 压缩链）。
 
 这一档解决 v14 的 **假 resume** —— v14 只落了 ``on_session_switch`` 生命周期
 钩子（给 memory manager 切 bank key），**从没把对话 messages 存过盘**。结果
@@ -6,29 +6,32 @@
 拿不回任何历史；进程一退，整段对话蒸发。
 
 本模块让 ``messages`` 成为可持久化的真实实体：
-- 每轮末 / 退出时 ``save`` 到 SQLite（``sessions/state.db``）
+- 每轮末 / 退出时 ``append`` 到 SQLite（``sessions/state.db``）
 - ``/resume <id>`` 真正 ``load`` 回历史对话
+- 压缩点会话分裂，压缩前全文封存在旧 session、可回溯（V24.1）
+
+**V24.0 → V24.1 演进**（同一文件两档）：
+- V24.0：``save`` 全量删重插 + 真 resume + ``/sessions`` —— 独立修掉假 resume。
+- V24.1：新增 ``append`` 走 append-only 游标（只增不删）+ 压缩链三件套
+  （``end_session`` / ``create_session`` / ``resolve_resume_tip``）+ ``list_sessions``
+  折叠。生产路径切到 ``append``；``save`` 保留（v24.0 测试 + 全量重写语义仍可用）。
+  为什么必须从全量重写改起：全量删重插会让压缩后旧消息被覆盖丢失，与"压缩前
+  可回溯"冲突；append-only 只增不删才是源项目"压缩前历史永久留旧 session"的根因。
 
 源项目对照：``hermes-agent/hermes_state.py``（SQLite 会话存储核心，
 SCHEMA_VERSION=11、30+ 字段、WAL + FTS5 + append-only 游标 + 压缩链）。
-nano v24.0 取最小够用切片：
+nano 取最小够用切片：
 
-| 维度 | 源项目 | nano v24.0 |
+| 维度 | 源项目 | nano v24.1 |
 |------|--------|-----------|
 | 后端 | SQLite + WAL + FTS5 三元组 CJK | SQLite + WAL（无 FTS）|
-| 写入 | append-only（游标只追加） | **全量删重插**（决策 2：v24.0 过渡形态，v24.1 迁 append-only）|
-| 会话表 | 30+ 字段 | 13 字段（4 维 token 摊平 + 压缩链 3 字段预留）|
-| Resume | resolve 沿链重定向到 tip | 直接 load target（重定向归 v24.1）|
-| 压缩 | 会话分裂 + parent 串链 | 不碰（归 v24.1）|
+| 写入 | append-only（游标只追加） | **append-only**（``COUNT(*)`` 当无状态游标）|
+| 会话表 | 30+ 字段 | 13 字段（4 维 token 摊平 + 压缩链 3 字段）|
+| Resume | resolve 沿链重定向（root 有消息则短路） | **无条件走到 tip**（教学版要"resume=压缩后最新点"）|
+| 压缩 | 会话分裂 + parent 串链 + ``started_at>=ended_at`` 判压缩子 | 会话分裂 + parent 串链（库只含压缩链，无需判别）|
 
-**为什么 v24.0 用全量删重插而非 append-only**（决策 2）：
-append-only 与压缩链绑死 —— append-only 下一旦 in-place 压缩，游标与变短的
-messages 错位，必须靠会话分裂化解。这俩进不了第一档。全量重写简单、能独立
-修掉假 resume、切割面干净，先交付。v24.1 再迁 append-only + 压缩链（~30 行
-返工换 v24.0 独立上线 + 里程碑清晰）。
-
-**schema 一次建全**（含 v24.1 才写的 ``parent_session_id`` / ``ended_at`` /
-``end_reason``）—— 避免 v24.1 改表。v24.0 只是不往这些列写值。
+**schema 一次建全**（v24.0 即含 ``parent_session_id`` / ``ended_at`` /
+``end_reason``）—— v24.1 只是开始往这些列写值，不改表。
 """
 
 from __future__ import annotations
@@ -149,6 +152,139 @@ class SessionStore:
                 session_id, created_at, now, turn_count, model, tokens
             )
 
+    def append(
+        self,
+        session_id: str,
+        messages: list[dict],
+        *,
+        turn_count: int = 0,
+        model: str = "",
+        session_tokens: Optional[dict[str, int]] = None,
+    ) -> None:
+        """V24.1 append-only：只追加"游标之后"的新消息，**绝不 DELETE 旧消息**。
+
+        游标无状态 = ``COUNT(*) WHERE session_id``（已写条数）。剔除 system 后，
+        索引 ≥ 游标的消息才插 —— 重启 / resume 后游标自动正确，不在内存存
+        ``_last_flushed_idx``。
+
+        与 v24.0 ``save`` 的本质差异：``save`` 全量删重插（in-place 压缩让
+        messages 变短时，旧消息被覆盖丢失）；``append`` 只增不删，所以压缩前的
+        完整历史永久留在旧 session 行里 —— 这正是决策 2/7 "压缩前可回溯"的根因。
+
+        与 in-place 压缩的冲突靠会话分裂化解（决策 7）：压缩点 ``end_session`` +
+        ``create_session`` 换 ``session_id``，新 session ``COUNT(*)=0`` → 游标归零，
+        下一轮从 seq 0 起插压缩后视图。每个 ``session_id`` 的 messages 只增不减。
+
+        ``persistable`` 短于已写条数时（理论上不该发生 —— 同一 session 不该缩，
+        缩了说明该走分裂换 id），``range`` 为空 → no-op，旧行原样保留。
+        """
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+        persistable = [m for m in messages if m.get("role") != "system"]
+        now = time.time()
+        tokens = session_tokens or {}
+        with self.conn:  # 事务：游标读 + 增量插 + upsert 元数据一致提交
+            row = self.conn.execute(
+                "SELECT created_at FROM sessions WHERE session_id=?", (session_id,)
+            ).fetchone()
+            created_at = row["created_at"] if row else now
+            already = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE session_id=?", (session_id,)
+            ).fetchone()["n"]
+            for seq in range(already, len(persistable)):
+                self._insert_message(session_id, seq, persistable[seq])
+            self._upsert_session(
+                session_id, created_at, now, turn_count, model, tokens
+            )
+
+    def end_session(self, session_id: str, reason: str) -> None:
+        """V24.1：给会话打 ``ended_at`` + ``end_reason`` 标，**不动 messages**。
+
+        压缩分裂的第二步：封存旧 session。封存后旧 session 仍能 ``load`` 出全文 ——
+        这是"压缩前可回溯"的核心（决策 7）。会话不存在则 UPDATE 影响 0 行（no-op）。
+        """
+        with self.conn:
+            self.conn.execute(
+                "UPDATE sessions SET ended_at=?, end_reason=? WHERE session_id=?",
+                (time.time(), reason, session_id),
+            )
+
+    def create_session(
+        self,
+        session_id: str,
+        *,
+        parent_session_id: Optional[str] = None,
+        model: str = "",
+        turn_count: int = 0,
+    ) -> None:
+        """V24.1：建压缩分裂的子 session 行。
+
+        游标天然为 0（新行无 messages）→ 下一轮 ``append`` 从 seq 0 起插压缩后视图。
+        ``parent_session_id`` 把子串到旧 session 上，构成压缩链。nano 库只含压缩链
+        （delegate 子不入库，决策 8），故任何 ``parent_session_id`` 都是压缩链接 ——
+        无需源项目 ``started_at >= ended_at`` 那种"压缩子 vs delegate 子"的判别。
+        """
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO sessions (session_id, created_at, updated_at, "
+                "turn_count, model, parent_session_id) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(session_id) DO UPDATE SET "
+                "parent_session_id=excluded.parent_session_id",
+                (session_id, now, now, turn_count, model, parent_session_id),
+            )
+
+    def resolve_resume_tip(self, session_id: str) -> str:
+        """V24.1：沿 ``parent_session_id`` 往子代走到压缩链最末 tip。
+
+        让"一条逻辑对话"默认恢复到压缩后的最新连续点，而非停在压缩断点的旧
+        root（旧 root 虽留着压缩前全文，但 resume 它会拿回超长对话、下一轮立刻
+        重压）。无子代的普通 / tip 会话原样返回。深度上限 32 防环。
+
+        **与源项目的取舍**：源 ``resolve_resume_session_id`` 在"root 自己有消息"
+        时短路返回 root；nano 改用 ``get_compression_tip`` 那种无条件走到 tip 的
+        语义 —— 教学版要的就是"resume = 压缩后的最新点"，且 nano 库只有压缩链、
+        不会把 delegate 子混进来误导走向。压缩前 root 默认对用户隐藏（列表折叠），
+        想回溯走 ``load(root_id)`` 直读或 ``/sessions --all``。
+        """
+        if not session_id:
+            return session_id
+        current = session_id
+        seen = {current}
+        for _ in range(32):
+            child = self.conn.execute(
+                "SELECT session_id FROM sessions WHERE parent_session_id=? "
+                "ORDER BY created_at DESC, session_id DESC LIMIT 1",
+                (current,),
+            ).fetchone()
+            if child is None:
+                return current
+            cid = child["session_id"]
+            if not cid or cid in seen:
+                return current
+            seen.add(cid)
+            current = cid
+        return current
+
+    def _chain_root(self, session_id: str) -> str:
+        """沿 ``parent_session_id`` 往上走到压缩链 root（折叠列表取 origin 预览用）。"""
+        current = session_id
+        seen = {current}
+        for _ in range(32):
+            row = self.conn.execute(
+                "SELECT parent_session_id FROM sessions WHERE session_id=?", (current,)
+            ).fetchone()
+            if row is None or not row["parent_session_id"]:
+                return current
+            parent = row["parent_session_id"]
+            if parent in seen:
+                return current
+            seen.add(parent)
+            current = parent
+        return current
+
     def _insert_message(self, session_id: str, seq: int, msg: dict) -> None:
         """把一条 OpenAI 消息规范化进 messages 表。
 
@@ -254,25 +390,46 @@ class SessionStore:
             msg["reasoning_content"] = row["reasoning_content"]
         return msg
 
-    def list_sessions(self) -> list[dict]:
-        """列出所有会话元数据，按 ``updated_at`` 倒序（最近活跃在前）。
+    def list_sessions(self, fold_chains: bool = True) -> list[dict]:
+        """列出会话元数据，按 ``updated_at`` 倒序（最近活跃在前）。
 
         每条带 ``msg_count`` 和首条 user 消息的 ``preview``（截断 60 字），
         供 ``/sessions`` 渲染 ``<id>  <turn>turns  <n>msgs  <updated>  <preview>``。
+
+        ``fold_chains=True``（默认，V24.1）：压缩链折叠 —— 凡是别人的
+        ``parent_session_id`` 指向的会话（链中被压缩封存的 root / 中间节点）一律
+        隐藏，只留 tip 和无链的独立会话。一条逻辑对话 = 一行，与源项目
+        ``project_compression_tips=True`` 同义。tip 的 ``preview`` 取自链 root 的
+        首条 user 消息（原始第一问，而非压缩摘要 —— 用户认得出是哪段对话）。
+
+        ``fold_chains=False``（``/sessions --all`` / debug）：展开所有节点，含压缩
+        前 root —— 才看得到被折叠藏起来的压缩前原文节点。
         """
         rows = self.conn.execute(
             "SELECT * FROM sessions ORDER BY updated_at DESC"
         ).fetchall()
+        hidden: set[str] = set()
+        if fold_chains:
+            # 任何被引用为 parent 的会话 = 链中非 tip 节点 → 折叠时隐藏
+            parent_rows = self.conn.execute(
+                "SELECT DISTINCT parent_session_id AS p FROM sessions "
+                "WHERE parent_session_id IS NOT NULL"
+            ).fetchall()
+            hidden = {r["p"] for r in parent_rows}
         result: list[dict] = []
         for sess in rows:
             sid = sess["session_id"]
+            if sid in hidden:
+                continue
             count = self.conn.execute(
                 "SELECT COUNT(*) AS n FROM messages WHERE session_id=?", (sid,)
             ).fetchone()["n"]
+            # 折叠时 preview 取链 root 的首问；展开时取本节点自己的首问
+            preview_sid = self._chain_root(sid) if fold_chains else sid
             preview_row = self.conn.execute(
                 "SELECT content FROM messages WHERE session_id=? AND role='user' "
                 "AND content IS NOT NULL ORDER BY seq LIMIT 1",
-                (sid,),
+                (preview_sid,),
             ).fetchone()
             preview = (preview_row["content"] if preview_row else "") or ""
             preview = preview.replace("\n", " ").strip()
@@ -285,6 +442,7 @@ class SessionStore:
                 "model": sess["model"] or "",
                 "updated_at": sess["updated_at"],
                 "created_at": sess["created_at"],
+                "parent_session_id": sess["parent_session_id"],
                 "preview": preview,
             })
         return result
