@@ -116,7 +116,7 @@ def _parse_cli_args() -> argparse.Namespace:
     parser.add_argument(
         "--cwd",
         type=str,
-        default='/Users/qshf/Documents/book',
+        default='', #'/Users/qshf/Documents/book',
         metavar="PATH",
         help=(
             "启动后切到此目录工作。terminal / read_file 等工具的相对路径以及 "
@@ -157,6 +157,7 @@ from transports.streaming import (
 from transports.types import build_assistant_history_msg
 from agent import PromptBuilder, SkillLoader
 from agent.runtime import AgentRuntime, SESSION_TOKEN_KEYS
+from agent.session_store import SessionStore
 import cli  # 触发 cli/commands 下所有命令的装饰器注册
 
 # V22 输入体验：用 prompt_toolkit 的 PromptSession 取代内建 ``input()``。
@@ -489,6 +490,21 @@ def run_agent():
     # V15: 上下文压缩器
     compressor = ContextCompressor()
 
+    # V24.0: 会话持久化 store —— 启动即建库（SESSION_DB_PATH 覆盖路径，
+    # ":memory:" 关闭落盘退化到 v14 ephemeral 行为）。若当前 session_id 已有
+    # 存档，把历史挂回 messages（system 重建在前 + 历史在后），并恢复
+    # turn_count / runtime.session_tokens —— 这一步就是 v24.0 修掉假 resume 的
+    # 核心：进程重启后同一 MEMORY_SESSION_ID 能续上对话。
+    session_store = SessionStore()
+    resumed_note = "new"
+    _saved = session_store.load(current_session_id)
+    if _saved is not None and _saved["messages"]:
+        messages.extend(_saved["messages"])
+        turn_count = _saved["turn_count"]
+        for _k in SESSION_TOKEN_KEYS:
+            runtime.session_tokens[_k] = _saved["session_tokens"].get(_k, 0)
+        resumed_note = f"resumed {len(_saved['messages'])} msgs, turn {turn_count}"
+
     print("=" * 60)
     print("  Nano Hermes Agent v23.4 — 多智能体结构化结果 + 父子成本聚合")
     print(f"  Default MODEL (entries 不内联时回退到此): {model}")
@@ -506,7 +522,7 @@ def run_agent():
     else:
         print(f"    prompt_cache: disabled (set PROMPT_CACHE_ENABLED=1 to enable)")
     print(f"  Streaming: {'on' if stream_enabled else 'off'} (toggle: /stream on|off)")
-    print(f"  Session: {current_session_id}")
+    print(f"  Session: {current_session_id} ({resumed_note})")
     print(f"  Toolsets: {ENABLED_TOOLSETS}")
     print(f"  Memory providers: {[p.name for p in memory_manager.providers]}")
     if builtin_provider is not None:
@@ -578,6 +594,7 @@ def run_agent():
         prompt_builder=prompt_builder,
         skill_loader=skill_loader,
         runtime=runtime,
+        session_store=session_store,
     )
 
     try:
@@ -781,7 +798,35 @@ def run_agent():
 
             # V21.1: 同步本轮 turn_count 到 ctx（messages / session_id 已通过引用共享）
             ctx.turn_count = turn_count
+
+            # V24.0: 轮末持久化 —— 全量删重插当前 messages 视图（剔除 system）。
+            # 放在 sync_all 之后，保证即使进程随后 crash，也只丢"未走到这里"的
+            # 当轮（轮末写的不变量：crash 最多丢一轮）。current_session_id 可能被
+            # 本轮 slash 改过（理论上 slash 在 tool loop 前 continue 了，不会到
+            # 这里），用 ctx 上的当前值最稳妥。
+            session_store.save(
+                ctx.current_session_id,
+                messages,
+                turn_count=turn_count,
+                model=model,
+                session_tokens=runtime.session_tokens,
+            )
     finally:
+        # V24.0: 退出兜底 —— 固化当前会话最后状态 + 关库。覆盖"轮中途按 quit /
+        # Ctrl+D 退出"的边界（轮末写没走到）。close() 让 WAL checkpoint 回主库。
+        # 包 try 防 save 失败遮蔽 memory shutdown（两者都要尽力跑完）。
+        try:
+            session_store.save(
+                ctx.current_session_id,
+                messages,
+                turn_count=ctx.turn_count,
+                model=model,
+                session_tokens=runtime.session_tokens,
+            )
+        except Exception as exc:
+            print(f"  [warn] session save on exit failed: {exc!r}")
+        finally:
+            session_store.close()
         # V10: 释放外部 provider 的 httpx client；builtin 的 shutdown 是 no-op
         memory_manager.shutdown_all()
 

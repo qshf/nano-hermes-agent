@@ -8,8 +8,8 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到挂载长期记忆 + 多智能体 + 跨项目可用。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v23.4 — 多智能体结构化结果 + 父子成本聚合。详见 [docs/decisions/v23.4.md](docs/decisions/v23.4.md)。
-- **演进主轴**：内存（v6→v16）→ transport（v17→v20）→ 交互层（v21.x）→ 流式（v22）→ 多智能体（v23.x）。
+- **当前阶段**：v24.0 — 会话状态持久化（SQLite 会话子系统 + 真 resume）。详见 [docs/decisions/v24.0.md](docs/decisions/v24.0.md)。
+- **演进主轴**：内存（v6→v16）→ transport（v17→v20）→ 交互层（v21.x）→ 流式（v22）→ 多智能体（v23.x）→ 会话持久化（v24.x）。
 
 ---
 
@@ -19,7 +19,7 @@
 |------|---------|-----------|
 | 源项目 | `/Users/qshf/my-project/hermes-agent` | `https://github.com/qshf/hermes-agent` |
 | nano | `/Users/qshf/my-project/nano_hermes_agent` | `git@github.com:qshf/nano-hermes-agent.git` |
-| 当前分支 | `delegate/v0.23.2`（基于 v0.23.1，并入 v15.1 修复档） | — |
+| 当前分支 | `delegate/v0.23.4`（基于 v0.23.1 + v15.1 修复档；v23.3/v23.4 已各建同名分支指针，均推远端） | — |
 
 **跨目录硬约束**：源项目和 nano 不在同一目录。"对照源项目读 X 文件"的操作必须用源项目绝对路径，例如 `/Users/qshf/my-project/hermes-agent/plugins/memory/hindsight/__init__.py`。
 
@@ -46,9 +46,10 @@
 | v23.0 / v23.1 | 多智能体 | delegate_task + 隔离 child loop → tasks[] 批量并行 + 工具白名单 |
 | v23.2 | 跨项目可用 | `--cwd PATH` + nano-hermes-agent.md / AGENTS.md 注入 / NANO_IGNORE_RULES |
 | v23.3 | 多智能体流式中继 + 父子 cancel | stream_enabled 透传到 child_loop / progress 走 stderr / 共享 CancelToken / interrupted 状态 |
-| **v23.4** | **多智能体结构化结果 + 成本聚合** | **统一 `{"results":[...]}` JSON / runtime.session_tokens 4 维 / tool_trace + duration / `/transport` 末尾 session 行** |
+| v23.4 | 多智能体结构化结果 + 成本聚合 | 统一 `{"results":[...]}` JSON / runtime.session_tokens 4 维 / tool_trace + duration / `/transport` 末尾 session 行 |
+| **v24.0** | **会话状态持久化（SQLite + 真 resume）** | **`agent/session_store.py`：sessions + messages 两表 / WAL / 全量删重插 / 剔除 system / 轮末+退出 save / `/resume` 真 load / `/sessions` 列表** |
 
-**下一档候选**：v15.2 prefill retry / v23.5 嵌套 delegate（role: orchestrator + max_spawn_depth）/ v24 trajectory + insights。
+**下一档候选**：v24.1 append-only 游标 + 压缩链（会话分裂 + parent 串链 + resume 重定向到 tip）/ v15.2 prefill retry / v23.5 嵌套 delegate（role: orchestrator + max_spawn_depth）。
 
 ---
 

@@ -75,6 +75,7 @@ def test_all_v21_1_commands_registered() -> None:
         "tools", "session", "new", "resume", "compress", "transport",
         "skill",
         "stream",  # V22
+        "sessions",  # V24.0
     }
     actual = {c.name for c in registered_commands()}
     missing = expected - actual

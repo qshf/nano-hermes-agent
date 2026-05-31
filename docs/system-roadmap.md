@@ -158,6 +158,20 @@ v27  Todo / Clarify（可选小尾巴）           ← 协作工具
 
 **承诺范围**：实际只承诺到 v24。做完后 nano 已经是"能渐进加载、能流式中断、能并行、能落盘训练数据"的真 agent，并具备数据飞轮起点。v25+ 按精力和兴趣追加。
 
+> **路线偏离记录（2026-05-31，场景 C）**：原计划 v24 = "Trajectory + Insights"。
+> 实际做 v24 时发现 **trajectory 落盘的前置是会话本身能落盘** —— 而 v14 标称的
+> 会话持久化是假的（只切 memory bank key，从没存过 messages，`/resume` 拿不回
+> 历史，进程退出对话蒸发）。所以把 v24 拆成两步先补这个债：
+> - **v24.0 会话状态持久化**（已完成）：`agent/session_store.py`，SQLite sessions +
+>   messages 两表 / WAL / 全量删重插 / 真 resume / `/sessions`。见
+>   [docs/decisions/v24.0.md](decisions/v24.0.md)。
+> - **v24.1**（下一档）：append-only 游标增量写 + 压缩链（会话分裂 + parent 串链 +
+>   resume 重定向到 tip）。
+> - **v24.2+ Trajectory + Insights**：复用 v24.x 的 SQLite 会话后端落训练数据。
+>
+> 偏离理由：原路线图把"会话持久化"默认当成 v14 已交付，实际是技术债。trajectory
+> 直接建在假持久化上等于沙上建塔。先补债、再上飞轮，依赖顺序才对。
+
 ### 2.5 排序依据（四条原则）
 
 1. **痛点驱动**：每档必须修一个具体痛点。v21 修 v4 设计债，v22 修 blocking 体感，v23 修单线程局限。

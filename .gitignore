@@ -8,3 +8,9 @@ docs/social
 .vscode
 
 skills/novel-writing
+
+# V24.0 会话持久化库（SQLite + WAL 旁路文件）—— 本地状态不入库
+sessions/
+*.db
+*.db-wal
+*.db-shm
