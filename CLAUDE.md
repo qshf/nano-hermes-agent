@@ -19,7 +19,7 @@
 |------|---------|-----------|
 | 源项目 | `/Users/qshf/my-project/hermes-agent` | `https://github.com/qshf/hermes-agent` |
 | nano | `/Users/qshf/my-project/nano_hermes_agent` | `git@github.com:qshf/nano-hermes-agent.git` |
-| 当前分支 | `session/v0.25.1`（基于 `session/v0.25.0`；每档均建同名分支指针） | — |
+| 当前分支 | `flywheel/v0.25.1`（基于 `flywheel/v0.25.0`；每档均建同名分支指针） | — |
 
 **跨目录硬约束**：源项目和 nano 不在同一目录。"对照源项目读 X 文件"的操作必须用源项目绝对路径，例如 `/Users/qshf/my-project/hermes-agent/plugins/memory/hindsight/__init__.py`。
 
