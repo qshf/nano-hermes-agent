@@ -23,6 +23,8 @@ import logging
 import os
 import re
 
+from agent.logging import get_log_session, log_session_scope
+
 logger = logging.getLogger(__name__)
 
 _CHARS_PER_TOKEN = 4
@@ -126,6 +128,10 @@ class ContextCompressor:
         # 上一次 compress() 触发时的真实 prompt_tokens；下一次 update_usage 用它
         # 与新的真实值算"压缩节省了多少"，喂给 anti-thrashing 计数。
         self._pending_pre_tokens: int | None = None
+        # 压缩发生时刻的 session_id 快照 —— 结算日志归因到"压缩实际发生的会话"，
+        # 而非"下一轮真实 token 到达时刻的会话"（compressor 是进程级单例、跨会话存活，
+        # 结算常落在用户已切换的新会话里，否则日志 [session_id] 会错标）。
+        self._pending_session_id: str | None = None
 
     # ─── 公开 API ────────────────────────────────────────────────────────────
 
@@ -145,11 +151,15 @@ class ContextCompressor:
                 self._ineffective_count += 1
             else:
                 self._ineffective_count = 0
-            logger.info(
-                "Compression real savings: ~%d → ~%d tokens (%.0f%% saved, ineffective_count=%d)",
-                pre, post, savings_pct, self._ineffective_count,
-            )
+            # 用压缩发生时刻的 session 打日志（compressor 跨会话单例，结算常落在
+            # 用户已切走的新会话里 —— 不切回去日志会错标到结算时刻的会话）。
+            with log_session_scope(self._pending_session_id or get_log_session()):
+                logger.info(
+                    "Compression real savings: ~%d → ~%d tokens (%.0f%% saved, ineffective_count=%d)",
+                    pre, post, savings_pct, self._ineffective_count,
+                )
             self._pending_pre_tokens = None
+            self._pending_session_id = None
 
         self._last_prompt_tokens = prompt_tokens
 
@@ -225,6 +235,8 @@ class ContextCompressor:
         # 把"压缩前真实 prompt_tokens"挂起 — 下一轮 update_usage 拿到压缩后
         # 真实值时结算节省比例 + ineffective_count
         self._pending_pre_tokens = pre_tokens
+        # 同时快照当前会话 —— 结算日志归因到此刻的会话，而非结算时刻（常已切走）的会话
+        self._pending_session_id = get_log_session()
         # 压缩后 _last_prompt_tokens 仍是旧值，但已经不再代表当前 messages —
         # 清空让 should_compress 在下一次真实 update_usage 之前不会重复触发
         self._last_prompt_tokens = None

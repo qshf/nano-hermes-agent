@@ -157,6 +157,7 @@ from transports.streaming import (
 from transports.types import build_assistant_history_msg
 from agent import PromptBuilder, SkillLoader
 from agent.compaction import apply_compaction
+from agent.logging import setup_logging, set_log_session, get_logger
 from agent.runtime import AgentRuntime, SESSION_TOKEN_KEYS
 from agent.session_store import SessionStore
 import cli  # 触发 cli/commands 下所有命令的装饰器注册
@@ -421,6 +422,13 @@ def _accumulate_parent_turn_tokens(runtime: AgentRuntime, usage) -> None:
 def run_agent():
 
 
+    # V25.1: 日志子系统开机 —— 必须在 chain 构建 / 任何 transport 调用之前，
+    # 否则那些早期 record 收不到。setup_logging 配 root（让 transports.chain /
+    # delegate / memory 等已有 getLogger(__name__) 模块的日志都流经 RedactingFormatter
+    # 脱敏），幂等。LOG_FILE=:none: 关闭文件日志只留 stderr。
+    setup_logging()
+    log = get_logger()
+
     # V19: 构建 transport 链 — TRANSPORT_CHAIN 优先（多家），否则退化为
     # TRANSPORT_MODE 单家（行为同 V18）。chain 长度 1 时仍带 RETRYABLE 错误重试，
     # 但不会切换 — 链长 ≥ 2 才有 failover 价值。
@@ -442,7 +450,22 @@ def run_agent():
     # 兼容存量代码路径 — 主家用于 client 引用（仅作为 compressor.compress 第三个
     # 位置参数兼容签名传入；真正的 LLM 调用统一走 chain.call()）。
     client = chain.primary_client
-    model = os.environ.get("MODEL", "gpt-4o-mini")
+    # V25.1 修复：model 优先取 chain 主家自带的内联模型名（TRANSPORT_CHAIN 里的
+    # ``api_mode:model``），而非直接读 MODEL env。此前直接 ``os.environ["MODEL"]``
+    # 在只配 TRANSPORT_CHAIN（未单设 MODEL）时回退到硬编码 ``gpt-4o-mini``，导致
+    # save_session 把一个从未真正调用过的假模型名写进 sessions 表 —— v25.1 insights
+    # 第一次把 model 字段聚合成报表才暴露出这个 v24 持久化 bug（详见 decisions/v25.1.md
+    # 决策 8）。chain.primary_model 为 None（legacy 单家未内联）时才回退到 env。
+    model = chain.primary_model or os.environ.get("MODEL", "gpt-4o-mini")
+
+    # V25.1: 启动埋点 —— chain 配置进结构化日志（排查"哪家 model / 链怎么配的"有据）
+    log.info(
+        "agent boot: model=%s chain=[%s] failover(threshold=%s cooldown=%ss)",
+        model,
+        ",".join(f"{e.api_mode}:{e.model or '-'}" for e in chain.entries),
+        chain.failure_threshold,
+        chain.cooldown_seconds,
+    )
 
     # V22: 流式开关 — env 默认开；运行期 /stream on|off 切换
     stream_enabled = os.environ.get("STREAM_ENABLED", "1") not in ("0", "false", "False", "")
@@ -508,6 +531,12 @@ def run_agent():
         for _k in SESSION_TOKEN_KEYS:
             runtime.session_tokens[_k] = _saved["session_tokens"].get(_k, 0)
         resumed_note = f"resumed {len(_saved['messages'])} msgs, turn {turn_count}"
+
+    # V25.1: session_id 已 resolve（含 resume 重定向到压缩链 tip），绑定到 thread-local
+    # —— 之后主循环所有 log record 带 [session_id]。/new /resume 切会话与压缩分裂时
+    # 会重新绑定（见下方两处 set_log_session）。
+    set_log_session(current_session_id)
+    log.info("session ready: %s (%s)", current_session_id, resumed_note)
 
     print("=" * 60)
     print("  Nano Hermes Agent v23.4 — 多智能体结构化结果 + 父子成本聚合")
@@ -622,6 +651,15 @@ def run_agent():
             #   - messages 与 ctx.messages 共享同一 list 引用（in-place ops）
             #   - session_id / turn_count 由 handler 改 ctx.* 后此处同步回局部
             if cli.dispatch(user_input, ctx):
+                # V25.1: /new /resume 等命令可能切了会话 —— 重新绑定 thread-local
+                # session_id，让后续日志归到新会话。仅在真变化时记一条。
+                if ctx.current_session_id != current_session_id:
+                    set_log_session(ctx.current_session_id)
+                    log.info(
+                        "session switched: %s -> %s (via slash command)",
+                        current_session_id,
+                        ctx.current_session_id,
+                    )
                 current_session_id = ctx.current_session_id
                 turn_count = ctx.turn_count
                 continue
@@ -675,6 +713,13 @@ def run_agent():
                         did = apply_compaction(ctx)
                         current_session_id = ctx.current_session_id
                         if did:
+                            # V25.1: 压缩分裂换了 session id —— 重新绑定 thread-local
+                            set_log_session(current_session_id)
+                            log.info(
+                                "compaction split -> %s (%d msgs live)",
+                                current_session_id,
+                                len(messages),
+                            )
                             print(
                                 f"  [compress] split → {current_session_id} "
                                 f"({len(messages)} msgs live, pre-compaction archived)"

@@ -16,4 +16,5 @@ from cli.commands import (  # noqa: F401
     transport,
     stream,
     skill,
+    insights,
 )

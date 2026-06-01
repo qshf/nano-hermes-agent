@@ -30,5 +30,6 @@
 | v24.0 | 会话状态持久化（SQLite 会话子系统 + 真 resume / 全量删重插 / `/sessions`） | [v24.0.md](./v24.0.md) |
 | v24.1 | append-only 写入迁移 + 压缩链（会话分裂 + resume 重定向到 tip + 列表折叠） | [v24.1.md](./v24.1.md) |
 | v25.0 | trajectory 训练样本导出（ShareGPT + 密钥脱敏 + 三 flush 点 / 子轨迹超越源项目） | [v25.0.md](./v25.0.md) |
+| v25.1 | insights 离线分析 + 结构化日志（读 v24 SQLite 出 token/成本/tool/失败率 + session 注入日志 + 写盘前脱敏） | [v25.1.md](./v25.1.md) |
 
 > 注：V8 的决策记录散落在对应的 commit message 与 [docs/Memory-system/](../Memory-system/) 子目录下，未来如有补录需求再回填本目录。V15 主决策（5 阶段压缩流水线）当时未单独建档，本目录从 v15.1 开始接力补完。

@@ -376,6 +376,26 @@ v27  Todo / Clarify（可选小尾巴）           ← 协作工具
 
 ### V24 Trajectory + Insights（日志追踪 + 训练数据）
 
+> **⚠️ 实际偏离（场景 C，2026-06-01 回写）**：本节原把 trajectory + insights 规划成
+> **一个 v24 档**。实际落地时拆成了**两条独立主线、四个档**，且编号顺延到 v25.x：
+>
+> | 规划 | 实际 |
+> |------|------|
+> | v24 = trajectory + insights 合一 | v24.0/v24.1 = **会话持久化**（SQLite store + append-only 压缩链）—— 见下方偏离说明 |
+> | （同上） | v25.0 = trajectory 导出 + redact（写路径）/ v25.1 = insights + 结构化日志（读路径） |
+>
+> **两个偏离点**：
+> 1. **会话持久化插队成 v24**：原路线图把"会话持久化"当成 v14 已交付，实际是技术债
+>    （v14 是假 resume）。trajectory 的前置是"会话本身能落盘"，所以先补 v24.0/v24.1 真
+>    持久化，trajectory 顺延到 v25.0。
+> 2. **insights 数据源从 jsonl 改成 SQLite**（推翻下方第 416 行"不做 SQLite 持久化"的
+>    前提）：那条简化基于"v14 只有 jsonl"的旧认知。v24 落地真 SQLite 会话子系统后，
+>    insights 改读 `sessions` 表的原始 4 维 token 计量 —— jsonl 是有损训练格式（脱敏 +
+>    拍平），拿它算钱会失真。**因此 v25.1 只依赖 v24，不依赖 v25.0**（见
+>    [decisions/v25.1.md](decisions/v25.1.md) 决策 4）。
+>
+> 下方原始规划文本保留作历史对照，不再代表当前实现。
+
 **核心问题**：
 - 前 23 档跑过的对话全部"用完即抛"，无法回放、无法分析、无法转训练数据
 - 缺少跨会话的统计视图（token / 成本 / tool 频次 / 失败率）
@@ -414,7 +434,7 @@ v27  Todo / Clarify（可选小尾巴）           ← 协作工具
 - v22 流式 + v23 多 agent 跑完，子 agent trajectory 独立成文件，父 agent trajectory 含 delegate_task 的 summary 但不含子的中间步
 
 **简化掉的**（vs 源项目 1780 行）：
-- 不做 SQLite 持久化（用 jsonl 文件存）—— v14 的 SQLite 已够用
+- ~~不做 SQLite 持久化（用 jsonl 文件存）—— v14 的 SQLite 已够用~~ —— **已推翻**：v24 补了真 SQLite 会话子系统，insights 改读 `sessions` 表原始计量（jsonl 有损）。见上方场景 C 偏离说明 + [decisions/v25.1.md](decisions/v25.1.md) 决策 4。
 - 不做 multi-platform breakdown（gateway 没做）
 - 不做 cost 估算的多家 pricing 表（hardcode 当前用的 deepseek + qwen 价格即可）
 - 不做基于 LLM 的总结/分析

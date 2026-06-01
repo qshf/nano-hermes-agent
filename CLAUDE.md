@@ -8,7 +8,7 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到挂载长期记忆 + 多智能体 + 跨项目可用。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v25.0 — trajectory 训练样本导出（ShareGPT + 密钥脱敏 + 三 flush 点，子轨迹落盘超越源项目）。详见 [docs/decisions/v25.0.md](docs/decisions/v25.0.md)。
+- **当前阶段**：v25.1 — insights 离线分析 + 结构化日志（读 v24 SQLite 出 token/成本/tool top-N/失败率报表 + session 注入日志 + 写盘前脱敏）。详见 [docs/decisions/v25.1.md](docs/decisions/v25.1.md)。
 - **演进主轴**：内存（v6→v16）→ transport（v17→v20）→ 交互层（v21.x）→ 流式（v22）→ 多智能体（v23.x）→ 会话持久化（v24.x）→ 数据飞轮（v25.x）。
 
 ---
@@ -19,7 +19,7 @@
 |------|---------|-----------|
 | 源项目 | `/Users/qshf/my-project/hermes-agent` | `https://github.com/qshf/hermes-agent` |
 | nano | `/Users/qshf/my-project/nano_hermes_agent` | `git@github.com:qshf/nano-hermes-agent.git` |
-| 当前分支 | `session/v0.24.1`（基于 `session/v0.24.0`；v24.0/v24.1 均建同名分支指针） | — |
+| 当前分支 | `session/v0.25.1`（基于 `session/v0.25.0`；每档均建同名分支指针） | — |
 
 **跨目录硬约束**：源项目和 nano 不在同一目录。"对照源项目读 X 文件"的操作必须用源项目绝对路径，例如 `/Users/qshf/my-project/hermes-agent/plugins/memory/hindsight/__init__.py`。
 
@@ -50,8 +50,9 @@
 | v24.0 | 会话状态持久化（SQLite + 真 resume） | `agent/session_store.py`：sessions + messages 两表 / WAL / 全量删重插 / 剔除 system / 轮末+退出 save / `/resume` 真 load / `/sessions` 列表 |
 | **v24.1** | **append-only + 压缩链** | **`append()` 无状态游标（`COUNT(*)`）只增不删 / 压缩点会话分裂（`end_session`+`create_session`+换 id）抽到 `agent/compaction.py::apply_compaction`（自动压缩 + 手动 `/compress` 共用）/ `resolve_resume_tip` 无条件走到 tip / `list_sessions(fold_chains)` 折叠 + `/sessions --all` 展开** |
 | **v25.0** | **trajectory 训练样本导出** | **`agent/trajectory.py`：OpenAI messages → ShareGPT `{from,value}`（assistant 包 `<think>`、tool_calls 拍平成 `<tool_call>` XML 丢 tool_call_id、连续 tool 合并）/ completed+完整 → `*_samples.jsonl` 否则 `*_failed.jsonl` / `agent/redact.py` ~10 pattern import 时快照默认开 / 三 flush 点：压缩点 + 退出兜底 + delegate 子轨迹（`_build_result` 加 `messages` 前置改动，**子轨迹落盘超越源项目**）/ `TRAJECTORY_DIR=:none:` 关闭** |
+| **v25.1** | **insights 离线分析 + 结构化日志** | **`agent/insights.py`：`InsightsEngine` 读 v24 SQLite（sessions+messages 两表）跨会话聚合 overview（4 维 token / 估算成本 / 平均轮长）+ tool top-N（扫 messages.tool_calls）+ per-model + 失败率（扫 role=tool 的 `{"error":...}`）/ `estimate_cost` hardcode deepseek+qwen 单价、未知 model 标 unknown / 决策 4：数据源是 SQLite 不是 jsonl（jsonl 有损，删光仍出报表）/ `agent/logging.py`：`RotatingFileHandler` + `RedactingFormatter`（写盘前过 redact，与 trajectory 共用防线）+ session_id thread-local 注入（filter 挂 **handler** 级）/ **挂 root logger** 让已有 8 个 `getLogger(__name__)` 模块（transports.chain failover / delegate / memory…）日志自动流经脱敏（决策 9）/ `main.py` 启动 `setup_logging()` + boot 埋点 + 三处 `set_log_session`（session resolve / 切换 / 压缩分裂）/ `/insights [--days N]` + `/trajectory list` / `LOG_FILE=:none:` 关闭** |
 
-**下一档候选**：v25.1 insights 离线分析（读 v24 SQLite 出 tool 使用/成本/失败率报表，不依赖 v25.0）/ v15.2 prefill retry / v23.5 嵌套 delegate（role: orchestrator + max_spawn_depth）/ v24.2 会话级锁修 last-write-wins / FTS5 全文检索。
+**下一档候选**：v26 多家 pricing 对账（pricing_version + actual_cost）/ insights 扩展（platform/skill breakdown + 活动模式）/ v15.2 prefill retry / v23.5 嵌套 delegate（role: orchestrator + max_spawn_depth）/ v24.2 会话级锁修 last-write-wins / FTS5 全文检索。
 
 ---
 
@@ -87,6 +88,11 @@ DELEGATE_MAX_CONCURRENT=3   # ThreadPoolExecutor max_workers；非数字/<=0 兜
 
 # V23.2 项目上下文（详见 v23.2 决策日志）
 NANO_IGNORE_RULES=0   # 1 时跳过 nano-hermes-agent.md / AGENTS.md 注入
+
+# V25.1 结构化日志 + insights
+LOG_FILE=logs/agent.log   # :none: 关闭文件日志（只 stderr）；滚动 5MB×3
+LOG_LEVEL=INFO            # DEBUG / INFO / WARNING / ERROR
+# /insights [--days N] 读 v24 SQLite 出报表（不依赖 trajectory）；/trajectory list 列样本文件
 
 # V15 上下文压缩
 CONTEXT_WINDOW=32000 ; CONTEXT_THRESHOLD_PERCENT=0.75

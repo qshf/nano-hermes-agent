@@ -53,5 +53,16 @@
 - [ ] V24.1 偏离计划文档：resume 重定向取 `get_compression_tip` 的无条件到 tip 语义，而非计划写的 `resolve_resume_session_id`（root 有消息则短路）。计划文本未更新，以 [decisions/v24.1.md](decisions/v24.1.md) 决策 3 为准；后续若回写计划文档需对齐。
 - [ ] V24.x 候选：append-only 之上接 trajectory 数据飞轮（导出"压缩前完整链 → 训练数据"）/ FTS5 全文检索跨会话搜历史 / 会话标题自动生成（`title` 列已预留，当前不写值）。
 
+## 数据飞轮（V25）
+
+- [x] ~~V25.0 trajectory 导出 + 脱敏~~ — ShareGPT 格式 + ~10 pattern redact + 三 flush 点（压缩点/退出/delegate 子轨迹），见 [decisions/v25.0.md](decisions/v25.0.md)。
+- [x] ~~V25.1 insights 离线分析 + 结构化日志~~ — `InsightsEngine` 读 v24 SQLite 出 token/成本/tool top-N/失败率，`RedactingFormatter` 写盘前脱敏 + session 注入。决策 4：数据源是 SQLite 不是 jsonl（纠正原 roadmap），见 [decisions/v25.1.md](decisions/v25.1.md)。
+- [ ] V25.1 成本估算 hardcode deepseek+qwen 单价，官方调价后会过时（决策 5 已知简化）。V26 候选：多家 pricing 表 + pricing_version + actual_cost 对账。
+- [ ] V25.1 insights 砍掉的报表块（platform/skill breakdown、活动模式 day/hour/streak、top sessions、gateway markdown）留作 insights 扩展档。
+- [ ] V25.1 失败率只认 `role=tool` 内容里的 `{"error":...}`（V21.4 协议）；`end_reason` 当前只写 `compression`，没有"会话因报错中止"的信号。若将来 end_reason 扩展（如 `error`/`cancelled`），insights 可加会话级失败维度。
+- [x] ~~V25.1 结构化日志只接了 `agent/logging.py` 基础设施，尚未在 transport / agent loop / delegate 各调用点广泛埋点~~ — review 时发现 `setup_logging()` **从没被调用**（死模块）+ handler 挂错私有 logger（已有 8 个 `getLogger(__name__)` 模块收不到）。已修（决策 9）：handler 改挂 **root** + filter 挂 handler 级，`main.py` 启动开机 + boot/session/failover 埋点。`transports.chain` failover 等已有日志现自动流经脱敏。
+- [ ] V25.1 主动埋点仍可扩 —— 目前靠"挂 root 让 8 个模块自动接入" + main.py 三处（boot / session 切换 / 压缩分裂）。agent loop 每轮 turn / tool dispatch 耗时 / memory recall 命中等更细的主动 `get_logger()` 埋点留后续按需补。
+
+
 ## 文档
 - [x] ~~CLAUDE.md 已超 250 行硬规则上限，下一档完成后应把决策日志按版本拆到 `docs/decisions/v<N>.md`，本文件只留索引。~~ — 已拆分（决策日志移到 [docs/decisions/](decisions/)，待办移到本文件）。
