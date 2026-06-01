@@ -8,8 +8,8 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到挂载长期记忆 + 多智能体 + 跨项目可用。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v24.1 — append-only 写入迁移 + 压缩链（会话分裂 + resume 重定向到 tip + 列表折叠）。详见 [docs/decisions/v24.1.md](docs/decisions/v24.1.md)。
-- **演进主轴**：内存（v6→v16）→ transport（v17→v20）→ 交互层（v21.x）→ 流式（v22）→ 多智能体（v23.x）→ 会话持久化（v24.x）。
+- **当前阶段**：v25.0 — trajectory 训练样本导出（ShareGPT + 密钥脱敏 + 三 flush 点，子轨迹落盘超越源项目）。详见 [docs/decisions/v25.0.md](docs/decisions/v25.0.md)。
+- **演进主轴**：内存（v6→v16）→ transport（v17→v20）→ 交互层（v21.x）→ 流式（v22）→ 多智能体（v23.x）→ 会话持久化（v24.x）→ 数据飞轮（v25.x）。
 
 ---
 
@@ -49,8 +49,9 @@
 | v23.4 | 多智能体结构化结果 + 成本聚合 | 统一 `{"results":[...]}` JSON / runtime.session_tokens 4 维 / tool_trace + duration / `/transport` 末尾 session 行 |
 | v24.0 | 会话状态持久化（SQLite + 真 resume） | `agent/session_store.py`：sessions + messages 两表 / WAL / 全量删重插 / 剔除 system / 轮末+退出 save / `/resume` 真 load / `/sessions` 列表 |
 | **v24.1** | **append-only + 压缩链** | **`append()` 无状态游标（`COUNT(*)`）只增不删 / 压缩点会话分裂（`end_session`+`create_session`+换 id）抽到 `agent/compaction.py::apply_compaction`（自动压缩 + 手动 `/compress` 共用）/ `resolve_resume_tip` 无条件走到 tip / `list_sessions(fold_chains)` 折叠 + `/sessions --all` 展开** |
+| **v25.0** | **trajectory 训练样本导出** | **`agent/trajectory.py`：OpenAI messages → ShareGPT `{from,value}`（assistant 包 `<think>`、tool_calls 拍平成 `<tool_call>` XML 丢 tool_call_id、连续 tool 合并）/ completed+完整 → `*_samples.jsonl` 否则 `*_failed.jsonl` / `agent/redact.py` ~10 pattern import 时快照默认开 / 三 flush 点：压缩点 + 退出兜底 + delegate 子轨迹（`_build_result` 加 `messages` 前置改动，**子轨迹落盘超越源项目**）/ `TRAJECTORY_DIR=:none:` 关闭** |
 
-**下一档候选**：v15.2 prefill retry / v23.5 嵌套 delegate（role: orchestrator + max_spawn_depth）/ v24.2 会话级锁修 last-write-wins / FTS5 全文检索。
+**下一档候选**：v25.1 insights 离线分析（读 v24 SQLite 出 tool 使用/成本/失败率报表，不依赖 v25.0）/ v15.2 prefill retry / v23.5 嵌套 delegate（role: orchestrator + max_spawn_depth）/ v24.2 会话级锁修 last-write-wins / FTS5 全文检索。
 
 ---
 

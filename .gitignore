@@ -14,3 +14,6 @@ sessions/
 *.db
 *.db-wal
 *.db-shm
+# V25.0 trajectory 训练样本（含脱敏后内容，仍属本地产物）—— 不入库
+trajectories/
+*.jsonl

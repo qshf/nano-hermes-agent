@@ -315,18 +315,27 @@ class ContextCompressor:
         return 0
 
     def _align_boundary(self, messages: list[dict], cut_idx: int, head_end: int) -> int:
-        """将 cut_idx 对齐到 tool_call/result 群之外（往前对齐到父 assistant 之前）。
+        """将 cut_idx 对齐到一个干净的"回合起点"——tail 必须从 user 消息开始。
 
-        如果 cut_idx 处或前面是 tool 消息，往前退到拥有 tool_calls 的父 assistant
-        消息，把整组 tool_call + tool_results 塞进 middle 摘要，避免 sanitize 阶段
-        删除孤立的 tool result（会静默丢消息）。
+        两层对齐（都只往前 / 往 head 方向走，只会让 tail 变长）：
+
+        1. tool 群：cut_idx 处或前面是 tool 消息时，往前退到拥有 tool_calls 的父
+           assistant，把整组 tool_call + tool_results 塞进 middle 摘要，避免 sanitize
+           阶段删除孤立的 tool result（会静默丢消息）。
+
+        2. user 回合边界：一个对话回合是 ``user → assistant(→tool→assistant)``。若
+           cut_idx 落在回合中段（assistant/tool），触发它的 user 会被划进 middle 被
+           摘要掉，而 assistant 回复留在 tail —— 压缩后 summary 紧跟一条**没有 user
+           的孤立 assistant**（在回答一个已被摘要掉的问题）。往前对齐到回合起点的
+           user，让整个回合留在 tail，user 与它的回复不被拆到两侧。
+           （这正是 v25 trajectory 里"不够吸引人"被吃掉、其回复"你说得对"变孤儿的根因。）
 
         对应源项目 _align_boundary_backward（agent/context_compressor.py:1188）。
         """
         if cut_idx <= 0 or cut_idx >= len(messages):
             return max(cut_idx, head_end + 1)
 
-        # 往前跨过连续的 tool result
+        # 1. 往前跨过连续的 tool result
         check = cut_idx - 1
         while check >= 0 and messages[check].get("role") == "tool":
             check -= 1
@@ -338,6 +347,15 @@ class ContextCompressor:
             and messages[check].get("tool_calls")
         ):
             cut_idx = check
+
+        # 2. 往前对齐到回合起点的 user —— tail 不能从 assistant/tool 开始。
+        # 若整段范围内找不到 user（极端：全 assistant/tool），保持原 cut_idx 不强行对齐
+        # （宁可维持 budget，不制造更差的边界）。
+        snap = cut_idx
+        while snap > head_end and messages[snap].get("role") != "user":
+            snap -= 1
+        if messages[snap].get("role") == "user":
+            cut_idx = snap
 
         return max(cut_idx, head_end + 1)
 

@@ -134,8 +134,16 @@ def _build_result(
     tokens: dict[str, int],
     tool_trace: list[dict],
     started_at: float,
+    messages: Optional[list[dict]] = None,
 ) -> dict[str, Any]:
-    """构造 child loop 返回 dict —— 7 处 return 路径共用，避免新加字段漏填。"""
+    """构造 child loop 返回 dict —— 9 处 return 路径共用，避免新加字段漏填。
+
+    V25.0 新增 ``messages``：子内层完整对话（含 system/user/assistant/tool）。
+    delegate hook 拿它转 ShareGPT 落子独立 trajectory（决策 6）—— ``tool_trace``
+    只是轻量摘要（tool/args_preview/result_bytes/status），转不出合格训练样本。
+    返回前 ``list(...)`` 浅拷贝：防调用方 mutate 串改子内部 list（与 tokens 同款保护）。
+    早退路径（白名单拒绝 / 构造失败）可能传 None —— 落空列表，hook 端按"无步可落"跳过。
+    """
     return {
         "summary": summary,
         "exit_reason": exit_reason,
@@ -143,6 +151,7 @@ def _build_result(
         "tokens": dict(tokens),  # 复制 —— 防调用方 mutate 影响日志
         "tool_trace": list(tool_trace),
         "duration_seconds": round(time.monotonic() - started_at, 3),
+        "messages": list(messages) if messages else [],
     }
 
 
@@ -251,6 +260,7 @@ def run_child_loop(
                 tokens=tokens,
                 tool_trace=tool_trace,
                 started_at=started_at,
+                messages=messages,
             )
 
         try:
@@ -279,6 +289,7 @@ def run_child_loop(
                         tokens=tokens,
                         tool_trace=tool_trace,
                         started_at=started_at,
+                        messages=messages,
                     )
             else:
                 normalized = chain.call(
@@ -294,6 +305,7 @@ def run_child_loop(
                 tokens=tokens,
                 tool_trace=tool_trace,
                 started_at=started_at,
+                messages=messages,
             )
         except FailoverExhausted as exc:
             return _build_result(
@@ -303,6 +315,7 @@ def run_child_loop(
                 tokens=tokens,
                 tool_trace=tool_trace,
                 started_at=started_at,
+                messages=messages,
             )
         except ValueError as exc:
             return _build_result(
@@ -312,6 +325,7 @@ def run_child_loop(
                 tokens=tokens,
                 tool_trace=tool_trace,
                 started_at=started_at,
+                messages=messages,
             )
         except Exception as exc:  # noqa: BLE001 — 子 loop 必须吃所有异常，不能炸到父
             logger.exception("[child_loop] unhandled exception: %s", exc)
@@ -322,6 +336,7 @@ def run_child_loop(
                 tokens=tokens,
                 tool_trace=tool_trace,
                 started_at=started_at,
+                messages=messages,
             )
 
         # V23.4: 把本次 LLM usage 累加到子内层 tokens（流式 done 帧的 response.usage
@@ -342,6 +357,7 @@ def run_child_loop(
                 tokens=tokens,
                 tool_trace=tool_trace,
                 started_at=started_at,
+                messages=messages,
             )
 
         # 跑工具 —— 子永远走 registry.dispatch，绕过 memory_manager
@@ -358,6 +374,7 @@ def run_child_loop(
                     tokens=tokens,
                     tool_trace=tool_trace,
                     started_at=started_at,
+                    messages=messages,
                 )
             name = tool_call.function.name
             raw_args = tool_call.function.arguments or ""
@@ -407,6 +424,7 @@ def run_child_loop(
         tokens=tokens,
         tool_trace=tool_trace,
         started_at=started_at,
+        messages=messages,
     )
 
 

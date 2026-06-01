@@ -64,6 +64,19 @@ def apply_compaction(ctx: Any) -> bool:
             turn_count=ctx.turn_count, model=ctx.model,
             session_tokens=ctx.runtime.session_tokens,
         )
+        # V25.0: 同一时机同一份 ctx.messages，顺手转 ShareGPT 落一份 trajectory。
+        # 干净复用 —— v24.1 已在这里把"压缩前全文"抓出来落 session-store，v25.0
+        # 只在旁边多落一份训练格式。这段会话即将被压缩摘要替换（即将"丢"），正是
+        # 数据飞轮该接住它的时刻（决策 7）。completed=True：自然压缩 = 这段跑完了。
+        try:
+            from agent.trajectory import flush_session_trajectory
+            flush_session_trajectory(
+                ctx.messages, model=ctx.model, completed=True,
+                filename_stem=old_sid,
+            )
+        except Exception:  # noqa: BLE001 — trajectory 落盘永不阻断压缩主流程
+            import logging
+            logging.getLogger(__name__).warning("[compaction] trajectory flush failed", exc_info=True)
         # 2. 封存旧 session（只打标不删消息）
         store.end_session(old_sid, "compression")
         # 3. 换 id + 建子会话串链（游标天然归零）

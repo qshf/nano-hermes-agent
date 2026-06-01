@@ -436,6 +436,25 @@ def _run_one_task(
     # 不等批量整体结束（保证 cancel 时已写入的不丢）。
     _accumulate_runtime_tokens(ctx.runtime, child_result.get("tokens"))
 
+    # V25.0: 子轨迹 flush —— 这是决策 6 的核心，nano 在此超越源项目。
+    # 源 delegate（hermes-agent/tools/delegate_tool.py:1090 构造 child AIAgent 时
+    # 缺省 save_trajectories=False）让子 agent 中间步直接丢弃，只留 summary 回父。
+    # nano 让 _build_result 多带一份子内层完整 messages（child_loop.py 前置改动），
+    # 在此转 ShareGPT 落子独立 trajectory。子的 tool 调用序列往往是最干净的训练
+    # 样本（目标明确、上下文窄、无父对话噪声）—— 丢掉等于丢掉飞轮最优质的燃料。
+    # 文件名带 task_index 隔离并发子；completed = 子正常跑完（非 interrupted/error）。
+    try:
+        from agent.trajectory import flush_session_trajectory
+        child_messages = child_result.get("messages") or []
+        if child_messages:
+            flush_session_trajectory(
+                child_messages, model=ctx.model,
+                completed=(child_result["exit_reason"] == "completed"),
+                filename_stem=f"child_t{effective_task_index}",
+            )
+    except Exception:  # noqa: BLE001 — 子轨迹落盘永不阻断父对结果的聚合
+        logger.warning("[delegate] child trajectory flush failed", exc_info=True)
+
     exit_reason = child_result["exit_reason"]
     logger.info(
         "[delegate] done task_index=%s exit=%s iters=%d summary_len=%d "

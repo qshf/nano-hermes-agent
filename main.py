@@ -841,6 +841,20 @@ def run_agent():
             print(f"  [warn] session save on exit failed: {exc!r}")
         finally:
             session_store.close()
+        # V25.0: 退出兜底 trajectory flush —— 把整段会话转 ShareGPT 落一份训练样本。
+        # 定调"整段 flush"而非轮末增量：ShareGPT 是"一行一个完整对话"，轮末
+        # append 增量会产生半截对话碎片，与该语义冲突。压缩点已 flush 被分裂走的
+        # 旧段（compaction.py），这里 flush 退出时的最终段，两点合起来覆盖全程。
+        # completed=True：正常退出 = 这段跑完了；若中途 quit 留下未闭合 <think>，
+        # has_incomplete_think 会把它分流到 *_failed.jsonl，不污染训练集。
+        try:
+            from agent.trajectory import flush_session_trajectory
+            flush_session_trajectory(
+                messages, model=model, completed=True,
+                filename_stem=ctx.current_session_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — trajectory 落盘永不阻断退出
+            print(f"  [warn] trajectory flush on exit failed: {exc!r}")
         # V10: 释放外部 provider 的 httpx client；builtin 的 shutdown 是 no-op
         memory_manager.shutdown_all()
 

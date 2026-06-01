@@ -300,6 +300,91 @@ def test_7_convert_messages_sanitizes_dirty_history():
     print("  [PASS] test_7_convert_messages_sanitizes_dirty_history")
 
 
+def test_8_tail_starts_on_user_turn_boundary():
+    """tail 必须从 user 消息开始 — 不能在回合中段(assistant)切割。
+
+    复现 v25 trajectory 报告的真实 bug：cut_idx 落在 `user → assistant` 之间，
+    user 被划进 middle 摘要掉，assistant 回复留在 tail，压缩后 summary 紧跟一条
+    孤立 assistant（在回答已被摘要掉的问题）。修复后 tail 起点必为 user。
+    """
+    compressor = ContextCompressor(
+        context_window=10000,
+        protect_first_n=3,
+        tail_token_budget=300,
+    )
+
+    # 构造一串干净的 user/assistant 回合，让 budget 自然把 cut_idx 落在某个
+    # assistant 上（回合中段）。
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u0"},
+        {"role": "assistant", "content": "a0"},
+        {"role": "user", "content": "u1"},                # 3 head_end
+        {"role": "assistant", "content": "x" * 400},       # 4
+        {"role": "user", "content": "不够吸引人"},          # 5  ← 触发问题
+        {"role": "assistant", "content": "x" * 200},       # 6  ← 它的回复，必须和 5 同侧
+        {"role": "user", "content": "蛊真人看过没有"},      # 7
+        {"role": "assistant", "content": "x" * 50},        # 8
+        {"role": "user", "content": "ok"},                 # 9
+        {"role": "assistant", "content": "bye"},           # 10
+    ]
+
+    tail_start = compressor._find_tail_boundary(messages, head_end=3)
+
+    assert messages[tail_start].get("role") == "user", (
+        f"tail 起点必须是 user，实测 role={messages[tail_start].get('role')} "
+        f"at idx {tail_start} —— 回合被从中段切开，孤立 assistant 进 tail"
+    )
+
+    print("  [PASS] test_8_tail_starts_on_user_turn_boundary")
+
+
+def test_9_no_orphan_assistant_after_summary():
+    """端到端：压缩后 summary（head 之后第一条）的下一条不能是孤立 assistant。
+
+    直接断言修复目标：summary user 之后若紧跟 assistant，则该 assistant 的触发
+    user 已丢失。修复后 summary 后第一条应是 user（新回合）或 head 尾本就合法。
+    """
+    compressor = ContextCompressor(
+        context_window=10000,
+        protect_first_n=3,
+        tail_token_budget=300,
+    )
+
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u0"},
+        {"role": "assistant", "content": "a0"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "x" * 400},
+        {"role": "user", "content": "不够吸引人"},
+        {"role": "assistant", "content": "你说得对…" + "x" * 200},
+        {"role": "user", "content": "蛊真人看过没有"},
+        {"role": "assistant", "content": "看过…" + "x" * 50},
+        {"role": "user", "content": "ok"},
+        {"role": "assistant", "content": "bye"},
+    ]
+
+    head_end = 3
+    tail_start = compressor._find_tail_boundary(messages, head_end=head_end)
+    tail = messages[tail_start:]
+
+    # tail 第一条是 user（回合起点）；它的 assistant 回复也在 tail 内
+    assert tail[0].get("role") == "user", (
+        f"tail 第一条应为 user，实测 {tail[0].get('role')}"
+    )
+    # 具体到这个 case：「不够吸引人」和它的回复要么都进 middle，要么都在 tail —— 不拆开
+    tail_contents = [m.get("content", "") for m in tail]
+    has_trigger = any("不够吸引人" in c for c in tail_contents)
+    has_reply = any("你说得对" in c for c in tail_contents)
+    assert has_trigger == has_reply, (
+        f"「不够吸引人」与其回复被拆到两侧：trigger_in_tail={has_trigger}, "
+        f"reply_in_tail={has_reply}"
+    )
+
+    print("  [PASS] test_9_no_orphan_assistant_after_summary")
+
+
 # ─── 运行 ───
 
 if __name__ == "__main__":
@@ -315,6 +400,8 @@ if __name__ == "__main__":
         test_5_format_messages_handles_none_content,
         test_6_build_assistant_history_msg_rescues_reasoning_only,
         test_7_convert_messages_sanitizes_dirty_history,
+        test_8_tail_starts_on_user_turn_boundary,
+        test_9_no_orphan_assistant_after_summary,
     ]
 
     passed = 0
