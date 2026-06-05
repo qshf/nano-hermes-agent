@@ -66,7 +66,11 @@ def _list(loader) -> None:
         desc = m.description
         if len(desc) > 80:
             desc = desc[:80] + "..."
-        print(f"    - {m.name}: {desc}")
+        # V26.1：env 缺失的 skill 标 ⚠ setup（软标记；requires_tools 硬隐藏由
+        # PromptBuilder 索引层处理，/skill list 故意全展示便于人工排查门控）
+        missing = getattr(m, "missing_env_vars", lambda: [])()
+        suffix = "  ⚠ (setup: set " + ", ".join(missing) + ")" if missing else ""
+        print(f"    - {m.name}: {desc}{suffix}")
 
 
 def _view(loader, name: str) -> None:

@@ -59,12 +59,16 @@ class _FakeSkill:
         self.name = name
         self.description = description
 
+    def missing_env_vars(self):  # V26.1: 可用性门控接口（此处恒为「无缺失」）
+        return []
+
 
 class _FakeSkillLoader:
     def __init__(self, skills: list[_FakeSkill]):
         self._skills = skills
 
-    def list_metadata(self):
+    # V26.1: list_metadata 接受可用工具/toolset（门控用）；fake 忽略它们全返回
+    def list_metadata(self, available_tools=None, available_toolsets=None):
         return list(self._skills)
 
 

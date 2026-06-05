@@ -32,5 +32,6 @@
 | v25.0 | trajectory 训练样本导出（ShareGPT + 密钥脱敏 + 三 flush 点 / 子轨迹超越源项目） | [v25.0.md](./v25.0.md) |
 | v25.1 | insights 离线分析 + 结构化日志（读 v24 SQLite 出 token/成本/tool/失败率 + session 注入日志 + 写盘前脱敏） | [v25.1.md](./v25.1.md) |
 | v26.0 | bundled 资源发现 + tier 3 读取 + 路径沙箱（skill 升级为目录包 / skill_view 双模式 / `..`+symlink 双防线） | [v26.0.md](./v26.0.md) |
+| v26.1 | 可用性门控（`required_environment_variables` 软标记 ⚠ / `metadata.requires_tools/toolsets` 硬隐藏 / skill_view 回填 readiness） | [v26.1.md](./v26.1.md) |
 
 > 注：V8 的决策记录散落在对应的 commit message 与 [docs/Memory-system/](../Memory-system/) 子目录下，未来如有补录需求再回填本目录。V15 主决策（5 阶段压缩流水线）当时未单独建档，本目录从 v15.1 开始接力补完。

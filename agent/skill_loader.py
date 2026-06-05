@@ -33,6 +33,7 @@ skill 时通过工具调用拉取。
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -53,6 +54,17 @@ class SkillMetadata:
 
     V26.0：新增 ``skill_dir`` —— SKILL.md 的父目录，作为 tier 3 资源
     （references / templates / assets / scripts）扫描与读取的沙箱根。
+
+    V26.1：新增可用性门控字段（仿源项目 ``skill_utils.py`` 的
+    ``required_environment_variables`` + ``metadata.requires_tools/toolsets``
+    子集，去 HERMES 前缀）。两种门控策略不同：
+
+    - ``required_env_vars`` 缺失 → **软标记**（仍进索引，渲染层标 ⚠ setup_needed），
+      因为 agent 需要「引导用户配置」的交互机会；
+    - ``requires_tools`` / ``requires_toolsets`` 不满足 → **硬隐藏**（不进索引），
+      因为工具不存在时 skill 根本无法工作，留着只浪费 token。
+
+    （nano **不做** 源项目的 ``fallback_for_tools/toolsets`` 兜底语义——YAGNI。）
     """
 
     name: str
@@ -60,6 +72,18 @@ class SkillMetadata:
     path: Path
     platforms: tuple[str, ...]
     skill_dir: Path = Path(".")  # 资源扫描根（SKILL.md 父目录）
+    required_env_vars: tuple[str, ...] = ()
+    requires_tools: tuple[str, ...] = ()
+    requires_toolsets: tuple[str, ...] = ()
+
+    def missing_env_vars(self) -> list[str]:
+        """声明的 env 中当前未设置（或为空串）的那些。顺序与声明一致。"""
+        return [v for v in self.required_env_vars if not os.environ.get(v)]
+
+    @property
+    def setup_needed(self) -> bool:
+        """有任一 required env 缺失 → 需要用户配置才能用（软标记依据）。"""
+        return bool(self.missing_env_vars())
 
 
 # tier 3 资源子目录 → 扩展名白名单。
@@ -126,6 +150,43 @@ def skill_matches_platform(frontmatter: dict[str, Any]) -> bool:
     return False
 
 
+def _parse_str_list(raw: Any) -> tuple[str, ...]:
+    """把 frontmatter 里的字段规整成 ``tuple[str, ...]``。
+
+    宽容输入：``None``/缺省→空 tuple；标量→单元素 tuple；list→逐项 str。
+    用于 ``metadata.requires_tools`` / ``requires_toolsets``。
+    """
+    if not raw:
+        return ()
+    if not isinstance(raw, list):
+        raw = [raw]
+    return tuple(str(x).strip() for x in raw if str(x).strip())
+
+
+def _parse_env_vars(fm: dict[str, Any]) -> tuple[str, ...]:
+    """抽顶层 ``required_environment_variables``。
+
+    支持两种写法（与源项目兼容）：
+    - 纯名字列表：``[DASHSCOPE_API_KEY, OTHER_KEY]``
+    - 带 help 的对象列表：``[{name: KEY, help: "..."}]`` —— nano 只取 ``name``
+      （不做交互式 secret capture，help 文案留给作者写进 SKILL.md 正文）。
+    """
+    raw = fm.get("required_environment_variables")
+    if not raw:
+        return ()
+    if not isinstance(raw, list):
+        raw = [raw]
+    names: list[str] = []
+    for item in raw:
+        if isinstance(item, dict):
+            name = item.get("name")
+        else:
+            name = item
+        if name and str(name).strip():
+            names.append(str(name).strip())
+    return tuple(names)
+
+
 class SkillLoader:
     """扫描 ``skills/<name>/SKILL.md`` → 缓存 metadata → 按需读全文。
 
@@ -187,12 +248,45 @@ class SkillLoader:
                 path=skill_md,
                 platforms=platforms,
                 skill_dir=skill_md.parent,  # 资源扫描根
+                required_env_vars=_parse_env_vars(fm),
+                requires_tools=_parse_str_list(
+                    (fm.get("metadata") or {}).get("requires_tools")
+                ),
+                requires_toolsets=_parse_str_list(
+                    (fm.get("metadata") or {}).get("requires_toolsets")
+                ),
             )
             self._cache[meta.name] = meta
 
-    def list_metadata(self) -> list[SkillMetadata]:
-        """返回按 name 排序的 metadata 列表。"""
-        return sorted(self._cache.values(), key=lambda m: m.name)
+    def list_metadata(
+        self,
+        available_tools: list[str] | None = None,
+        available_toolsets: list[str] | None = None,
+    ) -> list[SkillMetadata]:
+        """返回按 name 排序的 metadata 列表（V26.1 加可用性门控）。
+
+        门控策略（仿源项目 ``prompt_builder._skill_passes_conditions`` 的
+        ``requires_*`` 子集，nano 不做 ``fallback_for_*``）：
+
+        - ``requires_tools`` / ``requires_toolsets`` 任一不满足 → **硬隐藏**
+          （不进返回列表）：工具不存在 skill 无法工作，留着浪费 token。
+        - ``required_env_vars`` 缺失 → **不在这里过滤**：交给渲染层软标记
+          ⚠ setup_needed，给 agent「引导用户配置」的机会。
+
+        向后兼容：``available_tools=None`` 表示「调用方没传工具信息」→ 不做
+        硬隐藏，全显示（V21.x / 单测路径行为不变）。``available_toolsets``
+        同理独立判断。
+        """
+        out: list[SkillMetadata] = []
+        at = set(available_tools) if available_tools is not None else None
+        ats = set(available_toolsets) if available_toolsets is not None else None
+        for m in sorted(self._cache.values(), key=lambda x: x.name):
+            if at is not None and any(t not in at for t in m.requires_tools):
+                continue  # 硬隐藏：缺工具
+            if ats is not None and any(s not in ats for s in m.requires_toolsets):
+                continue  # 硬隐藏：缺 toolset
+            out.append(m)  # env 缺失不在此过滤 —— 交给渲染层标记
+        return out
 
     # ── tier 2：按需读全文 ─────────────────────────────────────────────
 
@@ -290,6 +384,10 @@ class SkillLoader:
             return f"[Binary file: {target.name}, {size} bytes]", True
 
     # ── 便利访问器 ─────────────────────────────────────────────────────
+
+    def get(self, name: str) -> "SkillMetadata | None":
+        """按名取 metadata；未知返回 None（不抛，调用方按需判空）。"""
+        return self._cache.get(name)
 
     def has(self, name: str) -> bool:
         return name in self._cache

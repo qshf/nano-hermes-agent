@@ -274,6 +274,9 @@ def skill_view_handler(args: dict) -> str:
 
 ## 6. v26.1 详细设计 — 可用性门控（env vars + requires_tools）
 
+> ✅ **已实现**（branch `skill/v0.26.1`，10/10 不变量）。落地详情见
+> [docs/decisions/v26.1.md](../decisions/v26.1.md)。下文为原始设计，与实现一致。
+
 ### 6.1 解决的问题
 voice-runtime 这类 skill「没有 `DASHSCOPE_API_KEY` 就用不了」，但当前 nano 会无差别把它注入 tier 1 索引，agent 调了才发现缺 key。需要：**声明依赖 → 启动期检查 → 缺失则索引隐藏（或标记）**，省下 token 也省下无效工具调用。
 

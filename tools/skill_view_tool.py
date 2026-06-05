@@ -124,6 +124,14 @@ def skill_view_handler(args: dict) -> str:
             "To read a linked file, call skill_view again with file_path, "
             "e.g. skill_view(name, 'references/api.md')."
         )
+    # V26.1 可用性回填 —— 让 agent 在读完 SKILL.md 后立刻知道这个 skill 能不能用，
+    # 缺哪些 env。字段名与源项目对齐（readiness_status: available | setup_needed）。
+    meta = _skill_loader.get(name) if hasattr(_skill_loader, "get") else None
+    missing = list(meta.missing_env_vars()) if meta is not None else []
+    payload["readiness_status"] = "setup_needed" if missing else "available"
+    if missing:
+        payload["missing_env_vars"] = missing
+        payload["setup_needed"] = True
     return tool_result(payload)
 
 

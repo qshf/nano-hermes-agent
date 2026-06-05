@@ -158,19 +158,43 @@ class PromptBuilder:
         return _load_project_context(self._cwd)
 
     def _render_skill_index(self) -> str:
-        """V21.3 tier 1 skill 索引（仅 name + description）。"""
+        """V21.3 tier 1 skill 索引（仅 name + description）。
+
+        V26.1 可用性门控：把当前可用工具/toolset 传给 ``list_metadata``，
+        ``requires_tools``/``requires_toolsets`` 不满足的 skill **硬隐藏**
+        （根本不进索引，省 token）；``required_env_vars`` 缺失的 skill 仍进
+        索引但追加 ``⚠ (setup: set X)`` **软标记**，给 agent「引导用户配置」
+        的机会。可用工具名复用 ``_render_tool_list`` 的同源逻辑，不新增依赖。
+        """
         if self._skill_loader is None:
             return ""
         try:
-            metadata = list(self._skill_loader.list_metadata())
+            metadata = list(
+                self._skill_loader.list_metadata(
+                    available_tools=self._available_tool_names(),
+                    available_toolsets=list(self._enabled_toolsets),
+                )
+            )
         except Exception:
             return ""
         if not metadata:
             return ""
         lines = ["## available skills"]
         for meta in metadata:
-            lines.append(f"- {meta.name}: {meta.description}")
+            suffix = ""
+            # setup 软标记 —— 仅当 metadata 暴露该能力时（向后兼容旧 SkillMetadata）
+            missing = getattr(meta, "missing_env_vars", lambda: [])()
+            if missing:
+                suffix = "  ⚠ (setup: set " + ", ".join(missing) + ")"
+            lines.append(f"- {meta.name}: {meta.description}{suffix}")
         return "\n".join(lines)
+
+    def _available_tool_names(self) -> list[str]:
+        """当前可用工具名 —— 与 ``_render_tool_list`` 同源（toolset 内置 +
+        memory provider 暴露的工具）。供 skill 索引的 requires_tools 门控用。"""
+        builtin = list(self._get_toolset_tool_names(self._enabled_toolsets))
+        provider = list(self._memory_manager.get_all_tool_names())
+        return sorted(set(builtin + provider))
 
     def _render_memory_block(self) -> str:
         """复用 ``MemoryManager.build_system_prompt()`` —— 它内部自己处理空态。"""

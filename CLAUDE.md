@@ -8,7 +8,7 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到挂载长期记忆 + 多智能体 + 跨项目可用。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v26.0 — skill 子系统纵深补强第一档：bundled 资源发现 + tier 3 读取 + 路径沙箱（skill 从单文件升级为目录包，`skill_view(name, file_path)` 双模式，`..`+symlink 双防线）。详见 [docs/decisions/v26.0.md](docs/decisions/v26.0.md)。
+- **当前阶段**：v26.1 — skill 子系统纵深补强第二档：可用性门控（`required_environment_variables` 缺失→软标记 ⚠ setup；`metadata.requires_tools/toolsets` 不满足→硬隐藏不进索引）。详见 [docs/decisions/v26.1.md](docs/decisions/v26.1.md)。
 - **演进主轴**：内存（v6→v16）→ transport（v17→v20）→ 交互层（v21.x）→ 流式（v22）→ 多智能体（v23.x）→ 会话持久化（v24.x）→ 数据飞轮（v25.x）→ skill 纵深（v26.x，走 `skill/` 分支前缀）。
 
 ---
@@ -31,7 +31,7 @@
 
 **下一档候选**：pricing 多家对账（pricing_version + actual_cost）/ insights 扩展（platform/skill breakdown + 活动模式）/ v15.2 prefill retry / v23.5 嵌套 delegate（role: orchestrator + max_spawn_depth）/ v24.2 会话级锁修 last-write-wins / FTS5 全文检索。
 
-**已规划档组**：**v26 skill 子系统纵深补强**（资源/参数/可用性三层，走独立 `skill/` 分支前缀与 flywheel 并行）— ✅ v26.0 bundled 资源发现 + tier 3 读取 + 路径沙箱（已完成）/ v26.1 可用性门控（env vars + requires_tools）/ v26.2 安全 token 替换（不做内联 shell）。计划见 [docs/Skill-system/skill-system-completion-plan.md](docs/Skill-system/skill-system-completion-plan.md)。（注：skill 档组先占用 v26 号，原候选「pricing 对账」顺延到后续可用号。）
+**已规划档组**：**v26 skill 子系统纵深补强**（资源/参数/可用性三层，走独立 `skill/` 分支前缀与 flywheel 并行）— ✅ v26.0 bundled 资源发现 + tier 3 读取 + 路径沙箱（已完成）/ ✅ v26.1 可用性门控（env vars 软标记 + requires_tools 硬隐藏，已完成）/ v26.2 安全 token 替换（不做内联 shell）。计划见 [docs/Skill-system/skill-system-completion-plan.md](docs/Skill-system/skill-system-completion-plan.md)。（注：skill 档组先占用 v26 号，原候选「pricing 对账」顺延到后续可用号。）
 
 ---
 
@@ -127,7 +127,7 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 #       v16_batch_decay/leiyu_recall_trace, v17_transport, v18_anthropic, v19_failover,
 #       v20_prompt_cache, v21_slash, v21_2_prompt_builder, v21_3_skill, v21_4_tool_result_protocol,
 #       v22_streaming, v23_0_delegate, v23_1_batch, v23_2_project_context, v23_3_streaming, v23_4_structured_result,
-#       v24_0_session_store, v24_1_compaction_chain, v26_0_skill_resources
+#       v24_0_session_store, v24_1_compaction_chain, v26_0_skill_resources, v26_1_availability
 
 # 看当前装了几个 skill
 ls /Users/qshf/my-project/nano_hermes_agent/skills/
