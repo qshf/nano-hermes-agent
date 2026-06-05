@@ -25,33 +25,9 @@
 
 ---
 
-## 3. 进度状态（30 档）
+## 3. 进度与下一步
 
-每档"引入概念"只列关键词；细节看 [docs/decisions/v<N>.md](docs/decisions/README.md)。
-
-| 版本 | 标题 | 关键词 |
-|------|------|--------|
-| v0–v5 | 工具调度演进 | if/elif → 注册表 → tool calling → toolsets → prompt builder → MCP |
-| v6–v8 | 记忆基础设施 | builtin store → MemoryProvider ABC → MemoryManager 编排 |
-| v9 | Agent Loop 生命周期 | prefetch / sync_turn 钩子 |
-| v10 / v10.1 | 远端语义记忆 | HTTP 边界 → pgvector + OpenAI embedding |
-| v11 | 知识图谱（Hindsight 1:1） | 实体/关系/事实 + 多策略检索 + reflect + memory mode |
-| v12 / v13 | 读写双异步 | 后台 writer 线程 + 后台 prefetch 预热 |
-| v14 / v15 / v15.1 | 会话与压缩 | /new + /resume → 5 阶段压缩 → 边界修复 + assistant 合法性 |
-| v16 | 召回质量 | retain 批量 / N-hop BFS / 时间衰减 |
-| v17 / v18 / v19 | Transport 解耦 | ABC → AnthropicTransport → Chain + 断路器 |
-| v20 | Prompt Cache | Anthropic ephemeral system_and_3 / Usage 拆 read+write |
-| v21.1 / v21.2 / v21.3 / v21.4 | 交互层 | slash 注册表 → 三段式 PromptBuilder → Skill progressive disclosure → tool result 协议 |
-| v22 | 流式 + 中断 | stream_call / CancelToken / failover-before-first-event |
-| v23.0 / v23.1 | 多智能体 | delegate_task + 隔离 child loop → tasks[] 批量并行 + 工具白名单 |
-| v23.2 | 跨项目可用 | `--cwd PATH` + nano-hermes-agent.md / AGENTS.md 注入 / NANO_IGNORE_RULES |
-| v23.3 | 多智能体流式中继 + 父子 cancel | stream_enabled 透传到 child_loop / progress 走 stderr / 共享 CancelToken / interrupted 状态 |
-| v23.4 | 多智能体结构化结果 + 成本聚合 | 统一 `{"results":[...]}` JSON / runtime.session_tokens 4 维 / tool_trace + duration / `/transport` 末尾 session 行 |
-| v24.0 | 会话状态持久化（SQLite + 真 resume） | `agent/session_store.py`：sessions + messages 两表 / WAL / 全量删重插 / 轮末+退出 save / `/resume` 真 load / `/sessions` 列表 |
-| v24.1 | append-only + 压缩链 | `append()` 无状态游标只增不删 / 压缩点会话分裂抽到 `agent/compaction.py` / resume 走 tip / `/sessions --all` 展开折叠链 |
-| v25.0 | trajectory 训练样本导出 | OpenAI→ShareGPT（`agent/trajectory.py`）/ `agent/redact.py` 写盘前脱敏 / 三 flush 点含 delegate 子轨迹 / `TRAJECTORY_DIR=:none:` 关 |
-| v25.1 | insights 离线分析 + 结构化日志 | `agent/insights.py` 读 SQLite 出 token/成本/tool top-N/失败率 / `agent/logging.py` 挂 root logger 写盘前脱敏 + session 注入 / `/insights` `/trajectory list` |
-| v26.0 | skill bundled 资源发现 + tier 3 读取 + 路径沙箱 | `SkillMetadata.skill_dir` / `list_resources`（4 类白名单）+ `read_resource`（`..`+symlink 双防线 / binary 尺寸标记）/ `skill_view(name, file_path)` 双模式 / scripts 只发现不执行 |
+**完整 30 档进度表（版本 / 标题 / 关键词 / 引入概念）见 [docs/decisions/README.md](docs/decisions/README.md)，每档细节看对应 `v<N>.md`。** 本节只留规划。
 
 **下一档候选**：pricing 多家对账（pricing_version + actual_cost）/ insights 扩展（platform/skill breakdown + 活动模式）/ v15.2 prefill retry / v23.5 嵌套 delegate（role: orchestrator + max_spawn_depth）/ v24.2 会话级锁修 last-write-wins / FTS5 全文检索。
 
