@@ -215,7 +215,7 @@ class TransportChain:
 
         raise FailoverExhausted(attempts)
 
-    # ── V22 流式入口 ──────────────────────────────────────────
+    # ── 流式入口 ──────────────────────────────────────────
     def stream_call(
         self,
         client: Any = None,
@@ -327,7 +327,7 @@ class TransportChain:
         if entry.model:
             call_kwargs["model"] = entry.model
 
-        # V20: cache 启用时让 transport 自己决定怎么标记（Anthropic 打 cache_control，
+        # cache 启用时让 transport 自己决定怎么标记（Anthropic 打 cache_control，
         # 其他家 identity）。注意 apply_prompt_cache 返回深拷贝，不污染上游 messages。
         if self.cache_enabled and "messages" in call_kwargs:
             call_kwargs["messages"] = entry.transport.apply_prompt_cache(
@@ -337,7 +337,7 @@ class TransportChain:
         for attempt in range(self.max_retries + 1):
             try:
                 resp = entry.transport.call(entry.client, **call_kwargs)
-                # V20: 累计 cache 统计 — usage.cached_tokens 已被 transport 标准化
+                # 累计 cache 统计 — usage.cached_tokens 已被 transport 标准化
                 self._accumulate_cache_stats(entry, resp)
                 return resp
             except Exception as exc:
@@ -378,7 +378,7 @@ class TransportChain:
                 entry.api_mode, entry.breaker.consecutive_failures, classified.reason,
             )
 
-    # ── V20 cache 记账 ────────────────────────────────────────
+    # ── cache 记账 ────────────────────────────────────────
 
     def _accumulate_cache_stats(
         self, entry: _ChainEntry, resp: NormalizedResponse,

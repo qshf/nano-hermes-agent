@@ -35,7 +35,7 @@ def cmd_compress(args: str, ctx: AgentCtx) -> None:
 
     pre_msgs = len(ctx.messages)
     old_sid = ctx.current_session_id
-    # V24.1: 统一走 apply_compaction —— 真压缩了会话分裂，ctx.current_session_id
+    # 统一走 apply_compaction —— 真压缩了会话分裂，ctx.current_session_id
     # 会被改成 旧-cN；in-place 替换 ctx.messages（与主循环局部 messages 同引用）。
     did = apply_compaction(ctx)
     if not did:

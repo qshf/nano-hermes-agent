@@ -55,7 +55,7 @@ Always explain what you're doing before and after tool use.
 Respond in the same language as the user."""
 
 
-# V23.2: 项目上下文文件配置
+# 项目上下文文件配置
 PROJECT_CONTEXT_FILE_NAMES = ("nano-hermes-agent.md", "AGENTS.md")
 PROJECT_CONTEXT_MAX_CHARS = 20_000
 PROJECT_CONTEXT_TRUNCATE_HEAD_RATIO = 0.6

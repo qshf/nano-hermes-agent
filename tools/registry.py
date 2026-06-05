@@ -24,7 +24,7 @@ CHECK_FN_TTL = 30.0  # check_fn 缓存有效期（秒）
 log = logging.getLogger(__name__)
 
 
-# --- V4: 异步桥接 ---
+# --- 异步桥接 ---
 
 def _run_async(coro) -> str:
     """在 sync 上下文中运行 async 协程。
@@ -118,8 +118,8 @@ class ToolRegistry:
     def dispatch(self, name: str, args: dict) -> str:
         """根据工具名分发调用。
 
-        V5: coerce → pre_hook → 执行 → post_hook → transform。
-        V21.4: 加最终防线 — 任何工具返回非字符串、抛出异常逃逸出 handler 自身的
+        流程：coerce → pre_hook → 执行 → post_hook → transform。
+        最终防线 — 任何工具返回非字符串、抛出异常逃逸出 handler 自身的
               try/except、或返回非合法 JSON 字符串时，dispatch 兜底成统一格式，
               确保 messages[]["content"] 永远是合法 JSON 字符串。
         """
@@ -129,18 +129,18 @@ class ToolRegistry:
         if entry is None:
             return tool_error(f"Unknown tool: {name}")
 
-        # V4: 类型强制转换
+        # 类型强制转换
         from tools.coerce import coerce_args
         coerced = coerce_args(entry["schema"], args)
 
-        # V5: pre_tool_call 钩子（可阻止执行）
+        # pre_tool_call 钩子（可阻止执行）
         from tools.hooks import hook_manager
         pre_results = hook_manager.invoke("pre_tool_call", tool_name=name, args=coerced)
         for r in pre_results:
             if isinstance(r, dict) and r.get("action") == "block":
                 return tool_error(f"Blocked: {r.get('message', '')}")
 
-        # 执行 handler（计时） — V21.4: 顶层 try 兜底未捕获异常
+        # 执行 handler（计时） — 顶层 try 兜底未捕获异常
         start = time.monotonic()
         try:
             if entry.get("is_async"):
@@ -152,17 +152,17 @@ class ToolRegistry:
             return tool_error(f"Tool execution failed: {type(exc).__name__}: {exc}")
         duration_ms = int((time.monotonic() - start) * 1000)
 
-        # V5: post_tool_call 钩子（观察者，返回值忽略）
+        # post_tool_call 钩子（观察者，返回值忽略）
         hook_manager.invoke("post_tool_call", tool_name=name, args=coerced, result=result, duration_ms=duration_ms)
 
-        # V5: transform_tool_result 钩子（第一个非 None 字符串替换结果）
+        # transform_tool_result 钩子（第一个非 None 字符串替换结果）
         transform_results = hook_manager.invoke("transform_tool_result", tool_name=name, args=coerced, result=result)
         for r in transform_results:
             if isinstance(r, str):
                 result = r
                 break
 
-        # V21.4 最终防线：保证返回值是合法 JSON 字符串
+        # 最终防线：保证返回值是合法 JSON 字符串
         # 三种异常情况：(1) handler 返回非 str；(2) 返回 str 但不是合法 JSON；
         # (3) 返回合法 JSON 但是 list/数字等非 object 顶层类型 — 也强转。
         if not isinstance(result, str):

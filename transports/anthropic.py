@@ -89,11 +89,11 @@ class AnthropicTransport(ProviderTransport):
         for m in messages:
             role = m.get("role", "user")
             content = m.get("content", "")
-            top_cache = m.get("cache_control")  # V20: prompt_caching 顶层标记
+            top_cache = m.get("cache_control")  # prompt_caching 顶层标记
 
             if role == "system":
                 if isinstance(content, list):
-                    # V20: 已升级为 [{"type":"text", ..., "cache_control":...}]
+                    # 已升级为 [{"type":"text", ..., "cache_control":...}]
                     system = content
                 else:
                     system = content if isinstance(content, str) else str(content)
@@ -102,7 +102,7 @@ class AnthropicTransport(ProviderTransport):
             if role == "assistant":
                 blocks: List[Dict[str, Any]] = []
                 if isinstance(content, list):
-                    # V20: 已是 block list（带 cache_control）
+                    # 已是 block list（带 cache_control）
                     blocks.extend(content)
                 elif content:
                     blocks.append({"type": "text", "text": str(content)})
@@ -128,7 +128,7 @@ class AnthropicTransport(ProviderTransport):
                 continue
 
             if role == "tool":
-                # V20: tool result 字符串可能已被 prompt_caching 升级为 list；统一回退到 str
+                # tool result 字符串可能已被 prompt_caching 升级为 list；统一回退到 str
                 tr_content: Any
                 if isinstance(content, list):
                     tr_content = content
@@ -151,7 +151,7 @@ class AnthropicTransport(ProviderTransport):
 
             # role=user
             if isinstance(content, list):
-                # V20: 已升级为 block list
+                # 已升级为 block list
                 user_content: Any = content
                 if top_cache and content and isinstance(content[-1], dict):
                     content[-1]["cache_control"] = top_cache
@@ -291,7 +291,7 @@ class AnthropicTransport(ProviderTransport):
             raise ValueError("Invalid response from messages.create")
         return self.normalize_response(response)
 
-    # ── V22 真流式 ──────────────────────────────────────────────────────
+    # ── 真流式 ──────────────────────────────────────────────────────
     def stream_call(
         self,
         client: Any,

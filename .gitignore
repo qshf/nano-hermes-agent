@@ -20,3 +20,6 @@ trajectories/
 # V25.1 结构化日志（脱敏后仍属本地运行产物）—— 不入库
 logs/
 *.log
+
+docs/值得讲的地方
+docs/整体叙事

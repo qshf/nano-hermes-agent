@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 #
 # 关键差异：
 #   1. 不含父的角色 / 风格指令（避免父 prompt 被复刻进子上下文）
-#   2. 不含 skill 索引段（V21.3 tier 1）—— 子默认拿不到 skill_view，索引也无意义
+#   2. 不含 skill 索引段 —— 子默认拿不到 skill_view，索引也无意义
 #   3. 不含 memory 围栏 —— 子拿不到 memory 工具
 #   4. 显式列出"你只能用这些工具"，让 LLM 提前放弃幻觉调用 delegate_task / memory_*
 #   5. 显式要求"达成目标后给出 concise summary"，避免子在父等待时无限提问
@@ -164,9 +164,9 @@ def run_child_loop(
     registry: ToolRegistry,
     allowed_tool_names: set[str],
     max_iterations: int = 8,
-    cancel_token: Optional[CancelToken] = None,            # V23.3
-    stream_enabled: bool = False,                          # V23.3
-    progress_callback: Optional[Callable[[StreamEvent], None]] = None,  # V23.3
+    cancel_token: Optional[CancelToken] = None,
+    stream_enabled: bool = False,
+    progress_callback: Optional[Callable[[StreamEvent], None]] = None,
 ) -> dict[str, Any]:
     """跑一个隔离的子 agent loop，返回结果 dict。
 
@@ -227,15 +227,15 @@ def run_child_loop(
     # 子 tools schema —— 直接复用 registry.get_definitions，但只传白名单
     tools_schema = registry.get_definitions(effective_tools)
 
-    # V23.3: 流式路径只在两个条件都成立时启用 —— ``stream_enabled`` 且 chain 有
-    # ``stream_call`` 方法。fake chain（V23.0/V23.1 测试用）默认没实现 stream_call，
+    # 流式路径只在两个条件都成立时启用 —— ``stream_enabled`` 且 chain 有
+    # ``stream_call`` 方法。fake chain（测试用）默认没实现 stream_call，
     # 所以即便测试里漏传 stream_enabled=False 也能优雅退化。
     use_stream = bool(stream_enabled) and hasattr(chain, "stream_call")
 
     def _is_cancelled() -> bool:
         return cancel_token is not None and cancel_token.is_cancelled()
 
-    # V23.4: 子内层累计的 token / trace / 起始时刻 —— 跨循环迭代累加
+    # 子内层累计的 token / trace / 起始时刻 —— 跨循环迭代累加
     tokens: dict[str, int] = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
     tool_trace: list[dict] = []
     started_at = time.monotonic()
@@ -339,7 +339,7 @@ def run_child_loop(
                 messages=messages,
             )
 
-        # V23.4: 把本次 LLM usage 累加到子内层 tokens（流式 done 帧的 response.usage
+        # 把本次 LLM usage 累加到子内层 tokens（流式 done 帧的 response.usage
         # 已经被 transport 层标准化，等价同步路径）
         _accumulate_usage(tokens, normalized.usage)
 
@@ -362,9 +362,8 @@ def run_child_loop(
 
         # 跑工具 —— 子永远走 registry.dispatch，绕过 memory_manager
         # 白名单二次校验：防 LLM 幻觉调用未授权工具（罕见但要兜底）
-        # V23.3: 每个 tool 跑前先 check cancel —— 父 cancel 时让长时工具
-        # （如 terminal 跑 `sleep 100`）不再继续执行
-        # V23.4: dispatch 后把摘要 append 到 tool_trace
+        # 每个 tool 跑前先 check cancel —— 父 cancel 时让长时工具
+        # （如 terminal 跑 `sleep 100`）不再继续执行；dispatch 后把摘要 append 到 tool_trace
         for tool_call in normalized.tool_calls:
             if _is_cancelled():
                 return _build_result(
@@ -389,7 +388,7 @@ def run_child_loop(
                 except json.JSONDecodeError as exc:
                     result = tool_error(f"invalid tool arguments JSON: {exc}")
                 else:
-                    # registry.dispatch 自带 V21.4 兜底（异常 / 非 str / 非 JSON）
+                    # registry.dispatch 自带兜底（异常 / 非 str / 非 JSON）
                     result = registry.dispatch(name, args)
 
             messages.append({
@@ -397,7 +396,7 @@ def run_child_loop(
                 "tool_call_id": tool_call.id,
                 "content": result,
             })
-            # V23.4: 每条 tool 调用追加一条轻量 trace 摘要
+            # 每条 tool 调用追加一条轻量 trace 摘要
             tool_trace.append({
                 "tool": name,
                 "args_preview": _truncate_args(raw_args),

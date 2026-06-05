@@ -51,10 +51,10 @@ DB_PATH = Path(os.environ.get("SESSION_DB_PATH", "sessions/state.db"))
 # output / cache_read / cache_write），摊平进 4 个 INTEGER 列。
 _TOKEN_COLUMNS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
 
-# 建表 DDL —— 源项目 30+ 字段裁到必要的 + 压缩链 3 字段（v24.1 才写）。
+# 建表 DDL —— 源项目 30+ 字段裁到必要的 + 压缩链 3 字段。
 # 逐条入行（messages 一行一条）而非整段 JSON 塞一列：对齐源项目 messages 表，
 # 教"把 OpenAI 消息规范化进表 + 读时重建 shape"这个真实生产模式；也为
-# v24.1 的 append-only 游标（COUNT(*)）和后续可选 FTS 留地基。
+# append-only 游标（COUNT(*)）和后续可选 FTS 留地基。
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id    TEXT PRIMARY KEY,

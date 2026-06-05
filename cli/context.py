@@ -75,10 +75,10 @@ class AgentCtx:
     registry: Any                      # tools.registry.ToolRegistry
     enabled_toolsets: list[str]
     build_system_prompt: Callable[[], str]
-    runtime: AgentRuntime              # 父子共享的可变运行期状态（V23.3+）
-    prompt_builder: Optional[Any] = None   # agent.prompt_builder.PromptBuilder（V21.2+）
-    skill_loader: Optional[Any] = None     # agent.skill_loader.SkillLoader（V21.3+）
-    session_store: Optional[Any] = None    # agent.session_store.SessionStore（V24.0+）
+    runtime: AgentRuntime              # 父子共享的可变运行期状态
+    prompt_builder: Optional[Any] = None   # agent.prompt_builder.PromptBuilder
+    skill_loader: Optional[Any] = None     # agent.skill_loader.SkillLoader
+    session_store: Optional[Any] = None    # agent.session_store.SessionStore
 
     # 后续版本扩展位
     extras: dict[str, Any] = field(default_factory=dict)

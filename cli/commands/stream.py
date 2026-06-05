@@ -1,19 +1,13 @@
-"""V22 — ``/stream`` 切换流式输出。
+"""``/stream`` 切换流式输出。
 
 用法
 ----
     /stream            # 显示当前状态
     /stream on         # 启用流式（默认）
-    /stream off        # 禁用流式 — 退化到 V20 行为，整段响应到达后一次性打印
+    /stream off        # 禁用流式 — 整段响应到达后一次性打印
 
-为什么要保留关闭路径
-================
-V22 之前的 21 档全是同步 ``chain.call``，已有 4 套测试脚本依赖"一次性返回"
-形态调试。``stream off`` 让那些路径仍可用，也方便对比"流式 vs 非流式"的
-usage / cache 命中率是否一致（V22 验证条目之一）。
-
-源项目 ``cli.py`` 的 ``/stream`` 命令更复杂（含 reasoning_box / per-provider
-opt-out / autopilot 联动等），nano 只保留布尔开关。
+关闭路径保留：让依赖"一次性返回"形态的测试脚本仍可用，也方便对比
+流式 vs 非流式的 usage / cache 命中率是否一致。
 """
 
 from cli.context import AgentCtx

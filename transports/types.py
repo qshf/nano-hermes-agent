@@ -66,8 +66,8 @@ class Usage:
     prompt_tokens: int = 0 #  输入规模
     completion_tokens: int = 0 # 输出规模
     total_tokens: int = 0 # 总规模（prompt + completion）
-    cached_tokens: int = 0 # 从缓存读取的 token 数（V20: Anthropic cache_read_tokens）
-    cache_creation_tokens: int = 0  # V20: Anthropic cache_creation_input_tokens
+    cached_tokens: int = 0 # 从缓存读取的 token 数（Anthropic cache_read_tokens）
+    cache_creation_tokens: int = 0  # Anthropic cache_creation_input_tokens
 
 
 @dataclass

@@ -18,7 +18,7 @@ from tools.hooks import hook_manager
 _TOOLS_DIR = Path(__file__).parent
 _PLUGINS_DIR = _TOOLS_DIR.parent / "plugins"
 
-# V5: 跟踪已加载的插件模块
+# 跟踪已加载的插件模块
 _loaded_plugins: dict[str, object] = {}
 
 
@@ -46,7 +46,7 @@ def load_plugin(filename: str):
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
 
-    # V5: 如果插件导出 register()，调用它注册钩子
+    # 如果插件导出 register()，调用它注册钩子
     if hasattr(module, "register"):
         module.register(hook_manager)
 
@@ -60,7 +60,7 @@ def unload_plugin(filename: str) -> bool:
     if module is None:
         return False
 
-    # V5: 如果插件导出 deregister()，调用它注销钩子
+    # 如果插件导出 deregister()，调用它注销钩子
     if hasattr(module, "deregister"):
         module.deregister(hook_manager)
 

@@ -64,10 +64,9 @@ def apply_compaction(ctx: Any) -> bool:
             turn_count=ctx.turn_count, model=ctx.model,
             session_tokens=ctx.runtime.session_tokens,
         )
-        # V25.0: 同一时机同一份 ctx.messages，顺手转 ShareGPT 落一份 trajectory。
-        # 干净复用 —— v24.1 已在这里把"压缩前全文"抓出来落 session-store，v25.0
-        # 只在旁边多落一份训练格式。这段会话即将被压缩摘要替换（即将"丢"），正是
-        # 数据飞轮该接住它的时刻（决策 7）。completed=True：自然压缩 = 这段跑完了。
+        # 同一时机同一份 ctx.messages，顺手转 ShareGPT 落一份 trajectory。
+        # 这段会话即将被压缩摘要替换（即将"丢"），正是数据飞轮接住它的时刻。
+        # completed=True：自然压缩 = 这段跑完了。
         try:
             from agent.trajectory import flush_session_trajectory
             flush_session_trajectory(

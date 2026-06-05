@@ -284,7 +284,7 @@ class ChatCompletionsTransport(ProviderTransport):
             raise ValueError("Invalid response from chat.completions.create")
         return self.normalize_response(response)
 
-    # ── V22 真流式 ──────────────────────────────────────────────────────
+    # ── 真流式 ──────────────────────────────────────────────────────
     def stream_call(
         self,
         client: Any,

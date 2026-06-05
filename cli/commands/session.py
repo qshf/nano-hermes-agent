@@ -83,14 +83,14 @@ def cmd_session(args: str, ctx: AgentCtx) -> None:
     category="session",
 )
 def cmd_new(args: str, ctx: AgentCtx) -> None:
-    # V24.0: 切走前固化旧会话，否则当前对话蒸发（假 resume 的另一面）
+    # 切走前固化旧会话，否则当前对话蒸发（假 resume 的另一面）
     _persist_current(ctx)
     new_id = f"session-{uuid.uuid4().hex[:8]}"
     ctx.memory_manager.on_session_switch_all(new_id, reset=True)
     ctx.current_session_id = new_id
     ctx.messages[:] = [{"role": "system", "content": _rebuild_system_prompt(ctx)}]
     ctx.turn_count = 0
-    # V24.0: 新会话的 token 计数归零（旧会话累计已随 save 落盘）
+    # 新会话的 token 计数归零（旧会话累计已随 save 落盘）
     _restore_session_tokens(ctx, {})
     print(f"  [session] New session: {ctx.current_session_id}")
 
@@ -110,11 +110,11 @@ def cmd_resume(args: str, ctx: AgentCtx) -> None:
         print("  [session] no session store (persistence disabled)")
         return
 
-    # V24.1: 先沿压缩链重定向到最新 tip —— 用户敲的旧 id 若已被压缩分裂封存，
+    # 先沿压缩链重定向到最新 tip —— 用户敲的旧 id 若已被压缩分裂封存，
     # 跳到压缩后连续点（旧 root 虽留全文但 resume 它会立刻触发重压）。无链则原样。
     tip = ctx.session_store.resolve_resume_tip(target)
 
-    # V24.0: 先真 load —— 不存在则友好报错，**不动当前对话**（不像 v14 直接清空）
+    # 先真 load —— 不存在则友好报错，**不动当前对话**
     data = ctx.session_store.load(tip)
     if data is None:
         print(f"  [session] No saved session: {target}")
@@ -151,7 +151,7 @@ def cmd_sessions(args: str, ctx: AgentCtx) -> None:
     if ctx.session_store is None:
         print("  [session] no session store (persistence disabled)")
         return
-    # V24.1: 默认折叠压缩链（一条逻辑对话只显示 tip 一行）；--all 展开看压缩前节点
+    # 默认折叠压缩链（一条逻辑对话只显示 tip 一行）；--all 展开看压缩前节点
     fold = "--all" not in args.split()
     rows = ctx.session_store.list_sessions(fold_chains=fold)
     if not rows:

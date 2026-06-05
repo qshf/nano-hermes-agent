@@ -99,6 +99,8 @@ def apply_anthropic_cache_control(
     if not messages:
         return messages
 
+    # Anthropic 默认 cache TTL 是 5m；只有 1h 需要显式带 ttl 字段。
+    # 保持 5m 省略可以兼容更多 Anthropic-like 代理端点。
     marker: Dict[str, Any] = {"type": "ephemeral"}
     if cache_ttl == "1h":
         marker["ttl"] = "1h"

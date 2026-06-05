@@ -8,7 +8,7 @@ from typing import Optional
 from transports.streaming import CancelToken
 
 
-# V23.4: 父子共享的 session-level token 累计字段名 —— 与 ``transports.types.Usage``
+# 父子共享的 session-level token 累计字段名 —— 与 ``transports.types.Usage``
 # 字段 1:1 对齐。常量化让 ``delegate_tool`` / ``main.py`` 累加时不会 typo 漏键。
 SESSION_TOKEN_KEYS = ("input", "output", "cache_read", "cache_write")
 

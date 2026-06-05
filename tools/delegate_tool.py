@@ -78,27 +78,15 @@ from transports.streaming import EVENT_DONE, EVENT_TOOL_CALL_STARTED, StreamEven
 logger = logging.getLogger(__name__)
 
 
-# ── V23.3 stderr fan-in lock ─────────────────────────────────────────────
-#
-# 多 worker 并发写父 stderr 时必须串行化，否则单行会被对半截断（如
-# ``[task#1] read_file: foo[task#0] read_file: bar`` 这种交织）。
-# 模块级 lock —— 同进程一份 stderr，一份 lock，不随 context 重置。
+# 串行化多 worker 并发写父 stderr（否则单行会被交织截断）。
 _PROGRESS_STDERR_LOCK = threading.Lock()
 
 
-# ── V23.4 session_tokens 累加 lock ───────────────────────────────────────
-#
-# 多 worker 完成后并发累加 ``runtime.session_tokens`` 时必须串行化：dict 在
-# CPython 单条 ``d[k] += n`` 不是原子的（GIL 仅保单字节字节码原子，``+=`` 是
-# LOAD/ADD/STORE 三步），两个 worker 同时累加同一键会丢一次。
+# 串行化多 worker 并发累加 runtime.session_tokens（dict += 非原子）。
 _SESSION_TOKENS_LOCK = threading.Lock()
 
 
-# ── V23.1 并发上限（env 可调，schema 不暴露 — 防父 LLM 滥用并发）─────────
-#
-# 默认 3 来自源项目 ``delegation.max_concurrent_children``。值取小一点的
-# 教学考量：3 个子并跑足够展示加速效果，又不至于一次开 8 个让 transport
-# rate-limit 触发，把"批量加速 + 故障切换"两个不变量纠缠到一起难以测试。
+# 并发上限（env DELEGATE_MAX_CONCURRENT 可调，schema 不暴露，默认 3）。
 def _get_max_concurrent() -> int:
     raw = os.environ.get("DELEGATE_MAX_CONCURRENT", "3")
     try:
@@ -108,15 +96,9 @@ def _get_max_concurrent() -> int:
         return 3
 
 
-# ── 黑名单（硬编码，V23.1 起暴露 ``tools`` 字段后仍强制减去）──────────────
-#
-# 每条都有具体理由，不要无差别复制源项目列表（nano 没有那么多工具）：
-#
-# - delegate_task：防递归（V23.0 仅 1 层；V23.4 才放开 orchestrator 角色）
-# - memory：nano 当前 memory_manager 暴露的单一工具名（V8 起），子拿了就能
-#           写脏父知识图谱
-# - memory_* 前缀：源项目里 hindsight 等 provider 拆出的子工具（如
-#           ``memory_recall_v2``）；nano 暂未拆，但前缀兜底未来扩展
+# 黑名单（硬编码，即便父暴露 tools 字段后仍强制减去）：
+# - delegate_task：防递归
+# - memory / memory_* 前缀：防子写脏父知识图谱
 _DELEGATE_BLACKLIST_NAMES = frozenset({"delegate_task", "memory"})
 _DELEGATE_BLACKLIST_PREFIXES = ("memory_",)
 
@@ -210,7 +192,7 @@ DELEGATE_TASK_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            # 单任务字段（V23.0 兼容路径）
+            # 单任务字段
             "goal": {
                 "type": "string",
                 "description": (
@@ -235,7 +217,7 @@ DELEGATE_TASK_SCHEMA = {
                     "Omit to give the sub-agent the full non-blacklisted parent toolset."
                 ),
             },
-            # V23.1 新增 — 批量模式
+            # 批量模式
             "tasks": {
                 "type": "array",
                 "description": (
@@ -436,12 +418,7 @@ def _run_one_task(
     # 不等批量整体结束（保证 cancel 时已写入的不丢）。
     _accumulate_runtime_tokens(ctx.runtime, child_result.get("tokens"))
 
-    # V25.0: 子轨迹 flush —— 这是决策 6 的核心，nano 在此超越源项目。
-    # 源 delegate（hermes-agent/tools/delegate_tool.py:1090 构造 child AIAgent 时
-    # 缺省 save_trajectories=False）让子 agent 中间步直接丢弃，只留 summary 回父。
-    # nano 让 _build_result 多带一份子内层完整 messages（child_loop.py 前置改动），
-    # 在此转 ShareGPT 落子独立 trajectory。子的 tool 调用序列往往是最干净的训练
-    # 样本（目标明确、上下文窄、无父对话噪声）—— 丢掉等于丢掉飞轮最优质的燃料。
+    # 子轨迹 flush：把子内层完整 messages 转 ShareGPT 落一份独立 trajectory。
     # 文件名带 task_index 隔离并发子；completed = 子正常跑完（非 interrupted/error）。
     try:
         from agent.trajectory import flush_session_trajectory
@@ -543,7 +520,7 @@ def delegate_task_handler(args: dict) -> str:
         if err:
             return tool_error(err)
         result = _run_one_task(single_entry, task_index=None, is_batch=False)
-        # V23.4: 单任务也走 results 数组（含 1 条），父 LLM 永远 json.loads → r["results"][i]
+        # 单任务也走 results 数组（含 1 条），父 LLM 永远 json.loads → r["results"][i]
         return tool_result(output=json.dumps(
             _build_handler_payload(
                 results=[result],
@@ -571,9 +548,8 @@ def delegate_task_handler(args: dict) -> str:
         len(tasks), max_workers,
     )
 
-    # ``executor.map`` 保留输入顺序（无论 worker 完成快慢），刚好与
-    # iteration-plan §V23.1 验证项 #2"结果顺序与 tasks 数组对齐"对齐。
-    # V23.3 进度中继走侧路 stderr，与主路 tool_result 顺序无关，仍可继续用 map。
+    # ``executor.map`` 保留输入顺序（无论 worker 完成快慢），结果与 tasks 数组对齐。
+    # 进度中继走侧路 stderr，与主路 tool_result 顺序无关。
     indexed = list(enumerate(tasks))
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         results = list(pool.map(
@@ -584,8 +560,7 @@ def delegate_task_handler(args: dict) -> str:
     logger.info("[delegate] batch done tasks=%d", len(results))
 
     # 单任务 + 批量统一返回 ``{"results":[...]}``；外层 ``tool_result`` 仍是
-    # V21.4 协议（``{"output": <json_string>}``），父 LLM 二次 ``json.loads`` 拿
-    # results 数组。
+    # ``{"output": <json_string>}`` 协议，父 LLM 二次 ``json.loads`` 拿 results 数组。
     return tool_result(output=json.dumps(
         _build_handler_payload(results=results, started_at=overall_started_at),
         ensure_ascii=False,

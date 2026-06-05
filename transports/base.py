@@ -83,7 +83,7 @@ class ProviderTransport(ABC):
         """
         ...
 
-    # ── V22: 流式入口（默认假流式 — 子类可重写为真流式） ────────
+    # ── 流式入口（默认假流式 — 子类可重写为真流式） ────────
 
     def stream_call(
         self,
