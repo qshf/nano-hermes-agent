@@ -13,9 +13,10 @@ skill 时通过工具调用拉取。
 扫描层 ~200 行的核心子集，去掉的部分：）
 ==================================================
 - 不做嵌套子目录（源项目 ``skills/<category>/<name>/SKILL.md``，nano 一级）
-- 不做条件激活（``requires_toolsets`` / ``requires_env_vars``）
+- 不做条件激活（``requires_toolsets`` / ``requires_env_vars``）— 留给 v26.1
 - 不做 mtime 失效检测的多级缓存（源项目对 100+ skill 是性能必需，nano 不需要）
-- 不做 ``references/`` / ``templates/`` 子文件（tier 3）
+- V26.0：tier 3 资源（``references/`` / ``templates/`` / ``assets/`` / ``scripts/``）
+  已支持发现 + 沙箱读取（``list_resources`` / ``read_resource``）
 - 不做 disabled list / external_dirs / qualified namespace
 - 不做 fallback 解析 — yaml 解析失败直接抛 ``KeyError`` / ``yaml.YAMLError``
 
@@ -48,12 +49,29 @@ PLATFORM_MAP: dict[str, str] = {
 
 @dataclass(frozen=True)
 class SkillMetadata:
-    """tier 1 元信息 — 注入 system prompt 的最小集。"""
+    """tier 1 元信息 — 注入 system prompt 的最小集。
+
+    V26.0：新增 ``skill_dir`` —— SKILL.md 的父目录，作为 tier 3 资源
+    （references / templates / assets / scripts）扫描与读取的沙箱根。
+    """
 
     name: str
     description: str
     path: Path
     platforms: tuple[str, ...]
+    skill_dir: Path = Path(".")  # 资源扫描根（SKILL.md 父目录）
+
+
+# tier 3 资源子目录 → 扩展名白名单。
+# 与源项目 ``tools/skills_tool.py:1196-1256`` 分类一致，扩展名收紧：
+# - references/templates 限文本类，scripts 限可执行脚本语言，assets 放行任意（含 binary）
+# - 白名单之外的文件不被 list_resources 收录（但 read_resource 仍可显式读，沙箱不依赖白名单）
+_RESOURCE_DIRS: dict[str, tuple[str, ...]] = {
+    "references": ("*.md", "*.txt"),
+    "templates": ("*.md", "*.py", "*.yaml", "*.yml", "*.json", "*.sh"),
+    "assets": ("*",),  # 任意文件（含 binary）
+    "scripts": ("*.py", "*.sh", "*.bash", "*.js", "*.ts"),
+}
 
 
 def parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
@@ -111,12 +129,14 @@ def skill_matches_platform(frontmatter: dict[str, Any]) -> bool:
 class SkillLoader:
     """扫描 ``skills/<name>/SKILL.md`` → 缓存 metadata → 按需读全文。
 
-    Two-tier progressive disclosure
-    ===============================
+    Three-tier progressive disclosure
+    ==================================
     - tier 1 (cheap)：``list_metadata()`` 启动期遍历返回轻量元信息，
       由 ``PromptBuilder._render_skill_index`` 注入 system prompt
     - tier 2 (on-demand)：``view(name)`` 在 agent 决定要用某 skill 时
       通过 ``tools/skill_view_tool.py`` 触发；返回完整 markdown 内容
+    - tier 3 (on-demand, V26.0)：``list_resources(name)`` 发现 bundled
+      资源，``read_resource(name, rel_path)`` 在沙箱内按需读取单个资源文件
 
     Parameters
     ----------
@@ -166,6 +186,7 @@ class SkillLoader:
                 description=str(fm["description"]).strip(),
                 path=skill_md,
                 platforms=platforms,
+                skill_dir=skill_md.parent,  # 资源扫描根
             )
             self._cache[meta.name] = meta
 
@@ -186,6 +207,87 @@ class SkillLoader:
         if meta is None:
             raise KeyError(f"unknown skill: {name}")
         return meta.path.read_text(encoding="utf-8")
+
+    # ── tier 3：bundled 资源发现 + 沙箱读取 ───────────────────
+
+    def list_resources(self, name: str) -> dict[str, list[str]]:
+        """发现某 skill 携带的 bundled 资源（references/templates/assets/scripts）。
+
+        skill 不是单个 ``SKILL.md``，而是一个**目录包**：``SKILL.md`` 是入口
+        （tier 2），引用的资源是 tier 3。本方法扫四个子目录，按类别返回相对
+        ``skill_dir`` 的路径列表 —— 告诉 agent「这个 skill 还带了哪些文件、
+        用什么路径取」。只发现、只列路径，**从不执行**（含 ``scripts/``）。
+
+        Returns:
+            ``{"references": ["references/api.md"], ...}``；无资源 → 空 dict。
+            每类内部按路径排序、去重。
+
+        Raises:
+            KeyError: 未知 skill 名。
+        """
+        meta = self._cache.get(name)
+        if meta is None:
+            raise KeyError(f"unknown skill: {name}")
+
+        out: dict[str, list[str]] = {}
+        for sub, patterns in _RESOURCE_DIRS.items():
+            d = meta.skill_dir / sub
+            if not d.is_dir():
+                continue
+            files = sorted(
+                {
+                    str(f.relative_to(meta.skill_dir))
+                    for pat in patterns
+                    for f in d.rglob(pat)
+                    if f.is_file()
+                }
+            )
+            if files:
+                out[sub] = files
+        return out
+
+    def read_resource(self, name: str, rel_path: str) -> tuple[str, bool]:
+        """读取 skill 目录内的 tier 3 资源；两道防线把读取沙箱在 skill_dir 内。
+
+        nano 不引入源项目的 ``path_security.py`` 整个模块，把两道防线内联
+        （教学场景看得见逻辑）：
+
+        - 防线 1：字面量 ``..`` 拦截 —— 任何路径分量是 ``..`` 直接拒（最常见攻击）
+        - 防线 2：``resolve()`` 后前缀校验 —— 解析符号链接后仍须落在 skill_dir
+          内（拦 symlink 指向目录外的逃逸）
+
+        Returns:
+            ``(content, is_binary)``。文本文件返回原始内容；无法 utf-8 解码的
+            binary 文件**不返回字节**，只返回 ``[Binary file: name, N bytes]``
+            尺寸标记（避免污染 context）。
+
+        Raises:
+            KeyError: 未知 skill 名。
+            ValueError: 路径越界（含字面 ``..`` 或 resolve 后逃逸）。
+            FileNotFoundError: 路径在沙箱内但文件不存在。
+        """
+        meta = self._cache.get(name)
+        if meta is None:
+            raise KeyError(f"unknown skill: {name}")
+
+        # 防线 1：字面量 ".." —— 在 resolve 前先拦，错误信息最直观
+        if ".." in Path(rel_path).parts:
+            raise ValueError(f"path traversal ('..') not allowed: {rel_path}")
+
+        target = (meta.skill_dir / rel_path).resolve()
+        root = meta.skill_dir.resolve()
+        # 防线 2：resolve 后仍须在 skill_dir 内（拦 symlink 逃逸）
+        if not (target == root or root in target.parents):
+            raise ValueError(f"path escapes skill dir: {rel_path}")
+
+        if not target.is_file():
+            raise FileNotFoundError(rel_path)
+
+        try:
+            return target.read_text(encoding="utf-8"), False
+        except UnicodeDecodeError:
+            size = target.stat().st_size
+            return f"[Binary file: {target.name}, {size} bytes]", True
 
     # ── 便利访问器 ─────────────────────────────────────────────────────
 

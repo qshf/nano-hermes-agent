@@ -81,6 +81,18 @@ def _view(loader, name: str) -> None:
         return
     print(content)
 
+    # 末尾列出 bundled 资源（tier 3），人工对照 agent 看到的 linked_files
+    try:
+        resources = loader.list_resources(name)
+    except (AttributeError, KeyError):
+        resources = {}
+    if resources:
+        print("\n  [skill] linked files (tier 3):")
+        for category, files in resources.items():
+            for rel in files:
+                print(f"    - {category}: {rel}")
+        print("  [skill] read one with: skill_view(name, '<path>')")
+
 
 def _reload(loader) -> None:
     before = len(loader)

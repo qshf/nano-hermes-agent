@@ -8,8 +8,8 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到挂载长期记忆 + 多智能体 + 跨项目可用。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v25.1 — insights 离线分析 + 结构化日志（读 v24 SQLite 出 token/成本/tool top-N/失败率报表 + session 注入日志 + 写盘前脱敏）。详见 [docs/decisions/v25.1.md](docs/decisions/v25.1.md)。
-- **演进主轴**：内存（v6→v16）→ transport（v17→v20）→ 交互层（v21.x）→ 流式（v22）→ 多智能体（v23.x）→ 会话持久化（v24.x）→ 数据飞轮（v25.x）。
+- **当前阶段**：v26.0 — skill 子系统纵深补强第一档：bundled 资源发现 + tier 3 读取 + 路径沙箱（skill 从单文件升级为目录包，`skill_view(name, file_path)` 双模式，`..`+symlink 双防线）。详见 [docs/decisions/v26.0.md](docs/decisions/v26.0.md)。
+- **演进主轴**：内存（v6→v16）→ transport（v17→v20）→ 交互层（v21.x）→ 流式（v22）→ 多智能体（v23.x）→ 会话持久化（v24.x）→ 数据飞轮（v25.x）→ skill 纵深（v26.x，走 `skill/` 分支前缀）。
 
 ---
 
@@ -19,7 +19,7 @@
 |------|---------|-----------|
 | 源项目 | `/Users/qshf/my-project/hermes-agent` | `https://github.com/qshf/hermes-agent` |
 | nano | `/Users/qshf/my-project/nano_hermes_agent` | `git@github.com:qshf/nano-hermes-agent.git` |
-| 当前分支 | `flywheel/v0.25.1`（基于 `flywheel/v0.25.0`；每档均建同名分支指针） | — |
+| 当前分支 | `skill/v0.26.0`（基于 `flywheel/v0.25.1`；skill 档组走独立 `skill/` 前缀与 flywheel 并行） | — |
 
 **跨目录硬约束**：源项目和 nano 不在同一目录。"对照源项目读 X 文件"的操作必须用源项目绝对路径，例如 `/Users/qshf/my-project/hermes-agent/plugins/memory/hindsight/__init__.py`。
 
@@ -47,12 +47,15 @@
 | v23.2 | 跨项目可用 | `--cwd PATH` + nano-hermes-agent.md / AGENTS.md 注入 / NANO_IGNORE_RULES |
 | v23.3 | 多智能体流式中继 + 父子 cancel | stream_enabled 透传到 child_loop / progress 走 stderr / 共享 CancelToken / interrupted 状态 |
 | v23.4 | 多智能体结构化结果 + 成本聚合 | 统一 `{"results":[...]}` JSON / runtime.session_tokens 4 维 / tool_trace + duration / `/transport` 末尾 session 行 |
-| v24.0 | 会话状态持久化（SQLite + 真 resume） | `agent/session_store.py`：sessions + messages 两表 / WAL / 全量删重插 / 剔除 system / 轮末+退出 save / `/resume` 真 load / `/sessions` 列表 |
-| **v24.1** | **append-only + 压缩链** | **`append()` 无状态游标（`COUNT(*)`）只增不删 / 压缩点会话分裂（`end_session`+`create_session`+换 id）抽到 `agent/compaction.py::apply_compaction`（自动压缩 + 手动 `/compress` 共用）/ `resolve_resume_tip` 无条件走到 tip / `list_sessions(fold_chains)` 折叠 + `/sessions --all` 展开** |
-| **v25.0** | **trajectory 训练样本导出** | **`agent/trajectory.py`：OpenAI messages → ShareGPT `{from,value}`（assistant 包 `<think>`、tool_calls 拍平成 `<tool_call>` XML 丢 tool_call_id、连续 tool 合并）/ completed+完整 → `*_samples.jsonl` 否则 `*_failed.jsonl` / `agent/redact.py` ~10 pattern import 时快照默认开 / 三 flush 点：压缩点 + 退出兜底 + delegate 子轨迹（`_build_result` 加 `messages` 前置改动，**子轨迹落盘超越源项目**）/ `TRAJECTORY_DIR=:none:` 关闭** |
-| **v25.1** | **insights 离线分析 + 结构化日志** | **`agent/insights.py`：`InsightsEngine` 读 v24 SQLite（sessions+messages 两表）跨会话聚合 overview（4 维 token / 估算成本 / 平均轮长）+ tool top-N（扫 messages.tool_calls）+ per-model + 失败率（扫 role=tool 的 `{"error":...}`）/ `estimate_cost` hardcode deepseek+qwen 单价、未知 model 标 unknown / 决策 4：数据源是 SQLite 不是 jsonl（jsonl 有损，删光仍出报表）/ `agent/logging.py`：`RotatingFileHandler` + `RedactingFormatter`（写盘前过 redact，与 trajectory 共用防线）+ session_id thread-local 注入（filter 挂 **handler** 级）/ **挂 root logger** 让已有 8 个 `getLogger(__name__)` 模块（transports.chain failover / delegate / memory…）日志自动流经脱敏（决策 9）/ `main.py` 启动 `setup_logging()` + boot 埋点 + 三处 `set_log_session`（session resolve / 切换 / 压缩分裂）/ `/insights [--days N]` + `/trajectory list` / `LOG_FILE=:none:` 关闭** |
+| v24.0 | 会话状态持久化（SQLite + 真 resume） | `agent/session_store.py`：sessions + messages 两表 / WAL / 全量删重插 / 轮末+退出 save / `/resume` 真 load / `/sessions` 列表 |
+| v24.1 | append-only + 压缩链 | `append()` 无状态游标只增不删 / 压缩点会话分裂抽到 `agent/compaction.py` / resume 走 tip / `/sessions --all` 展开折叠链 |
+| v25.0 | trajectory 训练样本导出 | OpenAI→ShareGPT（`agent/trajectory.py`）/ `agent/redact.py` 写盘前脱敏 / 三 flush 点含 delegate 子轨迹 / `TRAJECTORY_DIR=:none:` 关 |
+| v25.1 | insights 离线分析 + 结构化日志 | `agent/insights.py` 读 SQLite 出 token/成本/tool top-N/失败率 / `agent/logging.py` 挂 root logger 写盘前脱敏 + session 注入 / `/insights` `/trajectory list` |
+| v26.0 | skill bundled 资源发现 + tier 3 读取 + 路径沙箱 | `SkillMetadata.skill_dir` / `list_resources`（4 类白名单）+ `read_resource`（`..`+symlink 双防线 / binary 尺寸标记）/ `skill_view(name, file_path)` 双模式 / scripts 只发现不执行 |
 
-**下一档候选**：v26 多家 pricing 对账（pricing_version + actual_cost）/ insights 扩展（platform/skill breakdown + 活动模式）/ v15.2 prefill retry / v23.5 嵌套 delegate（role: orchestrator + max_spawn_depth）/ v24.2 会话级锁修 last-write-wins / FTS5 全文检索。
+**下一档候选**：pricing 多家对账（pricing_version + actual_cost）/ insights 扩展（platform/skill breakdown + 活动模式）/ v15.2 prefill retry / v23.5 嵌套 delegate（role: orchestrator + max_spawn_depth）/ v24.2 会话级锁修 last-write-wins / FTS5 全文检索。
+
+**已规划档组**：**v26 skill 子系统纵深补强**（资源/参数/可用性三层，走独立 `skill/` 分支前缀与 flywheel 并行）— ✅ v26.0 bundled 资源发现 + tier 3 读取 + 路径沙箱（已完成）/ v26.1 可用性门控（env vars + requires_tools）/ v26.2 安全 token 替换（不做内联 shell）。计划见 [docs/Skill-system/skill-system-completion-plan.md](docs/Skill-system/skill-system-completion-plan.md)。（注：skill 档组先占用 v26 号，原候选「pricing 对账」顺延到后续可用号。）
 
 ---
 
@@ -148,7 +151,7 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 #       v16_batch_decay/leiyu_recall_trace, v17_transport, v18_anthropic, v19_failover,
 #       v20_prompt_cache, v21_slash, v21_2_prompt_builder, v21_3_skill, v21_4_tool_result_protocol,
 #       v22_streaming, v23_0_delegate, v23_1_batch, v23_2_project_context, v23_3_streaming, v23_4_structured_result,
-#       v24_0_session_store, v24_1_compaction_chain
+#       v24_0_session_store, v24_1_compaction_chain, v26_0_skill_resources
 
 # 看当前装了几个 skill
 ls /Users/qshf/my-project/nano_hermes_agent/skills/
