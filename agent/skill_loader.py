@@ -75,6 +75,12 @@ class SkillMetadata:
     required_env_vars: tuple[str, ...] = ()
     requires_tools: tuple[str, ...] = ()
     requires_toolsets: tuple[str, ...] = ()
+    # V26.3：可选「行为指令」。声明了它的 skill，会把这段文本注入 system prompt
+    # 常驻段（PromptBuilder._render_behavioral_directives），让 agent 每轮都看得到，
+    # 不依赖它先调 skill_view。用于「需要主动触发」的能力（如语音播报）——光靠
+    # tier 1 一行 description 驱动不了主动行为。只在 skill 完全可用时注入（见
+    # is_fully_available），且应保持简短：每个 skill 都塞会撑爆 prompt + 毁缓存。
+    inject_directive: str = ""
 
     def missing_env_vars(self) -> list[str]:
         """声明的 env 中当前未设置（或为空串）的那些。顺序与声明一致。"""
@@ -84,6 +90,28 @@ class SkillMetadata:
     def setup_needed(self) -> bool:
         """有任一 required env 缺失 → 需要用户配置才能用（软标记依据）。"""
         return bool(self.missing_env_vars())
+
+    def is_fully_available(self, available_tools: list[str] | None = None) -> bool:
+        """skill 是否「完全可用」—— 注入 behavioral directive 的门槛。
+
+        比 list_metadata 的硬隐藏更严：那里只要 requires_tools 满足就进索引
+        （env 缺失仅软标记）；但 directive 是「命令 agent 主动用这个能力」，
+        能力真用不了（缺 env / 缺 tool）时注入是有害的，所以这里要求：
+
+        - 无 missing_env_vars（required env 全设了），且
+        - requires_tools 全在 available_tools 里（None=没传工具信息→不卡这条，
+          向后兼容单测路径）。
+
+        requires_toolsets 不在此判断 —— directive 门槛只认「具体工具 + env」这两个
+        agent 实际执行 directive 时直接依赖的条件。
+        """
+        if self.missing_env_vars():
+            return False
+        if available_tools is not None:
+            at = set(available_tools)
+            if any(t not in at for t in self.requires_tools):
+                return False
+        return True
 
 
 # tier 3 资源子目录 → 扩展名白名单。
@@ -255,6 +283,7 @@ class SkillLoader:
                 requires_toolsets=_parse_str_list(
                     (fm.get("metadata") or {}).get("requires_toolsets")
                 ),
+                inject_directive=str(fm.get("inject_directive") or "").strip(),
             )
             self._cache[meta.name] = meta
 

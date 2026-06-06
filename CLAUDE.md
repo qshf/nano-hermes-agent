@@ -8,7 +8,7 @@
 
 - **项目定位**：教学版 AI Agent，从零迭代演进到挂载长期记忆 + 多智能体 + 跨项目可用。
 - **源项目**：[hermes-agent](https://github.com/qshf/hermes-agent)（生产级，含 gateway / 多模型后端 / SQLite 会话 / 多终端环境 / 插件系统）。
-- **当前阶段**：v26.2 — skill 子系统纵深补强收尾档：安全 token 替换（SKILL.md 正文里 `${SKILL_DIR}`/`${SESSION_ID}` 白名单替换，**绝不移植源项目的内联 shell**，tier 3 资源不替）。详见 [docs/decisions/v26.2.md](docs/decisions/v26.2.md)。
+- **当前阶段**：v26.3 — skill 行为指令注入：SKILL.md frontmatter 声明 `inject_directive`，skill 完全可用（env 全设 + requires_tools 满足）时把强制纪律提到 system prompt 常驻段，让 agent 每轮可见、驱动主动行为（语音播报）。配套接入了独立包 `nano_voice_kit`（平级目录，见根 CLAUDE 记忆）。详见 [docs/decisions/v26.3.md](docs/decisions/v26.3.md)。
 - **演进主轴**：内存（v6→v16）→ transport（v17→v20）→ 交互层（v21.x）→ 流式（v22）→ 多智能体（v23.x）→ 会话持久化（v24.x）→ 数据飞轮（v25.x）→ skill 纵深（v26.x，走 `skill/` 分支前缀）。
 
 ---
@@ -31,7 +31,7 @@
 
 **下一档候选**：pricing 多家对账（pricing_version + actual_cost）/ insights 扩展（platform/skill breakdown + 活动模式）/ v15.2 prefill retry / v23.5 嵌套 delegate（role: orchestrator + max_spawn_depth）/ v24.2 会话级锁修 last-write-wins / FTS5 全文检索。
 
-**已规划档组**：**v26 skill 子系统纵深补强**（资源/参数/可用性三层，走独立 `skill/` 分支前缀与 flywheel 并行）— ✅ v26.0 bundled 资源发现 + tier 3 读取 + 路径沙箱（已完成）/ ✅ v26.1 可用性门控（env vars 软标记 + requires_tools 硬隐藏，已完成）/ ✅ v26.2 安全 token 替换（`${SKILL_DIR}`/`${SESSION_ID}` 白名单，不做内联 shell，已完成）。**三层全部落地，档组收尾。** 计划见 [docs/Skill-system/skill-system-completion-plan.md](docs/Skill-system/skill-system-completion-plan.md)。（注：skill 档组先占用 v26 号，原候选「pricing 对账」顺延到后续可用号。）
+**已规划档组**：**v26 skill 子系统纵深补强**（资源/参数/可用性三层，走独立 `skill/` 分支前缀与 flywheel 并行）— ✅ v26.0 bundled 资源发现 + tier 3 读取 + 路径沙箱 / ✅ v26.1 可用性门控（env vars 软标记 + requires_tools 硬隐藏）/ ✅ v26.2 安全 token 替换（`${SKILL_DIR}`/`${SESSION_ID}` 白名单，不做内联 shell）/ ✅ v26.3 行为指令注入（`inject_directive` → system prompt 常驻段，驱动 agent 主动行为；由接入 `nano_voice_kit` 语音播报触发）。计划见 [docs/Skill-system/skill-system-completion-plan.md](docs/Skill-system/skill-system-completion-plan.md)。（注：skill 档组占用 v26 号，原候选「pricing 对账」顺延到后续可用号。）
 
 ---
 
@@ -127,7 +127,8 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 #       v16_batch_decay/leiyu_recall_trace, v17_transport, v18_anthropic, v19_failover,
 #       v20_prompt_cache, v21_slash, v21_2_prompt_builder, v21_3_skill, v21_4_tool_result_protocol,
 #       v22_streaming, v23_0_delegate, v23_1_batch, v23_2_project_context, v23_3_streaming, v23_4_structured_result,
-#       v24_0_session_store, v24_1_compaction_chain, v26_0_skill_resources, v26_1_availability, v26_2_token_subst
+#       v24_0_session_store, v24_1_compaction_chain, v26_0_skill_resources, v26_1_availability, v26_2_token_subst,
+#       v26_3_inject_directive
 
 # 看当前装了几个 skill
 ls /Users/qshf/my-project/nano_hermes_agent/skills/

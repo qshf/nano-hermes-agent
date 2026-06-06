@@ -30,7 +30,7 @@ prompt 自动注入"用户项目根目录的上下文文件"：
 ========
 - ``PromptBuilder.build()`` 返回 ``"\\n\\n".join(...)`` — 段间用空行分隔
 - 每段都是独立方法 ``_render_<section>``，返回 str（空 str 表示该段跳过）
-- 段顺序固定：骨架 → 项目上下文（V23.2）→ skill 索引 → memory → 工具列表
+- 段顺序固定：骨架 → 项目上下文（V23.2）→ skill 索引 → 行为指令（V26.3）→ memory → 工具列表
 - ``cwd`` 为 None 时项目上下文段返回 ""，与 V21.2 行为完全一致（向下兼容）
 
 关于 V20 prompt cache 的影响
@@ -196,6 +196,42 @@ class PromptBuilder:
         provider = list(self._memory_manager.get_all_tool_names())
         return sorted(set(builtin + provider))
 
+    def _render_behavioral_directives(self) -> str:
+        """V26.3 行为指令段 —— 把「完全可用」的 skill 的 ``inject_directive``
+        注入 system prompt 常驻段，让 agent 每轮都看得到、不依赖先调 skill_view。
+
+        为什么需要：tier 1 只给 agent 一行 description，驱动不了「主动触发」类
+        能力（如语音播报）—— 强制纪律写在 SKILL.md 正文里，但 agent 平时不读正文。
+        本段把这类纪律提到常驻区，是渐进式披露的「常驻例外」。
+
+        门控（``is_fully_available``）：只注入 required env 全设、requires_tools
+        全满足的 skill —— 能力真用不了还命令 agent「必须用」是有害的。同一 cwd 下
+        可用性稳定 → 本段稳定 → 不破坏 prompt cache。
+        """
+        if self._skill_loader is None:
+            return ""
+        try:
+            metadata = list(
+                self._skill_loader.list_metadata(
+                    available_tools=self._available_tool_names(),
+                    available_toolsets=list(self._enabled_toolsets),
+                )
+            )
+        except Exception:
+            return ""
+        avail_tools = self._available_tool_names()
+        blocks: list[str] = []
+        for meta in metadata:
+            directive = getattr(meta, "inject_directive", "")
+            if not directive:
+                continue
+            if not meta.is_fully_available(avail_tools):
+                continue
+            blocks.append(f"### {meta.name}\n{directive}")
+        if not blocks:
+            return ""
+        return "## behavioral directives\n\n" + "\n\n".join(blocks)
+
     def _render_memory_block(self) -> str:
         """复用 ``MemoryManager.build_system_prompt()`` —— 它内部自己处理空态。"""
         block = self._memory_manager.build_system_prompt()
@@ -221,6 +257,7 @@ class PromptBuilder:
             self._render_skeleton(),
             self._render_project_context(),
             self._render_skill_index(),
+            self._render_behavioral_directives(),
             self._render_memory_block(),
             self._render_tool_list(),
         ]
