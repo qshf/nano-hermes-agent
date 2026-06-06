@@ -76,12 +76,15 @@ def test_all_v21_1_commands_registered() -> None:
         "skill",
         "stream",  # V22
         "sessions",  # V24.0
+        "insights",  # V25.1
+        "trajectory",  # V25.0
     }
     actual = {c.name for c in registered_commands()}
     missing = expected - actual
     extra = actual - expected
     assert not missing, f"missing commands: {missing}"
     assert not extra, f"unexpected commands: {extra}"
+
 
 
 def test_dispatch_non_slash_returns_false() -> None:

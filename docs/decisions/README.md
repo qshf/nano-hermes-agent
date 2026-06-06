@@ -34,5 +34,7 @@
 | v26.0 | bundled 资源发现 + tier 3 读取 + 路径沙箱（skill 升级为目录包 / skill_view 双模式 / `..`+symlink 双防线） | [v26.0.md](./v26.0.md) |
 | v26.1 | 可用性门控（`required_environment_variables` 软标记 ⚠ / `metadata.requires_tools/toolsets` 硬隐藏 / skill_view 回填 readiness） | [v26.1.md](./v26.1.md) |
 | v26.2 | 安全 token 替换（`${SKILL_DIR}`/`${SESSION_ID}` 白名单替换 / **绝不做内联 shell** / tier 3 资源不替） | [v26.2.md](./v26.2.md) |
+| v26.3 | 行为指令注入 system prompt（`inject_directive` frontmatter / 完全可用才注入 / 渐进式披露的常驻例外，驱动主动播报） | [v26.3.md](./v26.3.md) |
+| v26.4 | 代码级语音心跳（后台守护线程直连 VoiceClient / 静默超时补播 / 接管模型物理上做不到的"阻塞期报活" / directive 瘦身） | [v26.4.md](./v26.4.md) |
 
 > 注：V8 的决策记录散落在对应的 commit message 与 [docs/Memory-system/](../Memory-system/) 子目录下，未来如有补录需求再回填本目录。V15 主决策（5 阶段压缩流水线）当时未单独建档，本目录从 v15.1 开始接力补完。

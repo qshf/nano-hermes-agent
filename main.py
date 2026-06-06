@@ -93,6 +93,7 @@ import json
 import os
 import signal
 import sys
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -155,7 +156,7 @@ from transports.streaming import (
     StreamCancelled,
 )
 from transports.types import build_assistant_history_msg
-from agent import PromptBuilder, SkillLoader
+from agent import PromptBuilder, SkillLoader, VoiceHeartbeat
 from agent.compaction import apply_compaction
 from agent.logging import setup_logging, set_log_session, get_logger
 from agent.runtime import AgentRuntime, SESSION_TOKEN_KEYS
@@ -485,7 +486,31 @@ def run_agent():
     # V23.4: agent_busy 覆盖整轮 tool loop（含 delegate 子 agent 执行期间），
     # 取代仅在父流式期间为 True 的 streaming_active。SIGINT / Esc listener 据此
     # 判断"现在按取消是取消 agent，还是退出 prompt"。
-    agent_busy = {"flag": False}
+    agent_busy = threading.Event()
+
+    # V26.4: 代码级语音心跳 —— 长任务（terminal 阻塞 / 多步检索）期间，主线程被
+    # 工具卡住、模型物理上无法插播时，由后台守护线程直连 nano_voice_kit 推一条
+    # 存活 progress，防用户以为"挂机"。门控两层：
+    #   1. skill 层：voice-runtime 必须 is_fully_available（DASHSCOPE_API_KEY 已设
+    #      + terminal 在）—— 与 V26.3 注入 directive 的门槛同源；
+    #   2. 链路层：VoiceHeartbeat.create_if_available 再探 VoiceClient import +
+    #      Runtime /health。任一不过 → voice_heartbeat 为 None，心跳不启、零副作用。
+    # env VOICE_HEARTBEAT_SECONDS=0 显式关闭。
+    voice_heartbeat = None
+    try:
+        _vmeta = skill_loader.get("voice-runtime")
+        _voice_tools = sorted(
+            set(get_available_tool_names(ENABLED_TOOLSETS))
+            | set(memory_manager.get_all_tool_names())
+        )
+        if _vmeta is not None and _vmeta.is_fully_available(_voice_tools):
+            voice_heartbeat = VoiceHeartbeat.create_if_available(agent_busy)
+    except Exception as exc:  # noqa: BLE001 — 心跳构造永不阻断 agent 启动
+        log.warning("voice heartbeat init skipped: %r", exc)
+        voice_heartbeat = None
+    if voice_heartbeat is not None:
+        voice_heartbeat.start()
+        log.info("voice heartbeat on (threshold=%ss)", voice_heartbeat._threshold)
 
     # V23.0: 注入 delegate_task 工具的运行期上下文 —— chain 构建完才注入。
     # 父全集 = registry 注册过的 + memory_manager 暴露的；黑名单（delegate_task /
@@ -593,14 +618,14 @@ def run_agent():
     turn_count = 0  # V9: 每轮递增，传给 on_turn_start
 
     # V22 cancel_token / agent_busy 已在 delegate 注入前提前构造（见上方）。
-    # 这里仅注册 SIGINT handler —— 用 agent_busy['flag'] 区分两种语境：
+    # 这里仅注册 SIGINT handler —— 用 agent_busy.is_set() 区分两种语境：
     # - prompt 期间 SIGINT → 还原默认行为，让 input() 抛 KeyboardInterrupt 退出
     # - tool loop 期间 SIGINT → cancel_token.cancel()，stream_call / 子 agent
     #   下一帧 check 后 raise StreamCancelled，main 捕获后回到 prompt 不退出
     # V23.4: 把判定从"父正在流式"扩到"父在跑 tool loop"，覆盖 delegate 子 agent
     # 执行期间的 Ctrl+C —— 否则按下后会走 KeyboardInterrupt 退出整个进程。
     def _sigint_handler(signum, frame):
-        if agent_busy["flag"]:
+        if agent_busy.is_set():
             cancel_token.cancel()
             # 不抛异常 — stream_call / 子 loop 检查 token 自己 raise StreamCancelled
         else:
@@ -687,15 +712,18 @@ def run_agent():
             # V23.4: 整个 tool loop 期间挂 Esc 监听 + 把 agent_busy 置 True ——
             # 这样 Ctrl+C / Esc 在父流式、tool 执行、delegate 子 agent 跑任何
             # 阶段都走 cancel_token.cancel()（不退出进程）。
-            import threading as _threading
-            _esc_stop = _threading.Event()
-            _esc_thread = _threading.Thread(
+            _esc_stop = threading.Event()
+            _esc_thread = threading.Thread(
                 target=_esc_listener,
                 args=(cancel_token, _esc_stop),
                 daemon=True,
             )
             cancel_token.reset()
-            agent_busy["flag"] = True
+            agent_busy.set()
+            # V26.4: 轮始刷新心跳基准 —— 从进入 tool loop 这刻起重新计沉默时长，
+            # 避免上一轮结束到本轮开始之间的间隔被算进沉默期、刚进 loop 就补播。
+            if voice_heartbeat is not None:
+                voice_heartbeat.mark_active()
             _esc_thread.start()
 
             try:
@@ -843,7 +871,7 @@ def run_agent():
                 # V23.4: 收回 busy 状态 + 通知 Esc listener 退出、恢复 termios。
                 # 放 finally 是因为 tool loop 中途任何 break / 异常都得保证 termios
                 # 被还原 —— 否则 prompt_toolkit 下一次 prompt 会继承 cbreak 模式。
-                agent_busy["flag"] = False
+                agent_busy.clear()
                 _esc_stop.set()
                 _esc_thread.join(timeout=1.0)
 
@@ -902,6 +930,10 @@ def run_agent():
             print(f"  [warn] trajectory flush on exit failed: {exc!r}")
         # V10: 释放外部 provider 的 httpx client；builtin 的 shutdown 是 no-op
         memory_manager.shutdown_all()
+        # V26.4: 停心跳守护线程（daemon 即便不 stop 进程退出也会回收，但显式
+        # stop 让 Ctrl+D 退出更干净、不在退出瞬间多吐一条心跳）。
+        if voice_heartbeat is not None:
+            voice_heartbeat.stop()
 
 
 if __name__ == "__main__":

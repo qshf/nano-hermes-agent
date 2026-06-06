@@ -446,17 +446,20 @@ def test_06_pure_logic_contracts_unchanged():
 
 
 def test_07_main_py_sigint_contract():
-    """main.py 必须用 agent_busy['flag'] 区分两种 SIGINT 语境。
+    """main.py 必须用 agent_busy.is_set() 区分两种 SIGINT 语境。
 
     这条不能在单元层 mock 信号，但可以校验 main.py 源码的契约：
-    - 含 ``agent_busy`` flag（V23.4 起取代 V22 的 streaming_active）
+    - 含 ``agent_busy`` Event（V23.4 起取代 V22 的 streaming_active）
     - tool loop 期间 cancel_token.cancel()，prompt 期间 raise KeyboardInterrupt
     - DelegateContext 注入 shared runtime，runtime 持有 cancel_token + stream_enabled
     """
     main_py = (Path(__file__).resolve().parent.parent / "main.py").read_text()
 
-    # 契约 1：仍有 busy flag 区分两种语境（名字 V23.4 改了，语义不变）
-    assert 'agent_busy' in main_py, "main.py 失去 agent_busy flag"
+    # 契约 1：仍有 busy signal 区分两种语境（名字 V23.4 改了，语义不变）
+    assert 'agent_busy = threading.Event()' in main_py, "main.py 失去 agent_busy Event"
+    assert 'agent_busy.is_set()' in main_py, "main.py SIGINT 不再读取 agent_busy Event"
+    assert 'agent_busy.set()' in main_py, "main.py tool loop 进入时未 set busy"
+    assert 'agent_busy.clear()' in main_py, "main.py tool loop 退出时未 clear busy"
     assert 'cancel_token.cancel()' in main_py, "main.py 失去 cancel_token.cancel() 路径"
     assert 'raise KeyboardInterrupt' in main_py, "main.py 失去 KeyboardInterrupt 路径"
 
@@ -487,7 +490,7 @@ if __name__ == "__main__":
         ("04b runtime 动态 stream toggle 传到 delegate", test_04b_runtime_stream_toggle_reaches_delegate),
         ("05 V21.4 工具协议未破坏", test_05_v21_4_protocol_unchanged),
         ("06 V23.0/V23.1 纯逻辑契约未漂移", test_06_pure_logic_contracts_unchanged),
-        ("07 main.py SIGINT 契约 — agent_busy flag", test_07_main_py_sigint_contract),
+        ("07 main.py SIGINT 契约 — agent_busy Event", test_07_main_py_sigint_contract),
     ]
     for name, fn in tests:
         _run(name, fn)

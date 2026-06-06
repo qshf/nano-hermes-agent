@@ -59,7 +59,7 @@ class _FakeSkillLoader:
     def __init__(self, skills):
         self._skills = skills
 
-    def list_metadata(self):
+    def list_metadata(self, **kwargs):  # V26.1: accept gating kwargs
         return list(self._skills)
 
 
