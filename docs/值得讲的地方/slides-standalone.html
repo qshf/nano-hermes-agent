@@ -1,0 +1,2019 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>nano_hermes_agent ÃÂ· Ã¥ÂÂ¼Ã¥Â¾ÂÃ¨Â®Â²Ã§ÂÂÃ¥ÂÂ°Ã¦ÂÂ¹</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/black.css" id="theme">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css">
+<style>
+  :root { --r-main-font: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  .reveal h1 { font-size: 1.9em; }
+  .reveal h2 { font-size: 1.35em; color: #4ec9b0; }
+  .reveal h3 { font-size: 1.05em; color: #9cdcfe; }
+  .reveal section { font-size: 0.78em; text-align: left; }
+  .reveal .slides section.title-slide { text-align: center; }
+  .reveal pre { width: 100%; font-size: 0.46em; box-shadow: none; }
+  .reveal pre code { max-height: 560px; padding: 14px; line-height: 1.32; }
+  .reveal blockquote { width: 100%; font-size: 0.92em; background: rgba(78,201,176,.08);
+    border-left: 4px solid #4ec9b0; padding: 8px 16px; }
+  .reveal table { font-size: 0.82em; }
+  .reveal .act-tag { color: #ce9178; font-size: 0.7em; letter-spacing: 2px; }
+  .reveal .keyline { color: #dcdcaa; }
+  .reveal ul, .reveal ol { width: 100%; }
+  .reveal section img { border: none; box-shadow: none; }
+  .reveal .footer { position: fixed; bottom: 8px; right: 16px; font-size: 12px; color: #666; }
+  .panzoom-toolbar {
+    position: fixed;
+    left: 14px;
+    bottom: 12px;
+    z-index: 40;
+    display: none;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    background: rgba(0,0,0,.55);
+    color: #cfcfcf;
+    font: 12px/1.2 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    user-select: none;
+  }
+  .panzoom-toolbar button {
+    width: 26px;
+    height: 24px;
+    border: 1px solid rgba(255,255,255,.22);
+    border-radius: 4px;
+    background: rgba(255,255,255,.08);
+    color: #eee;
+    cursor: pointer;
+  }
+  .panzoom-toolbar button:hover { background: rgba(255,255,255,.18); }
+  .panzoom-toolbar .zoom-label { min-width: 42px; text-align: center; color: #9cdcfe; }
+  .panzoom-toolbar .zoom-hint { color: #888; }
+  .reveal .slides section.present .panzoom-inner { transform-origin: 0 0; }
+  body.panzoom-dragging { cursor: grabbing; }
+  body.panzoom-dragging .reveal .slides section.present .panzoom-inner { cursor: grabbing; }
+</style>
+</head>
+<body>
+<div class="footer">nano_hermes_agent</div>
+<div class="panzoom-toolbar" aria-label="slide zoom controls">
+  <button type="button" data-zoom-action="out" title="Ã§Â¼Â©Ã¥Â°Â">Ã¢ÂÂ</button>
+  <span class="zoom-label">100%</span>
+  <button type="button" data-zoom-action="in" title="Ã¦ÂÂ¾Ã¥Â¤Â§">+</button>
+  <button type="button" data-zoom-action="reset" title="Ã¥Â¤ÂÃ¤Â½Â">Ã¢ÂÂ²</button>
+  <span class="zoom-hint">Ã¦Â»ÂÃ¨Â½Â®Ã§Â¼Â©Ã¦ÂÂ¾ ÃÂ· Ã§Â©ÂºÃ¦Â Â¼Ã¦ÂÂÃ¥ÂÂ¨ ÃÂ· Ã¥ÂÂÃ¥ÂÂ»Ã¥Â¤ÂÃ¤Â½Â</span>
+</div>
+<div class="reveal">
+  <div class="slides">
+    <section data-markdown
+             data-separator="^\r?\n===\r?\n"
+             data-separator-vertical="^\r?\n---\r?\n"
+             data-separator-notes="^Note:">
+      <textarea data-template>
+&lt;!-- slide separators: === between slides, Note: starts speaker notes --&gt;
+
+&lt;!-- .slide: class="title-slide" --&gt;
+# Nano Hermes Agent
+
+## 一个 AI Agent 的演进之路
+
+从 重构 Hermes Agent 的视角看软件工程
+
+&lt;span class="act-tag"&gt;值得讲的五条主线&lt;/span&gt;
+
+Note:
+这版按“精简版本”的结构重新收束，讲五条主线：Tool System、Memory System、Transport System、Stream、父子智能体。每段只保留最值得讲的结构与设计点。
+
+===
+
+## 全景：五段主线
+
+| 段落 | 主题 | 一句话 |
+|------|------|--------|
+| Tool System | 新增工具不动主循环 | 从 if/else 到注册表、toolsets、MCP、钩子管线 |
+| Memory System | 换记忆后端不动主循环 | 从文件记忆到 Provider / Manager / 生命周期 / 外部语义服务 |
+| Transport System | 换模型厂商不动主循环 | 从单厂商调用到 Anthropic、故障链、Prompt Cache |
+| Stream | 边生成边输出 | 同步 `call` 不动，流式单独走 `stream_call` |
+| 父子智能体 | 派出分身但管住它 | delegate + child_loop + 权限边界 + 并行聚合 |
+
+&gt; 贯穿全场的一个信念：**一次只解决一个问题，每步都站在上一步的稳定之上。**
+
+Note:
+这五段不是功能罗列，而是同一个设计模式在不同维度上的重复验证：新增工具来源、替换记忆后端、替换模型厂商、增加流式维度、派生子 agent，都不能把主循环拖成一坨。
+
+===
+
+&lt;!-- .slide: class="title-slide" --&gt;
+# Tool System
+
+## 新增一个工具来源，不需要动主循环
+
+&lt;span class="act-tag"&gt;v0.0 → v0.5 · ToolRegistry&lt;/span&gt;
+
+Note:
+第一段讲工具系统。核心问题很小：模型说要调用某个工具，程序怎么真的执行？但这条线会长出整个项目最基础的模式：统一注册表和统一关口。
+
+===
+
+## v0 — 最直觉的 if/else
+
+```python
+def dispatch(name: str, args: dict) -&gt; str:
+    if name == "terminal":
+        return terminal_handler(args)
+    elif name == "read_file":
+        return read_file_handler(args)
+    elif name == "write_file":
+        return write_file_handler(args)
+    else:
+        return f"Unknown tool: {name}"
+```
+
+问题很直接：
+
+- 每加一个工具，都要回来改这个 `if/elif` 长链
+- 主循环会逐渐变成所有工具的耦合点
+
+Note:
+这就是最朴素的起点。它能跑，但工具越多，主循环越脏。
+
+===
+
+## v0 — 字典查表
+
+```python
+TOOLS = [
+    {"type": "function", "function": TERMINAL_SCHEMA},
+    {"type": "function", "function": READ_FILE_SCHEMA},
+]
+
+DISPATCH = {
+    "terminal": terminal_handler,
+    "read_file": read_file_handler,
+}
+
+handler = DISPATCH.get(name)
+```
+
+派发不再膨胀，但问题换了位置：
+
+- 顶部 import 要手写
+- `TOOLS` 表要手写
+- `DISPATCH` 表要手写
+- 三处信息必须手动对齐
+
+Note:
+字典让 dispatch 变清爽，但工具登记信息仍然散落在主程序里。下一步不是优化查找，而是把“登记”这件事收口。
+
+===
+
+## v0.1 — ToolRegistry + 自动发现
+
+```python
+class ToolRegistry:
+    def register(self, schema, handler, check_fn=None):
+        ...
+
+    def get_openai_tools(self):
+        ...
+
+    def dispatch(self, name, args):
+        ...
+
+
+registry = ToolRegistry()
+
+registry.register(
+    READ_FILE_SCHEMA,
+    read_file_handler,
+)
+```
+
+工具实现的代码放在一个目录里，在自己的文件里进行登记，主程序只负责触发自动发现：
+
+```python
+def discover_tools():
+    """扫描 tools/ 目录，import 所有 *_tool.py 模块以触发自注册。"""
+    for file in sorted(_TOOLS_DIR.glob("*_tool.py")):
+        module_name = f"tools.{file.stem}"
+        importlib.import_module(module_name)
+```
+&gt; 新增一个工具，只需要新增工具文件。主循环一个字都不用改。
+
+Note:
+这是第一个关键抽象：注册表。工具的说明书和执行函数一起登记，主循环不再认识任何具体工具。
+
+===
+
+## v0.2 — Toolsets 解决“我要哪组能力”
+
+```python
+TOOLSETS = {
+    "core": ["terminal", "read_file", "write_file"],
+    "docker": ["terminal", "read_file", "write_file", "docker_exec"],
+}
+
+
+def resolve_toolsets(enabled_toolsets):
+    ...
+
+
+enabled_toolsets = ["core"]
+tool_names = resolve_toolsets(enabled_toolsets)
+tools = registry.get_definitions(tool_names)
+```
+
+`v0.1` 解决了“工具怎么自注册”，但如果主循环还要逐个写工具名，也会很快变脏。
+
+&gt; agent 只说“我要 core / docker 这组能力”，`toolsets.py` 负责展开成具体工具名。
+
+Note:
+toolsets 是能力分组。它让主循环表达意图，而不是维护具体清单。
+
+===
+
+## v0.2 — check_fn 解决“这轮能不能用”
+
+```python
+registry.register(
+    DOCKER_EXEC_SCHEMA,
+    docker_exec_handler,
+    check_fn=lambda: shutil.which("docker") is not None,
+)
+```
+
+真实环境里工具可用性是动态的：
+
+- Docker 没装，Docker 工具不该出现在清单里
+- API key 没配，远程服务工具不该暴露给模型
+- 权限不足，危险工具应该临时下线
+
+这一版故意每轮重算“当前可用工具清单”，把 `check_fn` 的成本暴露出来。
+
+Note:
+check_fn 可能 fork 进程探测环境，成本不一定低。v0.2 先把问题摆出来，下一步才知道该怎么缓存。
+
+===
+
+## v0.3 — MCP 工具也进同一张表
+
+```text
+我们自己写的工具    ┐
+                    ├─→ 同一张 ToolRegistry ─→ 模型只看到统一工具表
+外部 MCP 服务的工具  ┘
+```
+
+```python
+async def discover_and_register(self):
+    for tool in await self._list_remote_tools():
+        schema, handler = self._wrap(tool)
+        registry.register(schema, handler)
+```
+
+MCP 是外部服务暴露工具的标准协议。关键不在“多了一种来源”，而在：
+
+&gt; 外部工具和本地工具注册进同一张 `ToolRegistry`，主循环完全无感。
+
+Note:
+这是 v0.1 注册表的回报：新增工具来源，不需要给主循环加分支。
+
+===
+
+## v0.3 — check_fn 缓存
+
+```python
+CHECK_FN_TTL = 30.0
+
+def _is_available(self, name, entry):
+    check_fn = entry["check_fn"]
+    if check_fn is None:
+        return True
+
+    now = time.time()
+    cached = self._check_fn_cache.get(name)
+    if cached and (now - cached[0]) &lt; CHECK_FN_TTL:
+        return cached[1]
+
+    result = check_fn()
+    self._check_fn_cache[name] = (now, result)
+    return result
+```
+
+&gt; v0.2 先暴露成本，v0.3 再缓存。先让问题可见，再做优化。
+
+Note:
+缓存不是一开始就加的。因为只有当你知道 check_fn 真有成本，缓存才不是拍脑袋。
+
+===
+
+## v0.4 — 类型矫正 + 异步桥接
+
+LLM 经常传来“脏参数”：
+
+```python
+coerce_args(schema, {"count": "42"})  # {"count": 42}
+coerce_args(schema, {"enabled": "true"})  # {"enabled": True}
+```
+
+有些工具是 `async def`，但起初主循环是同步实现的，进行一个桥接：
+
+```python
+# V4: 异步桥接（async handler 自动通过 _run_async 执行）
+if entry.get("is_async"):
+    return _run_async(entry["handler"](coerced))
+return entry["handler"](coerced)
+```
+
+共同点：
+
+&gt; 把“脏”收在注册表这一处，让业务工具和主循环都保持干净。
+
+Note:
+这页讲统一关口的价值。类型矫正、同步异步桥接，都不应该散落在每个工具里。
+
+===
+
+## v0.5 — 三个钩子 + 工具调用管线
+
+```text
+dispatch(name, args)
+  ① 查注册表       Unknown tool 直接返回错误
+  ② coerce         按 schema 修正 LLM 传来的脏参数
+  ③ pre_hook       执行前最后一道门，可 block
+  ④ run handler    同步/异步统一桥接，并记录耗时
+  ⑤ post_hook      只观察：日志、指标、审计，不改结果
+  ⑥ transform      第一个字符串返回值可以改写工具结果
+```
+
+三个钩子的分工：
+
+- `pre_hook`：鉴权、黑名单、限流
+- `post_hook`：日志、指标、审计
+- `transform`：脱敏、结果改写
+
+&gt; `dispatch` 是工具系统的统一关口。横切逻辑进管线，业务工具保持干净。
+
+Note:
+v0.5 的重点不是“多了几个函数”，而是工具调用从一个动作变成一条可治理的流水线。
+
+===
+
+## Tool System 小结
+
+```text
+v0    if/else → 字典查表
+v0.1  ToolRegistry + 自动发现
+v0.2  Toolsets + check_fn
+v0.3  MCP + check_fn 缓存
+v0.4  类型矫正 + 异步桥接
+v0.5  pre/post/transform 管线
+```
+
+这条线证明了一件事：
+
+&gt; 复杂度被关进 `ToolRegistry` 内部，没有漏给主循环。
+
+Note:
+工具系统从几十行硬编码长成可插拔、自我保护、可扩展的地基。下一段，记忆系统会把同一个模式换一个维度再走一遍。
+
+===
+
+&lt;!-- .slide: class="title-slide" --&gt;
+# Memory System
+
+## 换记忆后端，不需要动主循环
+
+&lt;span class="act-tag"&gt;v0.6 → v0.16 · MemoryProvider / MemoryManager&lt;/span&gt;
+
+Note:
+第二段讲记忆系统。它不是一上来就设计一套复杂框架，而是从最简单的文件记忆开始，随着问题出现再抽象。
+
+===
+
+## v0.6 — 最简单的长期记忆
+
+最简单的代码构建一个文件记忆系统，在此基础上进行改进
+
+```python
+class MemoryStore:
+    def load(self): ...
+
+    @property
+    def snapshot(self) -&gt; str | None:
+        ...
+
+    def add(self, content: str) -&gt; dict:
+        ...
+
+    def replace(self, old_text: str, new_content: str) -&gt; dict:
+        ...
+
+    def remove(self, old_text: str) -&gt; dict:
+        ...
+```
+
+每次运行程序后，把记忆块注入 system prompt。
+
+Note:
+v0.6 的价值是跑通最小闭环：模型能主动写记忆，下次启动能读回来。
+
+===
+
+## v0.6 的下一个问题
+
+文件记忆能跑，但很快会问：
+
+- 如果记忆存在 SQL 库里呢？
+- 如果记忆存在向量库里呢？
+- 如果记忆是一个远程服务呢？
+
+如果每种记忆后端服务都让主循环改一次，记忆系统就会污染 agent loop。
+
+&gt; 所以 v0.7 抽出 `MemoryProvider` 契约。
+
+Note:
+这是抽象出现的时机：不是为了好看，而是第二个后端马上要来了。
+
+===
+
+## v0.7 — MemoryProvider 契约
+
+```python
+class MemoryProvider(ABC):
+    @property
+    def name(self) -&gt; str: ...
+
+    def is_available(self) -&gt; bool: ...
+    def initialize(self, session_id="", **kwargs) -&gt; None: ...
+    def get_tool_schemas(self) -&gt; list[dict]: ...
+    def handle_tool_call(self, tool_name, args) -&gt; str: ...
+    def system_prompt_block(self) -&gt; str: ...
+    def shutdown(self) -&gt; None: ...
+
+
+class BuiltinMemoryProvider(MemoryProvider):
+    # 把 v0.6 的 MemoryStore 包成一个标准 provider
+    ...
+```
+
+重点不是新增功能，而是把文件记忆包成一个可替换后端。
+
+Note:
+MemoryStore 继续负责纯存储；BuiltinMemoryProvider 是适配器；主循环只认识 provider 契约。
+
+===
+
+## v0.7 — provider 工具路由
+
+```python
+provider_schemas = memory_provider.get_tool_schemas()
+all_tools_schema = tools_schema + [
+    {"type": "function", "function": s}
+    for s in provider_schemas
+]
+provider_tool_names = {s["name"] for s in provider_schemas}
+
+if name in provider_tool_names:
+    result = memory_provider.handle_tool_call(name, args)
+else:
+    result = registry.dispatch(name, args)
+```
+
+这一版还有一个问题：
+
+&gt; agent 还是直接拿着一个 provider。只要第二个 provider 出现，主循环又会开始变脏。
+
+Note:
+v0.7 证明了后端可替换，但还没有解决多个 provider 的编排问题。
+
+===
+
+## v0.8 — MemoryManager 管多个 provider
+
+```python
+class MemoryManager:
+    def add_provider(self, provider) -&gt; None:
+        ...
+
+    def build_system_prompt(self) -&gt; str:
+        ...
+
+    def get_all_tool_schemas(self) -&gt; list[dict]:
+        ...
+
+    def has_tool(self, tool_name) -&gt; bool:
+        ...
+
+    def handle_tool_call(self, tool_name, args) -&gt; str:
+        ...
+
+    def initialize_all(self, session_id="", **kwargs):
+        ...
+
+    def shutdown_all(self) -&gt; None:
+        ...
+```
+
+&gt; agent 只和 `MemoryManager` 对话，不再感知 provider 数量。
+
+Note:
+manager 内部建 tool_name 到 provider 的路由表，并隔离每个 provider 的错误。某个记忆后端坏了，不该拖垮整个 agent。
+
+===
+
+## v0.9 — 固定“召回 / 持久化”的生命周期
+
+```python
+class MemoryProvider(ABC):
+    def on_turn_start(self, turn_number, message, **kwargs): ...
+    def prefetch(self, query, *, session_id="") -&gt; str: ...
+    def sync_turn(self, user_content, assistant_content, *, session_id=""): ...
+```
+
+```text
+用户输入
+  → prefetch_all：召回内容清洗后包进 &lt;memory-context&gt;
+  → 把 recalled context + 原始输入 合成 user message
+  → tool loop
+  → sync_all：只同步原始 user 输入 + 最终 assistant 文本
+```
+
+&gt; v0.9 解决的不是“记什么”，而是“什么时候召回、什么时候持久化”。
+
+Note:
+注意只同步原始 user 输入和最终 assistant 文本，不把召回围栏再写回记忆库，避免后端越存越脏。
+
+===
+
+## v0.9 — 默认空实现
+
+MemoryManager 新增广播方法：on_turn_start_all / prefetch_all / sync_all
+
+```python
+class MemoryProvider(ABC):
+    @abstractmethod
+    def is_available(self) -&gt; bool: ...
+
+    @abstractmethod
+    def get_tool_schemas(self) -&gt; list[dict]: ...
+
+    def prefetch(self, query) -&gt; str:
+        return ""
+
+    def sync_turn(self, user, assistant):
+        ...
+
+class MemoryManager:
+
+     def sync_all(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+    ) -&gt; None:
+        """持久化 广播 sync_turn 到所有 provider。"""
+
+    def prefetch_all(self, query: str, *, session_id: str = "") -&gt; str:
+        """收集所有 provider 的召回结果，sanitize 后用围栏包裹。
+
+        每个 provider 的输出都先过 sanitize_context（剥离伪造围栏），
+        多个 provider 的结果用空行分隔；最终统一包一层 &lt;memory-context&gt;。
+        全部 provider 都返回空时，返回空字符串（不注入空围栏）。
+        """
+
+    def on_turn_start_all(
+        self,
+        turn_number: int,
+        message: str,
+        **kwargs,
+    ) -&gt; None:
+        """广播 on_turn_start 到所有 provider。"""
+```
+
+为什么生命周期钩子不全都强制实现？
+
+&gt; 让接口的复杂度，对不需要它的人透明。
+
+内置文件记忆不需要每轮召回，它只要一次性注入 system prompt。
+
+Note:
+这是一个很值得讲的接口设计点。复杂后端需要生命周期，简单后端不应该被迫写一堆空方法。
+
+===
+
+## v0.10 — 远程语义记忆服务
+
+provider 通过 HTTP 调远程服务：
+
+```python
+class RemoteSemanticProvider(MemoryProvider):
+    """通过 HTTP 调用远端语义记忆服务。"""
+```
+
+服务端代码接收路由
+
+```python
+@app.get("/healthz")
+def healthz() -&gt; dict[str, Any]:
+    ...
+
+@app.post("/recall", response_model=RecallResponse)
+def recall(req: RecallRequest) -&gt; RecallResponse:
+    ...
+
+@app.post("/sync", response_model=SyncResponse)
+def sync(req: SyncRequest) -&gt; SyncResponse:
+    ...
+```
+
+&gt; v0.10 的重点是验证“远程服务”这个边界，而不是一上来追求真实召回质量。
+
+Note:
+先用假 embedding 和内存 dict 跑通 provider 和服务端的 HTTP 边界。
+
+===
+
+## v0.10 — 假 embedding 先占位
+
+用最小实现验证边界：
+
+```python
+_STORE: dict[str, list[tuple[str, list[float]]]] = {}
+
+
+def fake_embedding(text: str) -&gt; list[float]:
+    """md5(text) → 16 维 float。"""
+    digest = hashlib.md5(text.encode("utf-8")).digest()
+    return [b / 255.0 for b in digest]
+```
+
+这不是为了“做好语义记忆”，而是为了先确认：
+
+- provider 能否连到远程服务
+- recall / sync 的协议是否够用
+- agent 主循环是否完全不用改
+
+Note:
+假的实现有真实价值：它让边界先稳定下来。边界稳定后，再换真实存储和 embedding。
+
+===
+
+## v0.10.1 — 换成 PostgreSQL + OpenAI 范式 embedding
+
+```python
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://nano:nano@127.0.0.1:5432/nano_memory",
+)
+
+_embedding_client = OpenAI(
+    api_key=EMBEDDING_API_KEY,
+    base_url=EMBEDDING_BASE_URL,
+)
+```
+
+从 dict + fake embedding 换成 PostgreSQL + embedding 服务：
+
+&gt; 存储和 embedding 整体替换，但 agent loop 仍然只认 `MemoryProvider` / `MemoryManager`。
+
+Note:
+这一步证明 v0.7 的契约不是空话：后端可以替换，主循环不跟着变。
+
+===
+
+## v0.11 — LLM 抽取实体、关系和事实
+
+```text
+对话文本
+  → LLM 抽取
+  → 实体 / 关系 / 事实
+  → 语义检索 + 图遍历
+  → reflect 合成召回结果
+```
+
+纯向量召回擅长找相似文本；图谱召回能找关联信息：
+
+```text
+问 A
+  → 命中实体 A
+  → 沿关系找到 B / C
+  → 带回相关事实
+```
+
+Note:
+v0.11 的重点是召回能力从“相似”走向“关联”。
+
+===
+
+## v0.12 — 召回质量与性能一起处理
+
+召回打分加入图遍历和时间衰减：
+
+```python
+final = cosine * _hop_weight(hop) * _decay_blend(age_days)
+```
+
+写路径性能问题：
+
+```text
+retain = LLM 抽取 + 多次 embedding
+常见耗时 2-5 秒
+```
+
+解决方式：
+
+&gt; 写路径丢给后台 writer 线程，主循环 0 阻塞。
+
+Note:
+记忆系统开始出现生产形态：召回质量要解释，写入路径不能卡主循环。
+
+===
+
+## v0.12 — 后台 retain
+
+```python
+def _ensure_writer(self):
+    if self._thread and self._thread.is_alive():
+        return
+    self._thread = threading.Thread(
+        target=self._writer_loop,
+        daemon=True,
+    )
+    self._thread.start()
+
+
+def _writer_loop(self):
+    while True:
+        try:
+            job = self._retain_queue.get(timeout=1.0)
+        except queue.Empty:
+            if self._shutting_down.is_set():
+                return
+            continue
+
+        try:
+            if job is _WRITER_SENTINEL:
+                return
+            job()
+        finally:
+            self._retain_queue.task_done()
+```
+
+三个关键点：
+
+- `timeout` 周期醒来，能响应 shutdown
+- 单个 job 失败不杀线程
+- `task_done` 让 shutdown 能 drain
+
+Note:
+这页保留实现细节，因为它很能说明“异步不是开个线程就完了”，还要考虑失败和退出。
+
+===
+
+## v0.12 — recall 预热
+
+```text
+当轮结束：
+  queue_prefetch(query)  → 后台线程提前算下一轮 recall
+
+下一轮开始：
+  prefetch(query)        → 优先取缓存
+                         → 冷启动 / 超时再同步 fallback
+```
+
+writer 管写，prefetch 管读。
+
+Note:
+读路径和写路径的时机不同。写是把本轮内容存进去，读是为下一轮准备召回。
+
+===
+
+## v0.12 — retain 批量缓冲
+
+```python
+def sync_turn(self, user_content, assistant_content, *, session_id=""):
+    turn_text = f"User: {user_content}\nAssistant: {assistant_content}"
+
+    with self._buffer_lock:
+        self._session_turns.append(turn_text)
+        self._turn_counter += 1
+        if self._turn_counter % self._retain_every_n_turns != 0:
+            return
+
+        turns_snapshot = list(self._session_turns)
+        self._session_turns = []
+
+    self._enqueue_buffered_retain(turns_snapshot, session_id=self._session_id)
+```
+
+&gt; N 轮合并入队，减少 LLM 调用次数，也让抽取器看到更完整的局部上下文。
+
+Note:
+这页对应精简版里的 retain 批量缓冲。它既是性能优化，也是质量优化。
+
+===
+
+## v0.10 → v0.16 小结
+
+```text
+v0.10   HTTP 远程服务，dict + fake embedding 验证边界
+v0.10.1 PostgreSQL + OpenAI 范式 embedding
+v0.11   实体 / 关系 / 事实三层抽取，多策略检索
+v0.12   图遍历 + 时间衰减，后台 retain，recall 预热，批量缓冲
+v0.13+  会话切换、上下文压缩、更多召回质量打磨
+```
+
+这条线证明：
+
+&gt; 从文件记忆到外部语义记忆服务，主循环始终只认同一套 provider / manager 契约。
+
+Note:
+这里不再逐档展开 v0.13 到 v0.16，只保留精简版关心的核心：远程服务、真实存储、图谱召回、读写异步。
+
+===
+
+&lt;!-- .slide: class="title-slide" --&gt;
+# Transport System
+
+## 换模型厂商，不需要动主循环
+
+&lt;span class="act-tag"&gt;v0.17 → v0.20 · ProviderTransport / TransportChain&lt;/span&gt;
+
+Note:
+第三段讲 transport。记忆系统证明了换存储后端不动主循环；transport 用同样思路解决换模型厂商的问题。
+
+===
+
+## Transport 主线
+
+```text
+v0.17  抽象：ProviderTransport 契约
+v0.18  验证：加 AnthropicTransport
+v0.19  韧性：TransportChain，多家主备链，一家挂了自动切换
+v0.20  省钱：Prompt Cache，显式标记缓存断点 + 命中率统计
+```
+
+&gt; 契约只有在第二个实现出现时才被证明。
+
+Note:
+v0.17 只有一家实现时，抽象还只是猜想；v0.18 接入 Anthropic 才是第一次实弹测试。
+
+===
+
+## v0.17 — ProviderTransport 契约
+
+```python
+class ProviderTransport(ABC):
+    @property
+    @abstractmethod
+    def api_mode(self) -&gt; str: ...
+
+    @abstractmethod
+    def convert_messages(self, messages, **kw): ...
+
+    @abstractmethod
+    def convert_tools(self, tools): ...
+
+    @abstractmethod
+    def build_kwargs(self, model, messages, tools=None, **p): ...
+
+    @abstractmethod
+    def normalize_response(self, response, **kw) -&gt; NormalizedResponse: ...
+```
+
+这层只负责“跟一家模型对话”的格式差异。
+
+不负责：
+
+- client 管理
+- 重试 / 切家
+- prompt cache 策略统计
+- streaming / 中断
+
+Note:
+边界外的东西写清楚，比边界内更重要。否则 transport 很容易慢慢变成大杂烩。
+
+===
+
+## v0.17 — NormalizedResponse
+
+```python
+
+class NormalizedResponse:
+    """跨 provider 标准化的 API 响应。
+    共享字段是真正跨家族通用的 — 任何调用方都能直接读，不必按 api_mode 分支。
+    协议特定状态（reasoning_details / codex 元信息等）放进 ``provider_data``。
+    """
+
+    content: str | None
+    tool_calls: list[ToolCall] | None
+    finish_reason: str  # "stop" / "tool_calls" / "length" / "content_filter"
+    reasoning: str | None = None
+    usage: Usage | None = None
+    provider_data: dict[str, Any] | None = field(default=None, repr=False)
+
+
+@dataclass
+class ToolCall:
+    """跨 provider 标准化的工具调用。"""
+    id: str | None
+    name: str
+    arguments: str
+    provider_data: dict | None = field(default=None, repr=False)
+
+    @property
+    def function(self) -&gt; "ToolCall":
+        return self
+
+    @property
+    def type(self) -&gt; str:
+        return "function"
+
+@dataclass
+class Usage:
+    """API 返回的 token 用量统计。
+
+    ``cached_tokens`` / ``cache_creation_tokens`` 区分 read/write —
+    Anthropic 显式区分，OpenAI 兼容只有 read（write=0）。这是为了让 V20
+    chain 能准确区分"省了多少钱"和"花了多少钱写入缓存"。
+    """
+```
+
+
+通用字段升到 top-level：
+- content
+- tool_calls
+- finish_reason
+- usage
+厂商私有字段放进 `provider_data` 逃生口。
+
+Note:
+这个兼容设计很克制：旧代码读 `tc.function.name` 也能继续工作，不为了新抽象强迫上层大改。
+
+===
+
+## v0.18 — AnthropicTransport 验证契约
+
+Anthropic 和 OpenAI 差异很大：
+
+```python
+class AnthropicTransport(ProviderTransport):
+    def convert_messages(self, messages, **kw) -&gt; tuple[str, list]:
+        return system_str, anthropic_messages
+
+    _STOP_MAP = {
+        "end_turn": "stop",
+        "tool_use": "tool_calls",
+        "max_tokens": "length",
+    }
+```
+
+典型差异：
+
+- system 是顶层参数，不是 messages 里的一条
+- assistant 工具调用是 `tool_use` block
+- tool 结果是 `tool_result` block
+- stop_reason 词汇不同，需要映射回统一 finish_reason
+
+&gt; 所有差异关在 `anthropic.py` 里，agent loop 不跟着长分支。
+
+Note:
+这一步是 ProviderTransport 契约的第一次实弹验证。第二家接进来，主循环不该被污染。
+
+===
+
+## v0.19 — TransportChain
+
+```python
+class TransportChain:
+    def call(self, client=None, **kwargs) -&gt; NormalizedResponse:
+        ...
+
+    def _try_with_retry(self, entry, **kwargs):
+        ...
+
+    def _jittered_backoff(self, attempt):
+        ...
+
+    def status(self) -&gt; list[dict]:
+        ...
+```
+
+主循环从：
+
+```python
+transport.call(...)
+```
+
+变成：
+
+```python
+chain.call(...)
+```
+
+&gt; 多家模型的重试、切家、断路器状态，都收进 `TransportChain`。
+
+Note:
+故障处理如果混在主循环里，主流和故障路径会耦死。TransportChain 是统一调用入口。
+
+===
+
+## v0.19 — 错误分类决定动作
+
+```python
+def classify_error(exc) -&gt; ErrorAction:
+    ...
+```
+
+三类错误：
+
+| 类型 | 例子 | 动作 |
+|------|------|------|
+| `RETRYABLE` | 500 / 502 / timeout | 同一家等待后重试 |
+| `FAILOVER` | 429 / 503 / 认证或限流问题 | 记一次失败，切下一家 |
+| `FATAL` | 400 context overflow / 413 | 切了也错，直接抛 |
+
+&gt; 只对“等一下可能就好”的错误退避重试；对“换家可能好”的错误立刻切；对“切了也错”的错误直接失败。
+
+Note:
+这是 TransportChain 的决策核心。没有分类，重试和切家都会变成拍脑袋。
+
+===
+
+## v0.19 — 断路器机制
+
+```python
+@dataclass
+class _BreakerState:
+    consecutive_failures: int = 0
+    opened_at: float = 0.0
+    last_reason: str = ""
+
+    def is_open(self, now, cooldown_seconds) -&gt; bool:
+        if self.opened_at == 0.0:
+            return False
+        return (now - self.opened_at) &lt; cooldown_seconds
+```
+
+行为：
+
+- 失败次数达到阈值，打开断路器
+- 冷却窗口内，跳过这家
+- 冷却窗口过了，半开探针
+- 探针成功，关闭断路器
+
+Note:
+closed / open / half_open 三态没有额外 enum，而是从两个字段推导出来。
+
+===
+
+## v0.19 — jittered backoff 防惊群
+
+多个 session 同时撞上同一家故障，重试时间如果完全对齐，会在服务刚恢复时一起打过去。
+
+```python
+def _jittered_backoff(self, attempt: int) -&gt; float:
+    exponent = max(0, attempt - 1)
+    delay = min(self.base_delay * (2 ** exponent), 60.0)
+    jitter = random.uniform(0, 0.5 * delay)
+    return delay + jitter
+```
+
+```python
+for attempt in range(self.max_retries + 1):
+    try:
+        resp = entry.transport.call(entry.client, **call_kwargs)
+        return resp
+    except Exception as exc:
+        classified = classify_error(exc)
+        if classified.action == ErrorAction.FATAL:
+            raise
+        if classified.action == ErrorAction.RETRYABLE and attempt &lt; self.max_retries:
+            delay = self._jittered_backoff(attempt + 1)
+            self._sleep(delay)
+            continue
+        self._record_failure(entry, classified)
+        return None
+```
+
+Note:
+加抖动是为了把重试尖峰摊平。它只发生在 RETRYABLE 分支。
+
+===
+
+## v0.20 — Prompt Cache 属于 provider 差异
+
+Anthropic 的缓存机制和 OpenAI 不一样，所以缓存策略放在 transport hook 里。
+
+```python
+def apply_prompt_cache(self, messages, cache_ttl="5m"):
+    return messages
+```
+
+只有 Anthropic 重写：
+
+```python
+def apply_anthropic_cache_control(api_messages, cache_ttl="5m"):
+    messages = copy.deepcopy(api_messages)
+    marker = {"type": "ephemeral"}
+    if cache_ttl == "1h":
+        marker["ttl"] = "1h"
+    ...
+    return messages
+```
+
+&gt; 缓存策略属于 provider 差异，不属于 agent loop。
+
+Note:
+OpenAI / DeepSeek 可能是隐式 prefix cache，Anthropic 要显式打 cache_control。这个差异应该在 transport 内部解决。
+
+===
+
+## v0.20 — system + 滚动断点
+
+```python
+_MAX_BREAKPOINTS = 4
+
+def apply_anthropic_cache_control(api_messages, cache_ttl="5m"):
+    messages = copy.deepcopy(api_messages)
+    marker = {"type": "ephemeral"}
+    breakpoints_used = 0
+
+    if messages and messages[0].get("role") == "system":
+        _apply_cache_marker(messages[0], marker)
+        breakpoints_used += 1
+
+    remaining = _MAX_BREAKPOINTS - breakpoints_used
+    non_sys = [
+        i for i in range(len(messages))
+        if messages[i].get("role") != "system"
+    ]
+    for idx in non_sys[-remaining:]:
+        _apply_cache_marker(messages[idx], marker)
+
+    return messages
+```
+
+策略：
+
+- 1 个 breakpoint 放 system：最稳定，命中率最高
+- 其余放最后几条非 system 消息：滚动窗口
+- 深拷贝，避免污染原始历史
+
+Note:
+这也呼应了记忆系统：召回内容放进 user message，而不是 system prompt，是为了保住稳定前缀的缓存价值。
+
+===
+
+## Transport System 小结
+
+```text
+v0.17  ProviderTransport 抽象
+v0.18  AnthropicTransport 验证第二家
+v0.19  TransportChain + 断路器 + jittered backoff
+v0.20  Prompt Cache hook + provider 差异隔离
+```
+
+这条线证明：
+
+&gt; 契约一旦立住，加模型、组故障链、上缓存，主循环几乎不动。
+
+Note:
+Transport 是第三次重复同一个主题：把变化关进合适的边界，让 agent loop 维持稳定。
+
+===
+
+&lt;!-- .slide: class="title-slide" --&gt;
+# Stream
+
+## 边生成边输出 + 能优雅中断
+
+&lt;span class="act-tag"&gt;stream_call · StreamEvent · CancelToken&lt;/span&gt;
+
+Note:
+第四段讲流式输出。重点不是“把 token 打印出来”，而是怎样把流式作为一个新维度接进 Transport，同时不污染已经验证过的同步路径。
+
+===
+
+## Stream 的结构性选择
+
+源项目把流式做成 `call` 的内部分支：
+
+```text
+call()
+  if stream_callback is not None:
+      ...流式状态机...
+  else:
+      ...同步调用...
+```
+
+nano 选择把两条路分开：
+
+```text
+call()        → 一进一出，返回完整 NormalizedResponse
+stream_call() → 独立方法，返回一串 StreamEvent
+```
+
+代价：
+
+- 每个 transport 要写两套 SDK 调用：`call` + `stream_call`
+
+收益：
+
+- V17 到 V21 的同步不变量测试不用改
+- `stream_call` 可以被设计成“事件流”，不必迁就 `call` 的单值返回
+
+Note:
+这页讲正交路径。同步路径已经证明过了，流式不要钻进它里面搅状态。
+
+===
+
+## 横向冗余是可控的
+
+```text
+transport          call       stream_call
+ChatCompletions    ~50 行     ~100 行（含累积器）
+Anthropic          ~40 行     ~85 行
+```
+
+加第三家，比如 Gemini，确实要再写一个 `stream_call`。
+
+但这点冗余的性质是：
+
+- 横向、隔离：每家一个独立文件
+- 加新厂商不碰 agent loop
+- 不碰 chain
+- 不碰其他 transport
+
+&gt; 如果厂商极多且流式逻辑高度雷同，再抽流式基类模板；现在先保留清晰边界。
+
+Note:
+这里按精简版的表达保留“什么时候这个选择会翻盘”。不是说重复永远好，而是当前阶段它的风险更低。
+
+===
+
+## StreamEvent：不是裸文本流
+
+```python
+EVENT_TEXT_DELTA = "text_delta"
+EVENT_REASONING_DELTA = "reasoning_delta"
+EVENT_TOOL_CALL_STARTED = "tool_call_started"
+EVENT_DONE = "done"
+
+
+@dataclass
+class StreamEvent:
+    type: str
+    text: str = ""
+    tool_name: Optional[str] = None
+    response: Optional[NormalizedResponse] = None
+```
+
+消费方按语义分流：
+
+```python
+for ev in chain.stream_call(cancel_token=ct, model=m, messages=msgs, tools=ts):
+    if ev.type == EVENT_TEXT_DELTA:
+        sys.stdout.write(ev.text)
+    elif ev.type == EVENT_REASONING_DELTA:
+        render_thinking(ev.text)
+    elif ev.type == EVENT_TOOL_CALL_STARTED:
+        sys.stdout.write(f"[tool] {ev.tool_name}")
+    elif ev.type == EVENT_DONE:
+        final_resp = ev.response
+```
+
+&gt; 裸文本流只回答“显示什么字”；事件流回答“这件事是什么”。
+
+Note:
+StreamEvent 是这一段最值得讲的抽象。正文、reasoning、工具调用、结束帧是不同语义，不应该混成字符串让上层猜。
+
+===
+
+## 多消费者：慢的那个自己扛债
+
+单消费者 CLI 很简单：
+
+```python
+for ev in chain.stream_call(cancel_token=ct, model=m, messages=msgs, tools=ts):
+    if ev.type == EVENT_TEXT_DELTA:
+        sys.stdout.write(ev.text)
+    elif ev.type == EVENT_DONE:
+        final_resp = ev.response
+```
+
+如果要广播给 TTS、复杂 UI、多个 gateway，第一反应是把一个循环变成一组 handler：
+
+```python
+def make_printer():
+    def handle(ev):
+        if ev.type == EVENT_TEXT_DELTA:
+            sys.stdout.write(ev.text)
+        elif ev.type == EVENT_TOOL_CALL_STARTED:
+            sys.stdout.write(f"\n[tool] {ev.tool_name}\n")
+    return handle
+
+
+def make_tts(tts_queue):
+    def handle(ev):
+        if ev.type == EVENT_TEXT_DELTA:
+            tts_queue.put(ev.text)  # 只朗读正文
+        elif ev.type == EVENT_DONE:
+            tts_queue.put(None)     # 本轮结束，冲刷缓冲
+    return handle
+```
+
+```python
+consumers = [make_printer(), make_tts(tts_queue)]
+for ev in chain.stream_call(...):
+    for handle in consumers:
+        handle(ev)
+```
+
+Note:
+这一版的好处是语义很清楚：TTS handler 只看 text_delta，reasoning_delta / tool_call_started / done 可以各取所需，不需要 None 哨兵去猜语义。
+
+===
+
+## 同步广播的问题
+
+`for h in consumers: h(ev)` 是同步串行的，生产级会踩三个坑：
+
+```text
+① 慢消费者反压生产者
+   TTS handle 里若直接 speak()，同步播 2 秒
+   → 这 2 秒 for 循环卡死
+   → 拉不了下一个 SSE 事件
+   → 连终端显示也跟着卡
+
+② 一个消费者崩，全流死
+   TTS 引擎没装，handler 抛异常
+   → 整个 for ev in stream 被打穿
+   → 显示也没了
+
+③ 只加队列还不够
+   无界队列：TTS 播不过来，文本越堆越多，延迟和内存一起涨
+   有界队列：满了若阻塞等待，又回到 ①
+```
+
+显示是微秒级，TTS 是秒级。
+
+&gt; 同一个事件流喂速度差千倍的消费者，慢的那个必须自己扛债。
+
+Note:
+这里要把“异构”讲出来。不是多一个消费者这么简单，而是消费者的速度、可靠性、能不能丢数据都不同。慢消费者不能拖垮快消费者，也不能反向卡住生产者。
+
+===
+
+## 每个消费者：自己的队列和线程
+
+解法是把消费者隔离开：
+
+&gt; 每个消费者 = 自己的线程 + 自己的有界队列 + 自己的丢弃策略。
+
+```python
+class Consumer:
+    def __init__(self, name, handle, *, maxsize, on_full):
+        self.name = name
+        self.handle = handle
+        self.on_full = on_full
+        self.q = queue.Queue(maxsize=maxsize)
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def offer(self, ev):
+        try:
+            self.q.put_nowait(ev)  # 生产者绝不阻塞
+        except queue.Full:
+            self._on_full(ev)  # drop_oldest / drop_new / coalesce
+
+    def _run(self):
+        while True:
+            ev = self.q.get()
+            try:
+                self.handle(ev)
+            except Exception as exc:
+                log_consumer_error(self.name, exc)
+```
+
+```python
+consumers = [
+    Consumer("display", printer_handle, maxsize=0, on_full=None),
+    Consumer("tts", tts_handle, maxsize=32, on_full="coalesce"),
+]
+
+for ev in stream:
+    for c in consumers:
+        c.offer(ev)  # 非阻塞：慢就在自己的队列里慢
+```
+
+Note:
+关键点有两个：offer 用 put_nowait，所以生产者不等消费者；_run 里 per-consumer try/except，所以一个消费者崩不会打穿整条流。
+
+===
+
+## 背压策略：不同消费者不同债务
+
+```text
+display  │ 必达不丢字 │ 队列无界，本来就快，堆不起来
+TTS      │ 可丢可合并 │ 落后了把几段文本拼成一句再念
+gateway  │ 可丢老的   │ on_full="drop_oldest"，客户端只要最新状态
+```
+
+`coalesce` 对 TTS 尤其合适：队列满时不是丢字，而是把相邻文本拼成一段，队列长度不增。
+
+```python
+def _on_full(self, ev):
+    if self.on_full == "coalesce" and ev.type == EVENT_TEXT_DELTA:
+        old = self.q.get_nowait()
+        merged = StreamEvent(EVENT_TEXT_DELTA, text=old.text + ev.text)
+        self.q.put_nowait(merged)
+    elif self.on_full == "drop_oldest":
+        self.q.get_nowait()
+        self.q.put_nowait(ev)
+    elif self.on_full == "drop_new":
+        pass
+```
+
+代价也很明确：线程、队列、丢弃策略都会增加复杂度。
+
+&gt; nano 当前只需要 CLI 单消费者，所以这是“真长出多消费者需求才做”的迭代，不是现在就加。
+
+Note:
+到这一版，nano 的多消费者不再是“用 pull 硬模拟 push”，而是多了一层 per-consumer 背压策略。事件模型让未来扩展有干净路径，但教学版不急着把这层复杂度放进主线。
+
+===
+
+## Stream 和 TransportChain 的边界
+
+同步路径失败可以后台重试，因为用户还没看见任何内容。
+
+流式路径不一样：一旦吐过一帧，内容已经显示在屏幕上。
+
+| 场景 | 行为 | 用户体感 |
+|------|------|----------|
+| 首帧之前挂 | 切下一家 | 卡一下后正常出字 |
+| 首帧之后挂 | 不切，异常上抛 | 半截真实内容 + 干净失败提示 |
+| `StreamCancelled` | 不动断路器 | 回到 prompt |
+
+```python
+delivered = False
+for ev in entry.transport.stream_call(...):
+    delivered = True
+    yield ev
+```
+
+&gt; 首帧之前可以无痕切家；首帧之后不能假装没发生。
+
+Note:
+这页讲流式和故障链的适配。同步重试是纯收益；流式重试可能导致屏幕上出现两段不连续内容。
+
+===
+
+## 累积器里的真实坑
+
+```python
+fn = getattr(tcd, "function", None)
+if fn is not None:
+    if fn.name:
+        entry["name"] = fn.name
+    if fn.arguments:
+        entry["arguments"] += fn.arguments
+```
+
+这里两个字段规则相反：
+
+- `arguments` 必须 `+=`：OpenAI spec 规定 arguments 逐片下发
+- `name` 必须赋值：MiniMax M2.7 会每帧重发完整 name，用 `+=` 会变成 `"read_fileread_file"`
+- `usage` 不在正文帧，在最后一个 `choices=[]` 空帧带，需要显式 `stream_options.include_usage`
+
+&gt; 事件越干净，transport 里面越要愿意把脏活吃掉。
+
+Note:
+这是精简版里的 bug 页，保留它很有价值：它说明 provider quirk 必须被封在 transport 内。
+
+===
+
+## 事件流怎么停：CancelToken
+
+```python
+class CancelToken:
+    def __init__(self):
+        self._event = threading.Event()
+
+    def cancel(self):
+        self._event.set()
+
+    def reset(self):
+        self._event.clear()
+
+    def check(self):
+        if self._event.is_set():
+            raise StreamCancelled(...)
+```
+
+```python
+def stream_call(...):
+    for event in stream:
+        if cancel_token is not None:
+            cancel_token.check()
+        yield event
+```
+
+用 `threading.Event`，不是裸 bool：
+
+&gt; 给下一段父子智能体预留：父 token 会被多个子线程同时检查。
+
+Note:
+CancelToken 是这一段和下一段的连接点。流式输出先需要它，多智能体会马上复用它。
+
+===
+
+## Stream 小结
+
+```text
+call / stream_call 分开  → 不污染同步路径
+StreamEvent             → 语义在事件里，不在消费方猜
+多消费者策略            → 慢消费者自己扛债
+首帧哨兵                → 首帧之后禁止无痕切家
+CancelToken             → Ctrl+C 取消本轮，并为多线程预留
+```
+
+Note:
+这一段的主题是：新维度走在旧路径旁边。不是把流式塞进同步调用里面，而是给它一条独立路径和独立事件契约。
+
+===
+
+&lt;!-- .slide: class="title-slide" --&gt;
+# 父子智能体
+
+## 派出分身，但管住它
+
+&lt;span class="act-tag"&gt;delegate_task · child_loop · ThreadPoolExecutor&lt;/span&gt;
+
+Note:
+第五段讲父子智能体。精简版里重点不是多智能体概念本身，而是最小可用 delegate、批量并行、权限边界和结构化结果。
+
+===
+
+## 最小可用版：delegate_task + child_loop
+
+父 agent 通过一个工具派出子 agent：
+
+```python
+def delegate_task_handler(args: dict) -&gt; str:
+    result = run_child_loop(
+        goal=goal,
+        context=context,
+        chain=_chain,
+        model=_model,
+        registry=registry,
+        allowed_tool_names=allowed,
+    )
+
+    logger.info(
+        "[delegate] child done: exit=%s iters=%d summary_len=%d",
+        result["exit_reason"],
+        result["iterations"],
+        len(result["summary"]),
+    )
+```
+
+关键选择：
+
+- handler 自身不把异常抛出去
+- delegate 失败应该变成工具返回 error
+- 让父 LLM 下一轮自然处理：换策略、重试或道歉
+
+Note:
+这页对应精简版“多智能体最小可用版”。父把任务交给子，子跑一个隔离的 child_loop，结果再回给父。
+
+===
+
+## 权限边界：白名单 ∩ 父能力 − 黑名单
+
+子 agent 不是继承父 agent 的所有能力。
+
+```python
+allowed = parent_full
+allowed &amp;= set(requested)
+allowed -= {"delegate_task", "memory", "memory_*"}
+
+if name not in allowed_tool_names:
+    result = tool_error(f"tool '{name}' is not available to this sub-agent")
+```
+
+这三行表达四个安全默认值：
+
+- 默认拒绝
+- 最小权限
+- 纵深防御
+- 安全红线不能被配置绕过
+
+&gt; 新功能一旦能“派生自己”，第一件事不是让它跑得更快，而是先想清楚它能干坏什么。
+
+Note:
+权限是父子智能体最值得讲的部分。黑名单最后一步减，保证就算白名单写错，也不能绕过安全红线。
+
+===
+
+## 裁剪子循环：不复用父的 1300 行
+
+```text
+父循环                         子循环
+────────────────────          ────────────────────
+完整 agent loop                精简 child_loop
+memory manager                不拿 memory_manager
+压缩 / resume / UI             不 import compressor
+复杂交互状态                    不碰 stdout UI
+```
+
+为什么不复用？
+
+- 父子差异要在代码结构上一眼看见
+- 子不要什么能力，就让它“结构性缺席”
+- 代价是父子加新能力时可能要两边各改一次
+
+&gt; 这是“架构服务于场景”：教学版更重视边界清楚，生产版可能更重视复用。
+
+Note:
+这页保留父子智能体里最核心的判断。不是说永远不复用，而是 nano 的目标是讲清楚父子差异。
+
+===
+
+## 批量并行：tasks + ThreadPoolExecutor
+
+```python
+def delegate_task_handler(args: dict) -&gt; str:
+    for i, t in enumerate(tasks):
+        err = _validate_task_entry(t, idx=i)
+        if err:
+            return tool_error(err)
+
+    with ThreadPoolExecutor(max_workers=...) as pool:
+        results = list(pool.map(
+            lambda it: _run_one_task(it[1], task_index=it[0], is_batch=True),
+            list(enumerate(tasks)),
+        ))
+
+    return tool_result(output=json.dumps(
+        _build_handler_payload(results=results, started_at=overall_started_at),
+        ensure_ascii=False,
+    ))
+```
+
+三条纪律：
+
+- 主线程构建和校验
+- 任一任务不合法，fail-fast，绝不半启动
+- `executor.map` 保留输入顺序
+
+Note:
+这页对应精简版的 v23.1。并行不是直接把所有东西扔进线程池，而是先在主线程完成构建和校验。
+
+===
+
+## 结构化结果：子到父不再是一行黑盒文本
+
+```python
+tool_result(output=json.dumps({
+    "results": [{
+        "task_index": 0,
+        "status": "completed",
+        "summary": "...",
+        "tokens": {
+            "input": N,
+            "output": N,
+            "cache_read": N,
+            "cache_write": N,
+        },
+        "tool_trace": [
+            {"tool": "read_file", "result_bytes": 1234, "status": "ok"}
+        ],
+        "duration_seconds": 2.3,
+        "iterations": 3,
+        "exit_reason": "completed",
+    }],
+    "total_duration_seconds": 4.1,
+}))
+```
+
+单任务也走 `results` 数组，只是数组长度为 1。
+
+&gt; 父 LLM 永远 `json.loads → results[i]`，不用区分单任务和批量任务。
+
+Note:
+结构化结果让父能看到子任务状态、成本、工具轨迹，不再只能拿到一行 summary。
+
+===
+
+## 父子成本聚合
+
+子 worker 是并发线程，写共享 token 统计要加锁：
+
+```python
+with _SESSION_TOKENS_LOCK:
+    for k in SESSION_TOKEN_KEYS:
+        runtime.session_tokens[k] += int(child_tokens[k])
+```
+
+为什么父不用同样的 lock？
+
+```text
+父 turn 在 main loop 单线程里跑
+子 worker 在 ThreadPoolExecutor 并发线程里跑
+```
+
+`d[k] += n` 不是一个原子动作，而是 LOAD / ADD / STORE。
+
+&gt; 子要 lock，父不用。并发边界在哪里，锁就加在哪里。
+
+Note:
+这页保留一个工程细节，让并发不是概念，而是具体落在共享状态上的风险。
+
+===
+
+## 父子智能体小结
+
+```text
+delegate_task       → 父通过工具派出子 agent
+child_loop          → 子循环隔离、裁剪、边界清楚
+权限计算            → 白名单 ∩ 父能力 − 黑名单
+ThreadPoolExecutor  → 批量并行，主线程构建，fail-fast
+结构化结果          → results 数组 + token / trace / duration
+```
+
+这一段证明：
+
+&gt; 能力即风险。能派生子 agent 之后，第一优先级是控制爆炸半径。
+
+Note:
+父子智能体不是“越能干越好”，而是能力、并发、成本、取消、权限都要能收束。
+
+===
+
+# 从项目里抽出的软件工程经验
+
+这个项目表面上是在重构一个 Agent，实际上一遍遍遇到的是同一类工程问题：
+
+&gt; 需求会变、能力会长、外部服务会挂、模型输出会脏、并发会把小问题放大。
+
+所以最后想分享的不是“Agent 应该这么写”，而是这个项目真实留下的一套工程闭环：
+
+```text
+系统路线图            docs/system-roadmap.md
+  └─ 拆分系统：每个系统负责什么、实现顺序、依赖关系、优先级
+子系统迭代计划        docs/*-system/iteration-plan.md
+  └─ 根据系统优先级，把每个系统拆成一档档可验证版本
+每版本决策记录        docs/decisions/v*.md
+每版本行为测试        scripts/test_v*.py
+```
+
+&gt; 代码只是结果；真正可复用的是“怎么把复杂系统一步步长出来”的过程记录。
+
+Note:
+这里要把经验落到材料上：不是泛泛说工程实践，而是告诉大家这个项目怎么把实践固化成路线图、迭代文档、决策日志、测试代码和讲解材料。
+
+===
+
+## 这些经验具体对应什么
+
+| 工程经验 | 项目里的具体证据 |
+|------|------|
+| 一次只解决一个问题 | `docs/system-roadmap.md` 先拆系统、排优先级、梳理依赖，确认接下来的子系统后，再写 `iteration-plan.md` |
+| 抽象等第二个用例验证 | `v17` 先抽 Transport ABC，`v18` 接 Anthropic 验证主循环不动 |
+| 决策要记录没选的路 | `docs/decisions/v*.md` 固定写“为什么选 / 为什么不选 / 怎么验证” |
+| 测试守住行为底线 | `scripts/test_v17_transport.py` 到 `test_v25_1_insights.py`，每版一组 |
+| 能力越大，边界越要清楚 | `v23.0` 黑名单、`v23.1` 白名单交集、`v23.4` 结构化结果 |
+| 横切能力收进统一关口 | `ToolRegistry` hooks、`MemoryManager` 生命周期、日志脱敏 formatter |
+
+Note:
+这页把经验和文件绑定起来。听众如果回去看仓库，能顺着 docs/decisions 和 scripts/test_v*.py 复盘每个版本为什么这么做。
+
+===
+
+## 每个版本都跑一遍这个循环
+
+还有一个很现实的前提：
+
+&gt; 不可能在没做之前就设计出完美方案，也不可能一开始就写出一个子系统完全可靠的迭代计划。
+
+路线图和迭代文档只能先给方向；真正的问题和 bug，是在代码迭代、测试、真实接入里被发现的。
+
+```text
+1. 上一版暴露一个具体痛点
+2. 子系统迭代文档里切出最小版本
+3. 代码只改这个最小切片
+4. 写 scripts/test_vN_*.py，测对外行为
+5. 写 docs/decisions/vN.md，记录取舍和坑
+6. 旧测试重跑，确认零回归
+7. 把新发现回写到路线图 / 决策文档 
+```
+
+举几个具体版本：
+
+```text
+v12  异步 retain       → test_v12_writer.py
+v19  Transport failover → test_v19_failover.py
+v22  流式 + 中断        → test_v22_streaming.py
+v23  父子 agent         → test_v23_*.py
+v25  轨迹 + insights    → test_v25_*.py
+```
+
+&gt; 每个版本都不是“按计划施工”，而是“用代码和测试校准计划”。
+
+Note:
+这页讲可复制的工作流。很多项目失败不是因为没有抽象，而是把方案文档当成答案。这个项目的做法是：文档先给方向，代码和测试暴露事实，再把事实回写进文档。
+
+===
+
+&lt;!-- .slide: class="title-slide" --&gt;
+# 最后一句
+
+&gt; **一次只解决一个问题，每步都站在上一步的稳定之上。**
+
+五条主线，其实都是这句话在不同方向上的重复验证：
+
+```text
+ToolRegistry      → 新增工具来源，不动主循环
+MemoryProvider    → 替换记忆后端，不动主循环
+ProviderTransport → 替换模型厂商，不动主循环
+StreamEvent       → 新增流式维度，不污染同步路径
+child_loop        → 派生子 agent，但收住权限和并发边界
+```
+
+希望大家带走的不是某个具体实现，而是一种节奏：
+
+&gt; 先定方向，小步演进，清楚边界，持续验证。
+
+&lt;span class="act-tag"&gt;谢谢&lt;/span&gt;
+
+Note:
+结尾回到全场最核心的方法论。不是炫功能，而是分享这个项目里反复验证过的软件工程经验。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      </textarea>
+    </section>
+  </div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/markdown/markdown.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+<script>
+  Reveal.initialize({
+    hash: true,
+    slideNumber: 'c/t',
+    width: 1280,
+    height: 760,
+    margin: 0.06,
+    transition: 'slide',
+    plugins: [ RevealMarkdown, RevealHighlight, RevealNotes ],
+  });
+
+  (() => {
+    const label = document.querySelector('.zoom-label');
+    const toolbar = document.querySelector('.panzoom-toolbar');
+    const state = { scale: 1, x: 0, y: 0, dragging: false, space: false, sx: 0, sy: 0, ox: 0, oy: 0 };
+
+    function leafSlide() {
+      const slide = Reveal.getCurrentSlide();
+      if (!slide || slide.querySelector(':scope > section')) return null;
+      return slide;
+    }
+
+    function ensureInner(slide) {
+      let inner = slide.querySelector(':scope > .panzoom-inner');
+      if (inner) return inner;
+      inner = document.createElement('div');
+      inner.className = 'panzoom-inner';
+      while (slide.firstChild) inner.appendChild(slide.firstChild);
+      slide.appendChild(inner);
+      return inner;
+    }
+
+    function apply() {
+      const slide = leafSlide();
+      if (!slide) return;
+      const inner = ensureInner(slide);
+      inner.style.transform = `translate(${state.x}px, ${state.y}px) scale(${state.scale})`;
+      label.textContent = `${Math.round(state.scale * 100)}%`;
+      document.body.classList.toggle('panzoom-active', state.scale !== 1 || state.x !== 0 || state.y !== 0);
+    }
+
+    function reset() {
+      state.scale = 1; state.x = 0; state.y = 0;
+      apply();
+    }
+
+    function zoomAt(clientX, clientY, nextScale) {
+      const slide = leafSlide();
+      if (!slide) return;
+      const rect = slide.getBoundingClientRect();
+      const mx = clientX - rect.left;
+      const my = clientY - rect.top;
+      const oldScale = state.scale;
+      nextScale = Math.min(3, Math.max(0.7, nextScale));
+      const cx = (mx - state.x) / oldScale;
+      const cy = (my - state.y) / oldScale;
+      state.x = mx - cx * nextScale;
+      state.y = my - cy * nextScale;
+      state.scale = nextScale;
+      apply();
+    }
+
+    document.addEventListener('wheel', (ev) => {
+      if (!ev.target.closest('.reveal')) return;
+      if (Reveal.isOverview && Reveal.isOverview()) return;
+      ev.preventDefault();
+      const factor = Math.exp(-ev.deltaY * 0.001);
+      zoomAt(ev.clientX, ev.clientY, state.scale * factor);
+    }, { passive: false });
+
+    document.addEventListener('keydown', (ev) => {
+      if (ev.code === 'Space') {
+        state.space = true;
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+      if (ev.key === '+' || ev.key === '=') zoomAt(window.innerWidth / 2, window.innerHeight / 2, state.scale * 1.12);
+      if (ev.key === '-' || ev.key === '_') zoomAt(window.innerWidth / 2, window.innerHeight / 2, state.scale / 1.12);
+      if (ev.key === '0') reset();
+    }, true);
+    document.addEventListener('keyup', (ev) => {
+      if (ev.code === 'Space') {
+        state.space = false;
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+    }, true);
+
+    document.addEventListener('mousedown', (ev) => {
+      if (toolbar.contains(ev.target)) return;
+      if (!ev.target.closest('.reveal')) return;
+      const wantsDrag = state.space || state.scale !== 1 || ev.button === 1 || ev.button === 2;
+      if (!wantsDrag) return;
+      ev.preventDefault();
+      state.dragging = true;
+      state.sx = ev.clientX; state.sy = ev.clientY;
+      state.ox = state.x; state.oy = state.y;
+      document.body.classList.add('panzoom-dragging');
+    });
+    document.addEventListener('mousemove', (ev) => {
+      if (!state.dragging) return;
+      state.x = state.ox + ev.clientX - state.sx;
+      state.y = state.oy + ev.clientY - state.sy;
+      apply();
+    });
+    document.addEventListener('mouseup', () => {
+      state.dragging = false;
+      document.body.classList.remove('panzoom-dragging');
+    });
+    document.addEventListener('contextmenu', (ev) => {
+      if (state.scale !== 1 && ev.target.closest('.reveal')) ev.preventDefault();
+    });
+    document.addEventListener('dblclick', (ev) => {
+      if (ev.target.closest('.reveal')) reset();
+    });
+
+    toolbar.addEventListener('click', (ev) => {
+      const action = ev.target.dataset.zoomAction;
+      if (action === 'in') zoomAt(window.innerWidth / 2, window.innerHeight / 2, state.scale * 1.2);
+      if (action === 'out') zoomAt(window.innerWidth / 2, window.innerHeight / 2, state.scale / 1.2);
+      if (action === 'reset') reset();
+    });
+
+    Reveal.on('slidechanged', reset);
+    Reveal.on('ready', apply);
+  })();
+</script>
+</body>
+</html>
