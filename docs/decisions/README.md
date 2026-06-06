@@ -36,5 +36,6 @@
 | v26.2 | 安全 token 替换（`${SKILL_DIR}`/`${SESSION_ID}` 白名单替换 / **绝不做内联 shell** / tier 3 资源不替） | [v26.2.md](./v26.2.md) |
 | v26.3 | 行为指令注入 system prompt（`inject_directive` frontmatter / 完全可用才注入 / 渐进式披露的常驻例外，驱动主动播报） | [v26.3.md](./v26.3.md) |
 | v26.4 | 代码级语音心跳（后台守护线程直连 VoiceClient / 静默超时补播 / 接管模型物理上做不到的"阻塞期报活" / directive 瘦身） | [v26.4.md](./v26.4.md) |
+| v26.5 | 事件驱动语音进度服务实验废弃（功能可跑但策略硬编码 / 多点插入 / 横切逻辑污染主流程；后续改走 EventBus + listener + policy 外置） | [v26.5.md](./v26.5.md) |
 
 > 注：V8 的决策记录散落在对应的 commit message 与 [docs/Memory-system/](../Memory-system/) 子目录下，未来如有补录需求再回填本目录。V15 主决策（5 阶段压缩流水线）当时未单独建档，本目录从 v15.1 开始接力补完。
