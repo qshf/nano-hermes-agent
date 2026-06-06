@@ -1,21 +1,11 @@
 """V21.3 / V26.0: ``skill_view`` 工具 — progressive disclosure tier 2/3 入口。
 
-行为
-====
-agent 看到 ``PromptBuilder`` 注入的 tier 1 索引（仅 name + description）
-后，**当它判断需要某个 skill 的详细指令时**主动调这个工具。tool result
-落进 messages → 下一轮推理就有了完整指令。这是上下文经济学的关键：
-一个 30+ skill 的 agent 启动只占 1-2 KB，详细指令只在按需展开时进入。
+两种模式（设计理由见 docs/decisions/v26.0.md 与 v21.3 决策日志）：
 
-V26.0 双模式
-============
-一个工具两种模式（仿源项目 ``skills_tool.py`` 的 ``file_path`` 设计，
-比拆两个工具更省 LLM 的工具选择负担）：
-
-- **无 ``file_path``（tier 2）**：读 SKILL.md，结果附 ``linked_files`` ——
-  告诉 agent 这个 skill 还带了哪些 references/templates/assets/scripts。
-- **有 ``file_path``（tier 3）**：读那个 bundled 资源；``read_resource``
-  的两道沙箱防线拦 ``..`` 与 symlink 逃逸，binary 文件只回尺寸标记。
+- **无 ``file_path``（tier 2）**：读 SKILL.md，结果附 ``linked_files`` 列出
+  该 skill 携带的 references/templates/assets/scripts。
+- **有 ``file_path``（tier 3）**：读那个 bundled 资源；``read_resource`` 的两道
+  沙箱防线拦 ``..`` 与 symlink 逃逸，binary 文件只回尺寸标记。
 
 注册时序问题
 ============
@@ -32,6 +22,20 @@ from typing import Optional
 
 from tools.registry import registry
 from tools.result import tool_error, tool_result
+
+
+def _current_session_id() -> str | None:
+    """取当前线程绑定的 session_id（V26.2 ${SESSION_ID} 替换用）。
+
+    复用 V25.1 的 thread-local 会话绑定；未绑定（``"-"`` 哨兵）归一成 None。
+    """
+    try:
+        from agent.logging import get_log_session
+
+        sid = get_log_session()
+        return sid if sid and sid != "-" else None
+    except Exception:
+        return None
 
 
 _skill_loader = None  # type: Optional["SkillLoader"]  # noqa: F821 (forward ref)
@@ -109,7 +113,9 @@ def skill_view_handler(args: dict) -> str:
 
     # ── tier 2：读 SKILL.md，末尾附 linked_files 引导 ─────────────────
     try:
-        content = _skill_loader.view(name)
+        # V26.2：取当前会话 id 让 ${SESSION_ID} 也能替换（thread-local 隔离）
+        session_id = _current_session_id()
+        content = _skill_loader.view(name, session_id)
     except KeyError:
         available = ", ".join(_skill_loader.names()) or "(none)"
         return tool_error(f"unknown skill '{name}'. available: {available}")

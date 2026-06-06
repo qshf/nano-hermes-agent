@@ -290,8 +290,12 @@ class SkillLoader:
 
     # ── tier 2：按需读全文 ─────────────────────────────────────────────
 
-    def view(self, name: str) -> str:
+    def view(self, name: str, session_id: str | None = None) -> str:
         """读取指定 skill 的完整 markdown（含 frontmatter）。
+
+        V26.2：返回前过安全 token 替换（``${SKILL_DIR}`` / ``${SESSION_ID}``，
+        见 ``agent/skill_preprocessing.py``）。``session_id=None`` 时
+        ``${SESSION_ID}`` 原样保留（向后兼容旧调用方）。
 
         Raises:
             KeyError: 未知 skill 名（不在缓存中）
@@ -300,7 +304,10 @@ class SkillLoader:
         meta = self._cache.get(name)
         if meta is None:
             raise KeyError(f"unknown skill: {name}")
-        return meta.path.read_text(encoding="utf-8")
+        content = meta.path.read_text(encoding="utf-8")
+        from agent.skill_preprocessing import substitute_tokens  # 延迟 import
+
+        return substitute_tokens(content, meta.skill_dir, session_id)
 
     # ── tier 3：bundled 资源发现 + 沙箱读取 ───────────────────
 

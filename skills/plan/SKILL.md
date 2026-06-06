@@ -32,6 +32,18 @@ Write a markdown plan that is concrete and actionable. Include, when relevant:
 
 If the task is code-related, include exact file paths, likely test targets, and verification steps.
 
+## Before you finish
+
+Run through the review checklist bundled with this skill. Read it with:
+
+```
+skill_view("plan", "references/checklist.md")
+```
+
+The checklist lives at `${SKILL_DIR}/references/checklist.md` on disk (the
+`${SKILL_DIR}` token is substituted with this skill's absolute directory when
+the skill is loaded, so the path stays correct wherever the repo is cloned).
+
 ## Save location
 
 Save the plan with the file-write tool under:

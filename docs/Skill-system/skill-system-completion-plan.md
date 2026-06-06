@@ -370,6 +370,9 @@ for meta in metadata:
 
 ## 7. v26.2 详细设计 — 参数/变量替换（仅安全 token）
 
+> ✅ **已实现**（branch `skill/v0.26.2`，8/8 不变量）。落地详情见
+> [docs/decisions/v26.2.md](../decisions/v26.2.md)。下文为原始设计，与实现一致。
+
 ### 7.1 解决的问题
 skill 指令里常需引用「自己的目录」（让 agent 知道去哪读模板）或「当前会话 id」。硬编码绝对路径不可移植。源项目用 `${HERMES_SKILL_DIR}` token 解决。
 

@@ -48,7 +48,7 @@ def cmd_skill(args: str, ctx: AgentCtx) -> None:
         if len(parts) < 2:
             print("  [skill] usage: /skill view <name>")
             return
-        _view(loader, parts[1])
+        _view(loader, parts[1], getattr(ctx, "current_session_id", None))
     elif sub == "reload":
         _reload(loader)
     else:
@@ -73,9 +73,9 @@ def _list(loader) -> None:
         print(f"    - {m.name}: {desc}{suffix}")
 
 
-def _view(loader, name: str) -> None:
+def _view(loader, name: str, session_id: str | None = None) -> None:
     try:
-        content = loader.view(name)
+        content = loader.view(name, session_id)  # V26.2: ${SESSION_ID} 替换
     except KeyError:
         avail = ", ".join(loader.names()) or "(none)"
         print(f"  [skill] unknown: {name}. available: {avail}")
