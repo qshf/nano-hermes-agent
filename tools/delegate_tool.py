@@ -406,17 +406,25 @@ def _run_one_task(
         effective_task_index, goal[:80], len(allowed), stream_enabled,
     )
     progress_cb = _build_child_progress_callback(task_index, is_batch, stream_enabled)
-    child_result = run_child_loop(
-        goal=goal,
-        context=context,
-        chain=ctx.chain,
-        model=ctx.model,
-        registry=registry,
-        allowed_tool_names=allowed,
-        cancel_token=ctx.runtime.cancel_token,
-        stream_enabled=stream_enabled,
-        progress_callback=progress_cb,
-    )
+    # 进入子 agent 区间：子内部复用父单例 registry，靠这个 contextvar 标记让
+    # registry 不在父 tracker 上开工具 span（v27.1 review #1）。worker 线程不继承
+    # 父 context，每个 worker 在自己线程里 set/reset，互不串扰。
+    from agent.runtime_phase import enter_child_agent_scope, exit_child_agent_scope
+    _scope_token = enter_child_agent_scope()
+    try:
+        child_result = run_child_loop(
+            goal=goal,
+            context=context,
+            chain=ctx.chain,
+            model=ctx.model,
+            registry=registry,
+            allowed_tool_names=allowed,
+            cancel_token=ctx.runtime.cancel_token,
+            stream_enabled=stream_enabled,
+            progress_callback=progress_cb,
+        )
+    finally:
+        exit_child_agent_scope(_scope_token)
 
     # 累加 child tokens 到父 runtime —— worker 线程内立即 finalize，
     # 不等批量整体结束（保证 cancel 时已写入的不丢）。

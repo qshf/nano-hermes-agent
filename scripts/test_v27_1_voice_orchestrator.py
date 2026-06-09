@@ -245,6 +245,82 @@ def test_13_agent_exports_do_not_expose_abandoned_supervisor():
     assert hasattr(agent, "TurnEventEnvelope")
 
 
+def test_14_preview_short_result_has_no_head_tail_overlap():
+    """review #6：结果放得下时只放 head，不切重叠的 tail，且 result_truncated=False。"""
+    os.environ["VOICE_ORCHESTRATOR_MAX_TOOL_RESULT_CHARS"] = "100"
+    try:
+        p = preview_tool_result("t", "ok", "abcdefg")
+        assert p.result_truncated is False
+        assert p.result_head.text == "abcdefg"
+        assert p.result_tail.text == ""
+        big = "H" * 60 + "M" * 200 + "T" * 60
+        p2 = preview_tool_result("t", "ok", big)
+        assert p2.result_truncated is True
+        # head 只含开头段、tail 只含结尾段 —— 中段被丢，两段不重叠
+        assert "T" not in p2.result_head.text
+        assert "H" not in p2.result_tail.text
+        assert len(p2.result_head.text) + len(p2.result_tail.text) <= 100
+    finally:
+        os.environ.pop("VOICE_ORCHESTRATOR_MAX_TOOL_RESULT_CHARS", None)
+
+
+def test_15_child_agent_scope_suppresses_tool_phase():
+    """review #1：子 agent 区间内 registry 不在父 tracker 上开工具 span。"""
+    from agent.runtime_phase import enter_child_agent_scope, exit_child_agent_scope
+
+    seen = []
+    runtime = AgentRuntime(stream_enabled=True, cancel_token=None)
+    runtime.phase_tracker = PhaseTracker(lambda status, phase: seen.append((status, phase.name)))
+    reg = ToolRegistry()
+    reg.set_runtime(runtime)
+    reg.register({"name": "noop", "parameters": {"type": "object", "properties": {}}}, lambda _a: tool_result(output="ok"))
+
+    tok = enter_child_agent_scope()
+    try:
+        reg.dispatch("noop", {})
+    finally:
+        exit_child_agent_scope(tok)
+    assert seen == [], f"child-scope dispatch leaked phases: {seen}"
+
+    # 区间外恢复正常：父工具仍上报 PHASE_TOOL_EXECUTING
+    reg.dispatch("noop", {})
+    assert [s for s, _ in seen] == ["phase_started", "phase_finished"]
+    assert seen[0][1] == PHASE_TOOL_EXECUTING
+
+
+def test_16_recent_messages_skipped_when_preview_disabled():
+    """review #7：send_message_preview=False 时不走 recent_messages 预览循环。"""
+    messages = [
+        {"role": "system", "content": "secret system prompt"},
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "hi there"},
+    ]
+    env = build_turn_event_envelope(
+        event_type="phase_activity",
+        session_id="s",
+        turn_id="t",
+        messages=messages,
+        send_message_preview=False,
+    ).to_dict()
+    assert env["context"]["recent_messages"] == []
+    # 最近用户目标仍单独保留
+    assert env["context"]["last_user_message_preview"]["text"] == "hello"
+    assert env["safety"]["message_preview_enabled"] is False
+
+
+def test_17_shared_env_helpers_single_source():
+    """review 折叠项：env 解析只有一份实现，两个 voice 模块都引用 agent.env。"""
+    from agent import env as shared_env
+    from agent import turn_events, voice_orchestrator_client
+
+    assert turn_events._env_int is shared_env.env_int
+    assert turn_events._env_bool is shared_env.env_bool
+    assert voice_orchestrator_client.env_bool is shared_env.env_bool
+    assert voice_orchestrator_client.env_float is shared_env.env_float
+    assert shared_env.env_bool("X_NOPE_MISSING", True) is True
+    assert shared_env.env_int("X_NOPE_MISSING", 9) == 9
+
+
 def main() -> None:
     print("=" * 60)
     print("V27.1 Voice Orchestrator Host-Side Invariant Test")
@@ -265,6 +341,10 @@ def main() -> None:
         test_11_delegate_child_phase_helpers_are_aggregate_only,
         test_12_voice_skill_no_longer_instructs_terminal_say,
         test_13_agent_exports_do_not_expose_abandoned_supervisor,
+        test_14_preview_short_result_has_no_head_tail_overlap,
+        test_15_child_agent_scope_suppresses_tool_phase,
+        test_16_recent_messages_skipped_when_preview_disabled,
+        test_17_shared_env_helpers_single_source,
     ]
     failed = 0
     for test in tests:

@@ -8,12 +8,12 @@ system prompts, and chain-of-thought.
 
 from __future__ import annotations
 
-import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
+from agent.env import env_bool as _env_bool, env_int as _env_int
 from agent.redact import redact as _redact_secrets
 
 
@@ -200,17 +200,26 @@ def preview_tool_result(name: str, status: str, result: Any, *, duration_ms: Opt
     max_chars = _env_int("VOICE_ORCHESTRATOR_MAX_TOOL_RESULT_CHARS", DEFAULT_MAX_TOOL_RESULT_CHARS)
     send_tool_preview = _env_bool("VOICE_ORCHESTRATOR_SEND_TOOL_PREVIEW", True)
     raw = "" if result is None or not send_tool_preview else str(result)
-    half = max(0, max_chars // 2)
-    head = preview_text(raw[:half], max_chars=half)
-    tail_source = raw[-half:] if half and len(raw) > half else ""
-    tail = preview_text(tail_source, max_chars=half)
+    truncated = len(raw) > max_chars
+    if not truncated:
+        # 整段放得下就只放 head，不再切 tail —— 否则 raw[:half] 和 raw[-half:]
+        # 会重叠，把中段内容外发两遍（v27.1 review #6）。
+        head = preview_text(raw, max_chars=max_chars)
+        tail = preview_text("", max_chars=max_chars)
+    else:
+        # 真截断时才 head/tail 分头取，丢中段。head_len + tail_len == max_chars
+        # < len(raw)，两段保证不重叠。
+        head_len = max(0, max_chars // 2)
+        tail_len = max_chars - head_len
+        head = preview_text(raw[:head_len], max_chars=head_len)
+        tail = preview_text(raw[-tail_len:] if tail_len else "", max_chars=tail_len)
     return ToolPreview(
         name=_safe_identifier(name),
         status=_safe_identifier(status),
         duration_ms=duration_ms,
         result_head=head,
         result_tail=tail,
-        result_truncated=len(raw) > max_chars,
+        result_truncated=truncated,
     )
 
 
@@ -321,24 +330,3 @@ def _safe_identifier(value: Any) -> str:
 
     text = "" if value is None else str(value)
     return "".join(ch for ch in text if ch.isalnum() or ch in "_:-.")[:96]
-
-
-def _env_int(name: str, default: int) -> int:
-    """读取整数环境变量，非法值回退默认值。"""
-
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    """读取布尔环境变量；0/false/空串视为 False。"""
-
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw not in ("0", "false", "False", "")

@@ -80,7 +80,11 @@ class ToolRegistry:
         if tracker is None:
             return None
         try:
-            from agent.runtime_phase import PHASE_TOOL_EXECUTING
+            from agent.runtime_phase import PHASE_TOOL_EXECUTING, in_child_agent_scope
+            # 子 agent 复用父单例 registry；子内部 dispatch 不该在父 tracker 上
+            # 各开一个工具 span（父侧只播 PHASE_CHILD_AGENT_RUNNING 聚合 span）。
+            if in_child_agent_scope():
+                return None
             return tracker.start(PHASE_TOOL_EXECUTING, tool_name=tool_name)
         except Exception:  # noqa: BLE001 — observers must never affect tools
             log.debug("tool phase start failed", exc_info=True)

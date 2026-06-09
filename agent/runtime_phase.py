@@ -14,6 +14,7 @@ metadata only; it does not decide if anything should be spoken.
 
 from __future__ import annotations
 
+import contextvars
 import itertools
 import time
 from collections.abc import Callable
@@ -26,6 +27,33 @@ PHASE_ASSISTANT_GENERATING_TEXT = "assistant_generating_text"
 PHASE_ASSISTANT_GENERATING_TOOL_ARGUMENTS = "assistant_generating_tool_arguments"
 PHASE_TOOL_EXECUTING = "tool_executing"
 PHASE_CHILD_AGENT_RUNNING = "child_agent_running"
+
+# 子 agent 跑在 ThreadPoolExecutor worker / 同步 child loop 里，复用父进程的
+# 单例 registry（其 _runtime 指向父）。若不抑制，子内部每次 registry.dispatch
+# 都会在父 tracker 上开一个 PHASE_TOOL_EXECUTING span —— orchestrator 把子工具
+# 当成父工具播报（v27.1 review #1）。用 contextvar 在子执行区间打标：worker
+# 线程会继承设置时的 context 副本，互不串扰；父侧只播 PHASE_CHILD_AGENT_RUNNING
+# 这一个聚合 span。
+_in_child_agent: contextvars.ContextVar[bool] = contextvars.ContextVar("nano_in_child_agent", default=False)
+
+
+def enter_child_agent_scope() -> contextvars.Token:
+    """标记"进入子 agent 执行区间"，返回用于复位的 token。"""
+
+    return _in_child_agent.set(True)
+
+
+def exit_child_agent_scope(token: contextvars.Token) -> None:
+    """复位子 agent 区间标记（与 enter_child_agent_scope 配对）。"""
+
+    _in_child_agent.reset(token)
+
+
+def in_child_agent_scope() -> bool:
+    """当前是否处于子 agent 执行区间（registry phase helper 据此抑制 span）。"""
+
+    return _in_child_agent.get()
+
 
 _PHASE_COUNTER = itertools.count(1)
 
