@@ -446,35 +446,42 @@ def test_06_pure_logic_contracts_unchanged():
 
 
 def test_07_main_py_sigint_contract():
-    """main.py 必须用 agent_busy.is_set() 区分两种 SIGINT 语境。
+    """父 loop 必须用 agent_busy.is_set() 区分两种 SIGINT 语境。
 
-    这条不能在单元层 mock 信号，但可以校验 main.py 源码的契约：
+    这条不能在单元层 mock 信号，但可以校验源码的契约：
     - 含 ``agent_busy`` Event（V23.4 起取代 V22 的 streaming_active）
     - tool loop 期间 cancel_token.cancel()，prompt 期间 raise KeyboardInterrupt
     - DelegateContext 注入 shared runtime，runtime 持有 cancel_token + stream_enabled
+
+    V27.1 重构后契约横跨两文件：装配（agent_busy / AgentRuntime / delegate 注入）
+    在 agent/bootstrap.py，运行（SIGINT handler / busy set·clear）在 agent/turn_loop.py。
+    合起来校验。
     """
-    main_py = (Path(__file__).resolve().parent.parent / "main.py").read_text()
+    root = Path(__file__).resolve().parent.parent
+    bootstrap_py = (root / "agent" / "bootstrap.py").read_text()
+    turn_loop_py = (root / "agent" / "turn_loop.py").read_text()
+    src = bootstrap_py + "\n" + turn_loop_py
 
     # 契约 1：仍有 busy signal 区分两种语境（名字 V23.4 改了，语义不变）
-    assert 'agent_busy = threading.Event()' in main_py, "main.py 失去 agent_busy Event"
-    assert 'agent_busy.is_set()' in main_py, "main.py SIGINT 不再读取 agent_busy Event"
-    assert 'agent_busy.set()' in main_py, "main.py tool loop 进入时未 set busy"
-    assert 'agent_busy.clear()' in main_py, "main.py tool loop 退出时未 clear busy"
-    assert 'cancel_token.cancel()' in main_py, "main.py 失去 cancel_token.cancel() 路径"
-    assert 'raise KeyboardInterrupt' in main_py, "main.py 失去 KeyboardInterrupt 路径"
+    assert 'agent_busy = threading.Event()' in src, "失去 agent_busy Event"
+    assert 'agent_busy.is_set()' in src, "SIGINT 不再读取 agent_busy Event"
+    assert 'agent_busy.set()' in src, "tool loop 进入时未 set busy"
+    assert 'agent_busy.clear()' in src, "tool loop 退出时未 clear busy"
+    assert 'cancel_token.cancel()' in src, "失去 cancel_token.cancel() 路径"
+    assert 'raise KeyboardInterrupt' in src, "失去 KeyboardInterrupt 路径"
 
     # 契约 2：delegate 注入共享 runtime，而不是启动期 stream_enabled 快照
-    inject_idx = main_py.find('_inject_delegate_context(')
-    assert inject_idx >= 0, "main.py 没调用 _inject_delegate_context"
-    inject_block = main_py[inject_idx:inject_idx + 600]
+    inject_idx = src.find('_inject_delegate_context(')
+    assert inject_idx >= 0, "没调用 _inject_delegate_context"
+    inject_block = src[inject_idx:inject_idx + 600]
     assert 'DelegateContext(' in inject_block, \
         f"_inject_delegate_context 没传 DelegateContext: {inject_block!r}"
     assert 'runtime=runtime' in inject_block, \
         f"_inject_delegate_context 没传 runtime: {inject_block!r}"
-    assert 'AgentRuntime(' in main_py and 'cancel_token=cancel_token' in main_py, \
-        "main.py runtime 没持有 cancel_token"
-    assert 'stream_enabled=stream_enabled' in main_py, \
-        "main.py runtime 没持有 stream_enabled 初始值"
+    assert 'AgentRuntime(' in src and 'cancel_token=cancel_token' in src, \
+        "runtime 没持有 cancel_token"
+    assert 'stream_enabled=stream_enabled' in src, \
+        "runtime 没持有 stream_enabled 初始值"
 
 
 # ─── 主入口 ─────────────────────────────────────────────────────────────────

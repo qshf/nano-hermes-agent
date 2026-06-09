@@ -371,14 +371,15 @@ def test_08_parent_loop_tolerates_bad_args_json():
     assert "raw_arguments" in parsed, "raw_arguments should be preserved for LLM diagnosis"
     assert parsed["raw_arguments"].startswith('{"tasks":')
 
-    # 反向校验：源文件 main.py 的修复点确实使用了 json.JSONDecodeError，
-    # 而不是 catch-all Exception（避免误吞真 bug）
-    main_py = (Path(__file__).resolve().parent.parent / "main.py").read_text()
+    # 反向校验：父 loop 修复点确实使用 json.JSONDecodeError，而不是 catch-all
+    # Exception（避免误吞真 bug）。V27.1 重构后父 loop 从 main.py 搬到
+    # agent/turn_loop.py，锚点跟着走。
+    turn_loop_py = (Path(__file__).resolve().parent.parent / "agent" / "turn_loop.py").read_text()
     fix_anchor = "invalid tool arguments JSON"
-    assert fix_anchor in main_py, "main.py missing the bad-args-recovery fix"
+    assert fix_anchor in turn_loop_py, "turn_loop.py missing the bad-args-recovery fix"
     # 在 fix 锚点附近找 except 关键字 — 必须是 JSONDecodeError 而不是 Exception
-    idx = main_py.index(fix_anchor)
-    window = main_py[max(0, idx - 300):idx]
+    idx = turn_loop_py.index(fix_anchor)
+    window = turn_loop_py[max(0, idx - 300):idx]
     assert "json.JSONDecodeError" in window, \
         "fix should catch json.JSONDecodeError specifically, not Exception"
 
