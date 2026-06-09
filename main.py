@@ -684,18 +684,24 @@ def run_agent():
             return
         if _voice_stream_only() and not runtime.stream_enabled:
             return
-        envelope = build_turn_event_envelope(
-            event_type=event_type,
-            session_id=current_session_id,
-            turn_id=f"turn-{turn_count}",
-            messages=messages,
-            assistant_text=assistant_text,
-            reasoning_activity=reasoning_activity,
-            next_tool_name=next_tool_name,
-            tool=tool,
-            phase=phase,
-        )
-        runtime.voice_event_sink.submit(envelope)
+        # envelope 构建在主线程同步执行（redaction 正则 / str() 任意内容 / asdict），
+        # 网络发送的 fail-safe 在 sink 内部，保护不到这里。任何构建期异常都不能掀翻
+        # 用户的主 turn —— 语音是旁路（v27.1 review #4）。
+        try:
+            envelope = build_turn_event_envelope(
+                event_type=event_type,
+                session_id=current_session_id,
+                turn_id=f"turn-{turn_count}",
+                messages=messages,
+                assistant_text=assistant_text,
+                reasoning_activity=reasoning_activity,
+                next_tool_name=next_tool_name,
+                tool=tool,
+                phase=phase,
+            )
+            runtime.voice_event_sink.submit(envelope)
+        except Exception:  # noqa: BLE001 — 语音旁路绝不影响主 turn
+            log.debug("voice turn-event build/submit failed", exc_info=True)
 
     runtime.phase_tracker.set_listener(lambda status, phase: _send_turn_event(status, phase=phase))
 

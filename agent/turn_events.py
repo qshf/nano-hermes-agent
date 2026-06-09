@@ -14,15 +14,14 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
+from agent.redact import redact as _redact_secrets
+
 
 SCHEMA_VERSION = "voice-orchestrator.v1"
 DEFAULT_MAX_MESSAGE_PREVIEWS = 4
 DEFAULT_MAX_MESSAGE_CHARS = 800
 DEFAULT_MAX_TOOL_RESULT_CHARS = 1200
 
-_SECRET_RE = re.compile(
-    r"(?i)(sk-[a-z0-9_-]{8,}|api[_-]?key\s*[:=]\s*\S+|token\s*[:=]\s*\S+|secret\s*[:=]\s*\S+)"
-)
 _ABS_PATH_RE = re.compile(r"(?<!\w)(?:/Users/[^\s'\"]+|/var/[^\s'\"]+|/tmp/[^\s'\"]+|[A-Za-z]:\\[^\s'\"]+)")
 _ENV_RE = re.compile(r"(?i)(?:^|[\s/])\.env(?:\b|[._-])")
 _TRACE_RE = re.compile(r"(?is)Traceback \(most recent call last\):.*")
@@ -216,12 +215,20 @@ def preview_tool_result(name: str, status: str, result: Any, *, duration_ms: Opt
 
 
 def redact_text(text: str) -> tuple[str, bool]:
-    """对文本做保守脱敏，返回脱敏后的文本和是否发生过替换。"""
+    """对文本做保守脱敏，返回脱敏后的文本和是否发生过替换。
+
+    密钥脱敏委托给 ``agent.redact.redact`` —— 那是经过校对的统一密钥表
+    （sk-*/ghp_*/AKIA*/JWT/Bearer/私钥块/DB 连接串），避免本模块维护一份更弱的
+    平行实现导致漏密（v27.1 review #2）。本函数只在其之上叠加语音外发场景特有的
+    脱敏：traceback / 绝对路径 / .env / 长 hex id。
+    """
 
     redacted = False
+    secret_safe = _redact_secrets(text)
+    redacted = redacted or (secret_safe != text)
+    text = secret_safe
     for pattern, replacement in (
         (_TRACE_RE, "[redacted-traceback]"),
-        (_SECRET_RE, "[redacted-secret]"),
         (_ABS_PATH_RE, "[redacted-path]"),
         (_ENV_RE, " [redacted-env]"),
         (_LONG_ID_RE, "[redacted-id]"),
@@ -232,10 +239,16 @@ def redact_text(text: str) -> tuple[str, bool]:
 
 
 def _recent_messages(messages: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
-    """取最近的非 system 消息，避免把系统提示词发给外部语音服务。"""
+    """取最近的非 system 消息，避免把系统提示词发给外部语音服务。
 
+    ``limit <= 0`` 显式返回空列表 —— 否则 ``candidates[-0:]`` 会退化成
+    ``candidates[0:]`` 把整段对话全部外发（v27.1 review #3）。
+    """
+
+    if limit <= 0:
+        return []
     candidates = [m for m in messages if m.get("role") != "system"]
-    return candidates[-max(0, limit):]
+    return candidates[-limit:]
 
 
 def _last_role_content(messages: list[dict[str, Any]], role: str) -> str:
