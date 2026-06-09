@@ -38,6 +38,7 @@ from agent import (
     PHASE_TOOL_EXECUTING,
     build_turn_event_envelope,
     preview_tool_result,
+    tool_span,
 )
 from model_tools import get_tool_definitions
 from tools.registry import registry
@@ -140,6 +141,21 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token, runtime: Agent
     _text_activity_last_chars = 0
     _TEXT_ACTIVITY_THRESHOLD = env_int("VOICE_ORCHESTRATOR_TEXT_DELTA_MIN_CHARS", 512)
 
+    def _open_args_phase(ev):
+        """开一把"正在生成工具参数"span 并复位节流游标。
+
+        TOOL_CALL_STARTED 与 TOOL_ARGUMENTS_DELTA 两条分支都可能首开 args span
+        （provider 谁先发不定），逻辑一字不差 —— 收口到一处，避免 tool_name /
+        tool_call_id 字段在两处各写一遍漂移（v27.1 review #9）。
+        """
+        nonlocal args_phase, _args_activity_last_chars
+        args_phase = runtime.phase_tracker.start(
+            PHASE_ASSISTANT_GENERATING_TOOL_ARGUMENTS,
+            tool_name=ev.tool_name or "",
+            tool_call_id=ev.tool_call_id or "",
+        )
+        _args_activity_last_chars = 0
+
     try:
         for ev in chain.stream_call(
             cancel_token=cancel_token,
@@ -180,12 +196,7 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token, runtime: Agent
                     # 会一直看到一个"正在生成参数"的孤儿 span（v27.1 review #5）。
                     if args_phase is not None:
                         runtime.phase_tracker.close(args_phase)
-                    args_phase = runtime.phase_tracker.start(
-                        PHASE_ASSISTANT_GENERATING_TOOL_ARGUMENTS,
-                        tool_name=ev.tool_name or "",
-                        tool_call_id=ev.tool_call_id or "",
-                    )
-                    _args_activity_last_chars = 0
+                    _open_args_phase(ev)
                 if saw_reasoning and not has_text:
                     # 清掉 [think] ... 占位，让 tool 行从行首开始
                     sys.stdout.write("\n")
@@ -197,12 +208,7 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token, runtime: Agent
                 sys.stdout.flush()
             elif ev.type == EVENT_TOOL_ARGUMENTS_DELTA:
                 if runtime is not None and args_phase is None:
-                    args_phase = runtime.phase_tracker.start(
-                        PHASE_ASSISTANT_GENERATING_TOOL_ARGUMENTS,
-                        tool_name=ev.tool_name or "",
-                        tool_call_id=ev.tool_call_id or "",
-                    )
-                    _args_activity_last_chars = 0
+                    _open_args_phase(ev)
                 total = ev.total_chars or 0
                 if args_phase is not None and (total - _args_activity_last_chars) >= _ARGS_ACTIVITY_THRESHOLD:
                     _args_activity_last_chars = total
@@ -568,19 +574,17 @@ def run_repl(services: AgentServices) -> None:
                         # 和安全 envelope；不在 main 里判断语音策略。
                         if memory_manager.has_tool(name):
                             _mem_started_at = time.monotonic()
-                            _mem_phase = runtime.phase_tracker.start(PHASE_TOOL_EXECUTING, tool_name=name, tool_category="memory")
-                            try:
+                            # tool_span 收口 phase 生命周期：异常自动 error-close 后
+                            # 重新抛出（保持原 raise 语义），正常退出按 finish。
+                            with tool_span(runtime, PHASE_TOOL_EXECUTING, tool_name=name, tool_category="memory") as _mem_span:
                                 result = memory_manager.handle_tool_call(name, args)
-                            except Exception as exc:  # noqa: BLE001 — 保持原异常语义，但先关 phase
-                                runtime.phase_tracker.close(_mem_phase, status="error", tool_name=name, error_type=type(exc).__name__)
-                                raise
-                            _duration_ms = int((time.monotonic() - _mem_started_at) * 1000)
-                            try:
-                                _mem_parsed = json.loads(result)
-                                _mem_result_kind = "error" if isinstance(_mem_parsed, dict) and "error" in _mem_parsed else "ok"
-                            except json.JSONDecodeError:
-                                _mem_result_kind = "non_json"
-                            runtime.phase_tracker.close(_mem_phase, tool_name=name, result_kind=_mem_result_kind)
+                                _duration_ms = int((time.monotonic() - _mem_started_at) * 1000)
+                                try:
+                                    _mem_parsed = json.loads(result)
+                                    _mem_result_kind = "error" if isinstance(_mem_parsed, dict) and "error" in _mem_parsed else "ok"
+                                except json.JSONDecodeError:
+                                    _mem_result_kind = "non_json"
+                                _mem_span.finish(tool_name=name, result_kind=_mem_result_kind)
                             _send_turn_event(
                                 "tool_finished" if _mem_result_kind != "error" else "tool_error",
                                 tool=preview_tool_result(name, _mem_result_kind, result, duration_ms=_duration_ms),

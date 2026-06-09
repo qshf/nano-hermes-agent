@@ -22,6 +22,7 @@ from agent.runtime_phase import (
     PHASE_TOOL_EXECUTING,
     PhaseSpan,
     PhaseTracker,
+    tool_span,
 )
 from agent.turn_events import (
     PhasePreview,
@@ -54,6 +55,7 @@ __all__ = [
     "PHASE_TOOL_EXECUTING",
     "PhaseSpan",
     "PhaseTracker",
+    "tool_span",
     "PhasePreview",
     "TextPreview",
     "ToolPreview",

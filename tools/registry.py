@@ -24,7 +24,6 @@ from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from agent.runtime import AgentRuntime
-    from agent.runtime_phase import PhaseCloseStatus, PhaseSpan
 
 CHECK_FN_TTL = 30.0  # check_fn 缓存有效期（秒）
 
@@ -73,40 +72,6 @@ class ToolRegistry:
         """Attach optional AgentRuntime for phase spans."""
 
         self._runtime = runtime
-
-    def _start_tool_phase(self, tool_name: str) -> "PhaseSpan | None":
-        runtime = self._runtime
-        tracker = getattr(runtime, "phase_tracker", None)
-        if tracker is None:
-            return None
-        try:
-            from agent.runtime_phase import PHASE_TOOL_EXECUTING, in_child_agent_scope
-            # 子 agent 复用父单例 registry；子内部 dispatch 不该在父 tracker 上
-            # 各开一个工具 span（父侧只播 PHASE_CHILD_AGENT_RUNNING 聚合 span）。
-            if in_child_agent_scope():
-                return None
-            return tracker.start(PHASE_TOOL_EXECUTING, tool_name=tool_name)
-        except Exception:  # noqa: BLE001 — observers must never affect tools
-            log.debug("tool phase start failed", exc_info=True)
-            return None
-
-    def _close_tool_phase(
-        self,
-        span: "PhaseSpan | None",
-        *,
-        status: PhaseCloseStatus = "finished",
-        **activity: Any,
-    ) -> None:
-        if span is None:
-            return
-        runtime = self._runtime
-        tracker = getattr(runtime, "phase_tracker", None)
-        if tracker is None:
-            return
-        try:
-            tracker.close(span, status=status, **activity)
-        except Exception:  # noqa: BLE001
-            log.debug("tool phase close failed", exc_info=True)
 
     def register(
         self,
@@ -183,62 +148,65 @@ class ToolRegistry:
         from tools.coerce import coerce_args
         coerced = coerce_args(entry["schema"], args)
 
+        from agent.runtime_phase import PHASE_TOOL_EXECUTING, tool_span
+
         start = time.monotonic()
-        tool_phase = self._start_tool_phase(name)
+        # tool_span 收口 phase 生命周期：tracker 缺失 / 子 agent 区间 → 空对象，
+        # 各返回分支只 annotate（span.finish/error 附 result_kind），CM 退出保证 close。
+        with tool_span(self._runtime, PHASE_TOOL_EXECUTING, tool_name=name) as span:
+            # pre_tool_call 钩子（可阻止执行）
+            from tools.hooks import hook_manager
+            pre_results = hook_manager.invoke("pre_tool_call", tool_name=name, args=coerced)
+            for r in pre_results:
+                if isinstance(r, dict) and r.get("action") == "block":
+                    span.error(tool_name=name, error_type="Blocked")
+                    return tool_error(f"Blocked: {r.get('message', '')}")
 
-        # pre_tool_call 钩子（可阻止执行）
-        from tools.hooks import hook_manager
-        pre_results = hook_manager.invoke("pre_tool_call", tool_name=name, args=coerced)
-        for r in pre_results:
-            if isinstance(r, dict) and r.get("action") == "block":
-                self._close_tool_phase(tool_phase, status="error", tool_name=name, error_type="Blocked")
-                return tool_error(f"Blocked: {r.get('message', '')}")
+            # 执行 handler（计时） — 顶层 try 兜底未捕获异常
+            try:
+                if entry.get("is_async"):
+                    result = _run_async(entry["handler"](coerced))
+                else:
+                    result = entry["handler"](coerced)
+            except Exception as exc:
+                log.exception("Tool %s dispatch error: %s", name, exc)
+                span.error(tool_name=name, error_type=type(exc).__name__)
+                return tool_error(f"Tool execution failed: {type(exc).__name__}: {exc}")
+            duration_ms = int((time.monotonic() - start) * 1000)
 
-        # 执行 handler（计时） — 顶层 try 兜底未捕获异常
-        try:
-            if entry.get("is_async"):
-                result = _run_async(entry["handler"](coerced))
-            else:
-                result = entry["handler"](coerced)
-        except Exception as exc:
-            log.exception("Tool %s dispatch error: %s", name, exc)
-            self._close_tool_phase(tool_phase, status="error", tool_name=name, error_type=type(exc).__name__)
-            return tool_error(f"Tool execution failed: {type(exc).__name__}: {exc}")
-        duration_ms = int((time.monotonic() - start) * 1000)
+            # post_tool_call 钩子（观察者，返回值忽略）
+            hook_manager.invoke("post_tool_call", tool_name=name, args=coerced, result=result, duration_ms=duration_ms)
 
-        # post_tool_call 钩子（观察者，返回值忽略）
-        hook_manager.invoke("post_tool_call", tool_name=name, args=coerced, result=result, duration_ms=duration_ms)
+            # transform_tool_result 钩子（第一个非 None 字符串替换结果）
+            transform_results = hook_manager.invoke("transform_tool_result", tool_name=name, args=coerced, result=result)
+            for r in transform_results:
+                if isinstance(r, str):
+                    result = r
+                    break
 
-        # transform_tool_result 钩子（第一个非 None 字符串替换结果）
-        transform_results = hook_manager.invoke("transform_tool_result", tool_name=name, args=coerced, result=result)
-        for r in transform_results:
-            if isinstance(r, str):
-                result = r
-                break
-
-        # 最终防线：保证返回值是合法 JSON 字符串
-        # 三种异常情况：(1) handler 返回非 str；(2) 返回 str 但不是合法 JSON；
-        # (3) 返回合法 JSON 但是 list/数字等非 object 顶层类型 — 也强转。
-        if not isinstance(result, str):
-            log.warning("Tool %s returned non-str (%s); coercing", name, type(result).__name__)
-            self._close_tool_phase(tool_phase, tool_name=name, result_kind="coerced_non_str")
-            return tool_result(output=str(result))
-        try:
-            parsed = json.loads(result)
-            if not isinstance(parsed, dict):
-                log.warning("Tool %s returned non-dict JSON; coercing", name)
-                self._close_tool_phase(tool_phase, tool_name=name, result_kind="coerced_non_dict")
+            # 最终防线：保证返回值是合法 JSON 字符串
+            # 三种异常情况：(1) handler 返回非 str；(2) 返回 str 但不是合法 JSON；
+            # (3) 返回合法 JSON 但是 list/数字等非 object 顶层类型 — 也强转。
+            if not isinstance(result, str):
+                log.warning("Tool %s returned non-str (%s); coercing", name, type(result).__name__)
+                span.finish(tool_name=name, result_kind="coerced_non_str")
+                return tool_result(output=str(result))
+            try:
+                parsed = json.loads(result)
+                if not isinstance(parsed, dict):
+                    log.warning("Tool %s returned non-dict JSON; coercing", name)
+                    span.finish(tool_name=name, result_kind="coerced_non_dict")
+                    return tool_result(output=result)
+            except json.JSONDecodeError:
+                log.warning("Tool %s returned non-JSON string; coercing", name)
+                span.finish(tool_name=name, result_kind="coerced_non_json")
                 return tool_result(output=result)
-        except json.JSONDecodeError:
-            log.warning("Tool %s returned non-JSON string; coercing", name)
-            self._close_tool_phase(tool_phase, tool_name=name, result_kind="coerced_non_json")
-            return tool_result(output=result)
 
-        if "error" in parsed:
-            self._close_tool_phase(tool_phase, status="error", tool_name=name, error_type="ToolResultError")
-        else:
-            self._close_tool_phase(tool_phase, tool_name=name, result_kind="ok")
-        return result
+            if "error" in parsed:
+                span.error(tool_name=name, error_type="ToolResultError")
+            else:
+                span.finish(tool_name=name, result_kind="ok")
+            return result
 
     @property
     def tool_names(self) -> list[str]:

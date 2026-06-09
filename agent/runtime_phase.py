@@ -14,10 +14,11 @@ metadata only; it does not decide if anything should be spoken.
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import itertools
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -142,3 +143,73 @@ class PhaseTracker:
         else:
             span.finish(**activity)
         self.active.pop(span.span_id, None)
+
+
+# ─── tool 执行 span 的统一上下文管理器（v27.1 review #8/#9 altitude）──────────
+#
+# 之前 registry.dispatch 与 turn_loop 的 memory 工具路径各自手写一遍
+# "resolve tracker → 子区间抑制 → start → 在每个返回/异常分支 close"，
+# 三处样板 + 各自的 try/except 守护 + 各自重算 result_kind。本 CM 把生命周期
+# 收口成一个 ``with``：进入时按需开 span（tracker 缺失 / 子 agent 区间 → 给个
+# 空对象，调用点无需判 None），退出时**保证** close —— 正常退出按 finished，
+# body 抛异常按 error。body 可中途调 ``span.finish(result_kind=...)`` 附带分类
+# 元数据；PhaseSpan 的 ``closed`` 幂等保证 CM 退出时不会二次 emit。
+
+
+class _NullSpan:
+    """tracker 缺失 / 子 agent 区间时的占位 span —— 所有方法 no-op。
+
+    让 ``with tool_span(...) as span:`` 的调用点永远拿到一个可调用对象，
+    不必在每次 ``span.activity_event`` / ``span.finish`` 前判 ``if span is not None``。
+    """
+
+    closed = True
+
+    def activity_event(self, **activity: Any) -> None:
+        return
+
+    def finish(self, **activity: Any) -> None:
+        return
+
+    def error(self, **activity: Any) -> None:
+        return
+
+    def cancel(self, **activity: Any) -> None:
+        return
+
+
+_NULL_SPAN = _NullSpan()
+
+
+@contextlib.contextmanager
+def tool_span(
+    runtime: Any,
+    name: str,
+    *,
+    suppress_in_child: bool = True,
+    **start_activity: Any,
+) -> Iterator[Any]:
+    """围绕一次工具执行开/关一个 phase span，异常安全且永不影响工具本身。
+
+    - ``runtime`` 为 None / 无 ``phase_tracker`` / 处于子 agent 区间（且
+      ``suppress_in_child``）→ yield ``_NULL_SPAN``，零开销。
+    - body 正常退出 → span.finish()（若 body 已 finish/error，则幂等跳过）。
+    - body 抛异常 → span.error(error_type=...) 后**重新抛出**（不吞工具异常）。
+    - listener 自身的异常已由 PhaseSpan._emit 吞掉，这里只兜底 start 失败。
+    """
+    tracker = getattr(runtime, "phase_tracker", None)
+    if tracker is None or (suppress_in_child and in_child_agent_scope()):
+        yield _NULL_SPAN
+        return
+    try:
+        span = tracker.start(name, **start_activity)
+    except Exception:  # noqa: BLE001 — observers must never affect tools
+        yield _NULL_SPAN
+        return
+    try:
+        yield span
+    except Exception as exc:
+        tracker.close(span, status="error", error_type=type(exc).__name__)
+        raise
+    else:
+        tracker.close(span)
