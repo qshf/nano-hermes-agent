@@ -137,17 +137,9 @@ if _cli_args.cwd is not None:
         sys.exit(2)
     os.chdir(_target)
 
-from model_tools import get_tool_definitions, get_available_tool_names
+from model_tools import get_tool_definitions
 from tools.registry import registry
-from tools.skill_view_tool import set_skill_loader as _inject_skill_loader
-from tools.delegate_tool import (
-    DelegateContext,
-    set_delegate_context as _inject_delegate_context,
-)
-from memory import BuiltinMemoryProvider, MemoryManager, RemoteSemanticProvider
-from context_compressor import ContextCompressor
-from transports.chain import FailoverExhausted, build_chain_from_env
-from transports.client_factory import make_llm_client
+from transports.chain import FailoverExhausted
 from transports.streaming import (
     EVENT_DONE,
     EVENT_REASONING_DELTA,
@@ -155,7 +147,6 @@ from transports.streaming import (
     EVENT_TOOL_ARGUMENTS_DELTA,
     EVENT_TOOL_ARGUMENTS_FINISHED,
     EVENT_TOOL_CALL_STARTED,
-    CancelToken,
     StreamCancelled,
 )
 from transports.types import build_assistant_history_msg
@@ -163,16 +154,14 @@ from agent import (
     PHASE_ASSISTANT_GENERATING_TEXT,
     PHASE_ASSISTANT_GENERATING_TOOL_ARGUMENTS,
     PHASE_TOOL_EXECUTING,
-    PromptBuilder,
-    SkillLoader,
-    VoiceEventSink,
     build_turn_event_envelope,
     preview_tool_result,
 )
+from agent.bootstrap import ENABLED_TOOLSETS, bootstrap_services
 from agent.compaction import apply_compaction
-from agent.logging import setup_logging, set_log_session, get_logger
+from agent.env import env_bool, env_int
+from agent.logging import set_log_session
 from agent.runtime import AgentRuntime, SESSION_TOKEN_KEYS
-from agent.session_store import SessionStore
 import cli  # 触发 cli/commands 下所有命令的装饰器注册
 
 # V22 输入体验：用 prompt_toolkit 的 PromptSession 取代内建 ``input()``。
@@ -189,97 +178,8 @@ import cli  # 触发 cli/commands 下所有命令的装饰器注册
 # Ctrl+C / Ctrl+D 仍按 input() 语义抛 KeyboardInterrupt / EOFError，
 # 与现有 try/except 代码兼容（prompt_toolkit 自己拦截，不走我们的 SIGINT
 # handler；流式期间的 SIGINT handler 由 V22 cancel_token 路径接管）。
-from prompt_toolkit import PromptSession
-from prompt_toolkit.history import FileHistory
-from prompt_toolkit.key_binding import KeyBindings
-
-_HISTORY_PATH = Path.home() / ".nano_hermes_history"
-
-_kb = KeyBindings()
-
-
-@_kb.add("escape", "enter")
-def _insert_newline(event):
-    """Esc-Enter（先按 Esc 松开再按 Enter）→ 在缓冲里插入 ``\\n``。
-
-    注意 macOS Terminal.app 下 Option-Enter 不会发送 Esc 序列；如需要
-    Option-Enter，自行去 Terminal → Settings → Profiles → Keyboard
-    勾选 "Use Option as Meta key"。iTerm2 / Alacritty 默认就支持。
-    """
-    event.current_buffer.insert_text("\n")
-
-
-_input_session = PromptSession(
-    history=FileHistory(str(_HISTORY_PATH)),
-    key_bindings=_kb,
-    multiline=False,
-)
-
-# ─── 配置 ────────────────────────────────────────────────────────────────────
-ENABLED_TOOLSETS = ["core"]
-
-# V8: 通过 manager 编排 provider；V10: 按环境变量加挂外部 provider
-memory_manager = MemoryManager()
-memory_manager.add_provider(BuiltinMemoryProvider())
-
-# V10/V10.1: 按需注册远端语义记忆 provider（mock 服务见 scripts/mock_memory_server.py）
-# V11: 支持 memory_mode / prefetch_method / bank_id / retain_tags 配置
-_remote_url = os.environ.get("MEMORY_SERVICE_URL", "").strip()
-if _remote_url:
-    _tags_raw = os.environ.get("MEMORY_RETAIN_TAGS", "").strip()
-    _retain_tags = [t.strip() for t in _tags_raw.split(",") if t.strip()] if _tags_raw else []
-
-    _remote = RemoteSemanticProvider(
-        base_url=_remote_url,
-        bank_id=os.environ.get("MEMORY_BANK_ID", "hermes"),
-        budget=os.environ.get("MEMORY_RECALL_BUDGET", "mid"),
-        memory_mode=os.environ.get("MEMORY_MODE", "hybrid"),
-        prefetch_method=os.environ.get("MEMORY_PREFETCH_METHOD", "recall"),
-        auto_retain=os.environ.get("MEMORY_AUTO_RETAIN", "1") not in ("0", "false", "False", ""),
-        auto_recall=os.environ.get("MEMORY_AUTO_RECALL", "1") not in ("0", "false", "False", ""),
-        retain_tags=_retain_tags,
-        retain_every_n_turns=max(1, int(os.environ.get("MEMORY_RETAIN_EVERY_N_TURNS", "1"))),
-    )
-    if _remote.is_available():
-        memory_manager.add_provider(_remote)
-    else:
-        print(f"  [warn] MEMORY_SERVICE_URL set but {_remote_url}/healthz unreachable — skipping")
-        _remote.shutdown()
-
-memory_manager.initialize_all(session_id=os.environ.get("MEMORY_SESSION_ID", "default"))
-
-
-# V21.3: skill 系统 — progressive disclosure tier 1
-# 一级目录约定 ``skills/<name>/SKILL.md``；scan 失败的单个 skill 会被跳过且打印
-# warning，不影响 agent 启动。skill_loader 同时注入到 PromptBuilder（tier 1
-# 索引段）和 tools/skill_view_tool（tier 2 工具回调），保证两条路径看到的是
-# 同一份 metadata 缓存。
-skill_loader = SkillLoader(Path(__file__).parent / "skills")
-skill_loader.scan()
-_inject_skill_loader(skill_loader)
-
-
-# V21.2: 三段式 PromptBuilder 替换 V4 的 SYSTEM_PROMPT.format(...)
-# 段顺序固定（骨架 → 项目上下文 → skill 索引 → memory → 工具列表），空段自动跳过；
-# V21.3 起 SkillLoader 实际注入，tier 1 索引段开始填充内容。
-# V23.2 起 cwd 注入 → system prompt 自动加用户项目根的 nano-hermes-agent.md /
-# AGENTS.md。``Path.cwd()`` 在 ``--cwd`` 已 chdir 之后捕获，所以等价用户传入值。
-prompt_builder = PromptBuilder(
-    get_toolset_tool_names=get_available_tool_names,
-    enabled_toolsets=ENABLED_TOOLSETS,
-    memory_manager=memory_manager,
-    skill_loader=skill_loader,
-    cwd=Path.cwd(),
-)
-
-
-def build_system_prompt() -> str:
-    """V4→V21.1 兼容入口；V21.2 起 thin wrapper 委托给 prompt_builder.build()。
-
-    保留模块函数是为了兼容 V21.1 期间 ``AgentCtx.build_system_prompt`` 字段
-    的 callable 类型 — 单测里 mock ctx 时直接传 ``lambda: "..."`` 即可。
-    """
-    return prompt_builder.build()
+# V27.1 重构：输入框 / memory / skill / prompt 装配全部下沉到 agent/bootstrap.py，
+# 由 bootstrap_services() 在 main() 调用时显式组装（不再是 import-time 副作用）。
 
 
 # ─── V22 流式辅助 ─────────────────────────────────────────────────────────
@@ -364,7 +264,12 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token, runtime: Agent
     text_phase = None
     args_phase = None
     _args_activity_last_chars = 0
-    _ARGS_ACTIVITY_THRESHOLD = int(os.environ.get("VOICE_ORCHESTRATOR_ARGUMENT_DELTA_MIN_CHARS", "512"))
+    _ARGS_ACTIVITY_THRESHOLD = env_int("VOICE_ORCHESTRATOR_ARGUMENT_DELTA_MIN_CHARS", 512)
+    # text delta 同样节流 —— 否则每个 token 都触发一次 phase_activity → 重建一份
+    # envelope（遍历 messages + 逐条 redact），在热路径上做无谓重活（v27.1 review #7）。
+    _text_activity_total = 0
+    _text_activity_last_chars = 0
+    _TEXT_ACTIVITY_THRESHOLD = env_int("VOICE_ORCHESTRATOR_TEXT_DELTA_MIN_CHARS", 512)
 
     try:
         for ev in chain.stream_call(
@@ -377,7 +282,10 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token, runtime: Agent
                 if runtime is not None and text_phase is None:
                     text_phase = runtime.phase_tracker.start(PHASE_ASSISTANT_GENERATING_TEXT)
                 if text_phase is not None:
-                    text_phase.activity_event(delta_chars=len(ev.text))
+                    _text_activity_total += len(ev.text)
+                    if (_text_activity_total - _text_activity_last_chars) >= _TEXT_ACTIVITY_THRESHOLD:
+                        _text_activity_last_chars = _text_activity_total
+                        text_phase.activity_event(delta_chars=_text_activity_total)
                 if not printed_prefix:
                     sys.stdout.write("\nAgent > ")
                     printed_prefix = True
@@ -397,6 +305,12 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token, runtime: Agent
                     runtime.phase_tracker.close(text_phase)
                     text_phase = None
                 if runtime is not None:
+                    # 多工具一轮内会连发多个 STARTED；上一把 args span 若没被
+                    # ARGUMENTS_FINISHED 关掉（provider 不发该事件，或并行 tool call），
+                    # 这里先关旧的再开新的，否则旧 span 永不 close —— orchestrator
+                    # 会一直看到一个"正在生成参数"的孤儿 span（v27.1 review #5）。
+                    if args_phase is not None:
+                        runtime.phase_tracker.close(args_phase)
                     args_phase = runtime.phase_tracker.start(
                         PHASE_ASSISTANT_GENERATING_TOOL_ARGUMENTS,
                         tool_name=ev.tool_name or "",
@@ -466,7 +380,7 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token, runtime: Agent
 
 
 def _voice_stream_only() -> bool:
-    return os.environ.get("VOICE_ORCHESTRATOR_STREAM_ONLY", "1") not in ("0", "false", "False", "")
+    return env_bool("VOICE_ORCHESTRATOR_STREAM_ONLY", True)
 
 
 def _accumulate_parent_turn_tokens(runtime: AgentRuntime, usage) -> None:
@@ -493,183 +407,29 @@ def _accumulate_parent_turn_tokens(runtime: AgentRuntime, usage) -> None:
 
 
 def run_agent():
-
-
-    # V25.1: 日志子系统开机 —— 必须在 chain 构建 / 任何 transport 调用之前，
-    # 否则那些早期 record 收不到。setup_logging 配 root（让 transports.chain /
-    # delegate / memory 等已有 getLogger(__name__) 模块的日志都流经 RedactingFormatter
-    # 脱敏），幂等。LOG_FILE=:none: 关闭文件日志只留 stderr。
-    setup_logging()
-    log = get_logger()
-
-    # V19: 构建 transport 链 — TRANSPORT_CHAIN 优先（多家），否则退化为
-    # TRANSPORT_MODE 单家（行为同 V18）。chain 长度 1 时仍带 RETRYABLE 错误重试，
-    # 但不会切换 — 链长 ≥ 2 才有 failover 价值。
-    chain_env = os.environ.get("TRANSPORT_CHAIN", "").strip()
-    if not chain_env:
-        chain_env = os.environ.get("TRANSPORT_MODE", "chat_completions")
-
-    chain = build_chain_from_env(
-        chain_env,
-        client_factory=make_llm_client,
-        failure_threshold=int(os.environ.get("FAILOVER_FAILURE_THRESHOLD", "3")),
-        cooldown_seconds=float(os.environ.get("FAILOVER_COOLDOWN_SECONDS", "60")),
-        max_retries=int(os.environ.get("FAILOVER_MAX_RETRIES", "2")),
-        base_delay=float(os.environ.get("FAILOVER_BASE_DELAY", "1.0")),
-        cache_enabled=os.environ.get("PROMPT_CACHE_ENABLED", "0") not in ("0", "false", "False", ""),
-        cache_ttl=os.environ.get("PROMPT_CACHE_TTL", "5m"),
-    )
-
-    # 兼容存量代码路径 — 主家用于 client 引用（仅作为 compressor.compress 第三个
-    # 位置参数兼容签名传入；真正的 LLM 调用统一走 chain.call()）。
-    client = chain.primary_client
-    # V25.1 修复：model 优先取 chain 主家自带的内联模型名（TRANSPORT_CHAIN 里的
-    # ``api_mode:model``），而非直接读 MODEL env。此前直接 ``os.environ["MODEL"]``
-    # 在只配 TRANSPORT_CHAIN（未单设 MODEL）时回退到硬编码 ``gpt-4o-mini``，导致
-    # save_session 把一个从未真正调用过的假模型名写进 sessions 表 —— v25.1 insights
-    # 第一次把 model 字段聚合成报表才暴露出这个 v24 持久化 bug（详见 decisions/v25.1.md
-    # 决策 8）。chain.primary_model 为 None（legacy 单家未内联）时才回退到 env。
-    model = chain.primary_model or os.environ.get("MODEL", "gpt-4o-mini")
-
-    # V25.1: 启动埋点 —— chain 配置进结构化日志（排查"哪家 model / 链怎么配的"有据）
-    log.info(
-        "agent boot: model=%s chain=[%s] failover(threshold=%s cooldown=%ss)",
-        model,
-        ",".join(f"{e.api_mode}:{e.model or '-'}" for e in chain.entries),
-        chain.failure_threshold,
-        chain.cooldown_seconds,
-    )
-
-    # V22: 流式开关 — env 默认开；运行期 /stream on|off 切换
-    stream_enabled = os.environ.get("STREAM_ENABLED", "1") not in ("0", "false", "False", "")
-
-    # V22: 全局 cancel token + SIGINT handler — V23.3 起也注入到 delegate
-    # 上下文，让父子共享同一个 token（父 Ctrl+C → 所有子下一帧退出）
-    # prompt 上 SIGINT → 走 KeyboardInterrupt 退出（Python 默认行为）
-    # LLM 调用期间 SIGINT → 设置 token，stream_call 内部循环 check 后 raise
-    #   StreamCancelled，main 捕获后回到 prompt 不退出
-    # 用一个布尔 `streaming_active` 区分两种语境 — handler 只在流式期间
-    # 翻译为 cancel；prompt 期间让 KeyboardInterrupt 自然抛出
-    cancel_token = CancelToken()
-    runtime = AgentRuntime(
-        stream_enabled=stream_enabled,
-        cancel_token=cancel_token,
-    )
-    voice_event_sink = VoiceEventSink.create_from_env()
-    if voice_event_sink is not None:
-        runtime.voice_event_sink = voice_event_sink
-        voice_event_sink.start()
-        log.info("voice orchestrator sink on")
-    registry.set_runtime(runtime)
-    # V23.4: agent_busy 覆盖整轮 tool loop（含 delegate 子 agent 执行期间），
-    # 取代仅在父流式期间为 True 的 streaming_active。SIGINT / Esc listener 据此
-    # 判断"现在按取消是取消 agent，还是退出 prompt"。
-    agent_busy = threading.Event()
-
-    # V23.0: 注入 delegate_task 工具的运行期上下文 —— chain 构建完才注入。
-    # 父全集 = registry 注册过的 + memory_manager 暴露的；黑名单（delegate_task /
-    # memory_*）由 ``_resolve_child_toolset`` 自己过滤。check_fn 在注入完成后
-    # 才让 delegate_task 暴露给父 LLM。
-    # V23.3: delegate 注入共享 runtime —— 子 agent 与父共享同一个 cancel_token；
-    # stream_enabled 也动态读取，让 /stream on|off 能同时影响父 loop 和子 loop。
-    _parent_full_toolset = sorted(
-        set(registry.tool_names) | set(memory_manager.get_all_tool_names())
-    )
-    _inject_delegate_context(DelegateContext(
-        chain=chain,
-        model=model,
-        parent_toolset_names=set(_parent_full_toolset),
-        runtime=runtime,
-    ))
-
-    messages = [{"role": "system", "content": build_system_prompt()}]
-
-    # V8: 通过 manager 拿到内置 provider，用于 banner 和 /memory 命令
-    builtin_provider = memory_manager.get_provider("builtin")
-
-    # V14: 跟踪当前 session_id
-    current_session_id = os.environ.get("MEMORY_SESSION_ID", "default")
-
-    # V15: 上下文压缩器
-    compressor = ContextCompressor()
-
-    # V24.0: 会话持久化 store —— 启动即建库（SESSION_DB_PATH 覆盖路径，
-    # ":memory:" 关闭落盘退化到 v14 ephemeral 行为）。若当前 session_id 已有
-    # 存档，把历史挂回 messages（system 重建在前 + 历史在后），并恢复
-    # turn_count / runtime.session_tokens —— 这一步就是 v24.0 修掉假 resume 的
-    # 核心：进程重启后同一 MEMORY_SESSION_ID 能续上对话。
-    # V24.1: 启动先 resolve_resume_tip —— 若该 session 曾被压缩分裂（成了链 root），
-    # 跳到压缩后最新 tip，避免重载压缩前超长 root 后下一轮立刻重压。
-    session_store = SessionStore()
-    resumed_note = "new"
-    current_session_id = session_store.resolve_resume_tip(current_session_id)
-    _saved = session_store.load(current_session_id)
-    if _saved is not None and _saved["messages"]:
-        messages.extend(_saved["messages"])
-        turn_count = _saved["turn_count"]
-        for _k in SESSION_TOKEN_KEYS:
-            runtime.session_tokens[_k] = _saved["session_tokens"].get(_k, 0)
-        resumed_note = f"resumed {len(_saved['messages'])} msgs, turn {turn_count}"
-
-    # V25.1: session_id 已 resolve（含 resume 重定向到压缩链 tip），绑定到 thread-local
-    # —— 之后主循环所有 log record 带 [session_id]。/new /resume 切会话与压缩分裂时
-    # 会重新绑定（见下方两处 set_log_session）。
-    set_log_session(current_session_id)
-    log.info("session ready: %s (%s)", current_session_id, resumed_note)
-
-    print("=" * 60)
-    print("  Nano Hermes Agent v23.4 — 多智能体结构化结果 + 父子成本聚合")
-    print(f"  Default MODEL (entries 不内联时回退到此): {model}")
-    chain_modes = " → ".join(
-        f"{e.api_mode}({e.model})" if e.model else e.api_mode
-        for e in chain.entries
-    )
-    print(f"  Transport chain: {chain_modes}")
-    print(f"    failure_threshold={chain.failure_threshold}, "
-          f"cooldown={chain.cooldown_seconds}s, "
-          f"max_retries={chain.max_retries}, base_delay={chain.base_delay}s")
-    if chain.cache_enabled:
-        print(f"    prompt_cache: enabled (ttl={chain.cache_ttl}, "
-              f"strategy=system_and_3, applies to anthropic_messages only)")
-    else:
-        print(f"    prompt_cache: disabled (set PROMPT_CACHE_ENABLED=1 to enable)")
-    print(f"  Streaming: {'on' if stream_enabled else 'off'} (toggle: /stream on|off)")
-    print(f"  Session: {current_session_id} ({resumed_note})")
-    print(f"  Toolsets: {ENABLED_TOOLSETS}")
-    print(f"  Memory providers: {[p.name for p in memory_manager.providers]}")
-    if builtin_provider is not None:
-        store = builtin_provider.store
-        print(f"    file: {store.file_path}")
-        print(f"    entries: {len(store.entries)}, "
-              f"usage: {store.char_count()}/{store.char_limit} chars")
-    print(f"  Compression: threshold={compressor.threshold_tokens}tok, "
-          f"tail_budget={compressor.tail_token_budget}tok, "
-          f"protect_head={compressor.protect_first_n}")
-    print(f"  Available tools: {', '.join(get_available_tool_names(ENABLED_TOOLSETS))}")
-    print(f"  Memory tools: {', '.join(sorted(memory_manager.get_all_tool_names()))}")
-    skill_names = skill_loader.names()
-    if skill_names:
-        print(f"  Skills: {len(skill_names)} loaded ({', '.join(skill_names)})")
-    else:
-        print(f"  Skills: 0 loaded (skills/ empty or absent)")
-    # V23.2: 显示 cwd + 命中的项目上下文文件（NANO_IGNORE_RULES=1 时跳过）
-    _cwd_now = Path.cwd()
-    _ignore_rules = os.environ.get("NANO_IGNORE_RULES", "0") not in ("0", "false", "False", "")
-    if _ignore_rules:
-        print(f"  Working dir: {_cwd_now} (project context: skipped via NANO_IGNORE_RULES)")
-    else:
-        from agent.prompt_builder import PROJECT_CONTEXT_FILE_NAMES as _PC_NAMES
-        _hit = next((n for n in _PC_NAMES if (_cwd_now / n).is_file()), None)
-        if _hit:
-            print(f"  Working dir: {_cwd_now} (project context: {_hit})")
-        else:
-            print(f"  Working dir: {_cwd_now} (project context: none — tried {', '.join(_PC_NAMES)})")
-    print("  Commands: /help to list all (V21.1: dispatched via cli registry)")
-    print("  输入 'quit' 退出")
-    print("=" * 60)
-    print()
-
-    turn_count = 0  # V9: 每轮递增，传给 on_turn_start
+    # V27.1 重构：装配全部下沉到 agent/bootstrap.py。这里只解包运行期对象,
+    # 然后跑 REPL + turn loop。装配时序（setup_logging → transport → runtime →
+    # registry/delegate → memory → prompt/session → banner）由 bootstrap_services
+    # 内部保证。``--cwd`` chdir 已在模块顶层完成,早于本调用。
+    services = bootstrap_services()
+    log = services.log
+    chain = services.chain
+    client = services.client
+    model = services.model
+    runtime = services.runtime
+    cancel_token = services.cancel_token
+    agent_busy = services.agent_busy
+    memory_manager = services.memory_manager
+    builtin_provider = services.builtin_provider
+    compressor = services.compressor
+    session_store = services.session_store
+    skill_loader = services.skill_loader
+    prompt_builder = services.prompt_builder
+    _input_session = services.input_session
+    messages = services.messages
+    current_session_id = services.current_session_id
+    # turn_count 恒从 0 起（resume 的轮号只进 banner）—— 对齐重构前行为。
+    turn_count = services.turn_count
 
     def _send_turn_event(
         event_type: str,
@@ -679,6 +439,7 @@ def run_agent():
         next_tool_name: str = "",
         tool=None,
         phase=None,
+        send_message_preview=None,
     ) -> None:
         if runtime.voice_event_sink is None:
             return
@@ -698,12 +459,19 @@ def run_agent():
                 next_tool_name=next_tool_name,
                 tool=tool,
                 phase=phase,
+                send_message_preview=send_message_preview,
             )
             runtime.voice_event_sink.submit(envelope)
         except Exception:  # noqa: BLE001 — 语音旁路绝不影响主 turn
             log.debug("voice turn-event build/submit failed", exc_info=True)
 
-    runtime.phase_tracker.set_listener(lambda status, phase: _send_turn_event(status, phase=phase))
+    # phase 事件（尤其高频的 phase_activity）只携带 span 元数据，无需重走
+    # recent_messages 预览循环（遍历全部 messages + 逐条 redact）—— 那是 envelope
+    # 构建里最重的一段，挂在流式热路径上纯属浪费（v27.1 review #7）。最近用户
+    # 目标已由 last_user_message_preview 单独保留，不受影响。
+    runtime.phase_tracker.set_listener(
+        lambda status, phase: _send_turn_event(status, phase=phase, send_message_preview=False)
+    )
 
     # V22 cancel_token / agent_busy 已在 delegate 注入前提前构造（见上方）。
     # 这里仅注册 SIGINT handler —— 用 agent_busy.is_set() 区分两种语境：
@@ -736,7 +504,7 @@ def run_agent():
         compressor=compressor,
         registry=registry,
         enabled_toolsets=ENABLED_TOOLSETS,
-        build_system_prompt=build_system_prompt,
+        build_system_prompt=prompt_builder.build,
         prompt_builder=prompt_builder,
         skill_loader=skill_loader,
         runtime=runtime,
