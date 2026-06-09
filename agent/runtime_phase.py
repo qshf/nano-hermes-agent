@@ -6,7 +6,7 @@ metadata only; it does not decide if anything should be spoken.
 命名说明（v27.1 后期重命名）
 ==========================
 - ``PhaseSpan``：一段「开了又关」的运行区间句柄（旧名 ``RuntimePhaseLease``）。
-  借用分布式追踪的 span 概念——start→(activity/heartbeat)*→finish/error/cancel。
+  借用分布式追踪的 span 概念——start→(activity)*→finish/error/cancel。
 - ``PhaseTracker``：span 的统一持有者 + 单一 listener 注入点（旧名 ``RuntimePhaseManager``）。
 - ``PhaseListener``：「phase 事件往哪流」的抽象回调（旧名 ``PhaseSink``）。
   注意与 ``VoiceEventSink`` 区分——listener 是口子，VoiceEventSink 是真正的 HTTP 出口。
@@ -23,14 +23,13 @@ from typing import Any, Literal
 from agent.turn_events import PhasePreview
 
 PHASE_ASSISTANT_GENERATING_TEXT = "assistant_generating_text"
-PHASE_ASSISTANT_GENERATING_TOOL_CALL = "assistant_generating_tool_call"
 PHASE_ASSISTANT_GENERATING_TOOL_ARGUMENTS = "assistant_generating_tool_arguments"
 PHASE_TOOL_EXECUTING = "tool_executing"
 PHASE_CHILD_AGENT_RUNNING = "child_agent_running"
 
 _PHASE_COUNTER = itertools.count(1)
 
-PhaseEventType = Literal["phase_started", "phase_activity", "phase_heartbeat", "phase_finished", "phase_error", "phase_cancelled"]
+PhaseEventType = Literal["phase_started", "phase_activity", "phase_finished", "phase_error", "phase_cancelled"]
 PhaseCloseStatus = Literal["finished", "error", "cancelled"]
 PhaseListener = Callable[[PhaseEventType, PhasePreview], None]
 
@@ -54,12 +53,6 @@ class PhaseSpan:
             return
         self.activity.update(activity)
         self._emit("phase_activity")
-
-    def heartbeat(self, **activity: Any) -> None:
-        if self.closed:
-            return
-        self.activity.update(activity)
-        self._emit("phase_heartbeat")
 
     def finish(self, **activity: Any) -> None:
         if self.closed:
