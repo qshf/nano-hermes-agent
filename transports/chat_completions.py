@@ -30,6 +30,8 @@ from transports.streaming import (
     EVENT_DONE,
     EVENT_REASONING_DELTA,
     EVENT_TEXT_DELTA,
+    EVENT_TOOL_ARGUMENTS_DELTA,
+    EVENT_TOOL_ARGUMENTS_FINISHED,
     EVENT_TOOL_CALL_STARTED,
     CancelToken,
     StreamEvent,
@@ -96,6 +98,14 @@ class _ChatStreamAccumulator:
                         entry["name"] = fn.name  # 赋值，非 +=
                     if fn.arguments:
                         entry["arguments"] += fn.arguments
+                        yield StreamEvent(
+                            type=EVENT_TOOL_ARGUMENTS_DELTA,
+                            tool_name=entry["name"] or None,
+                            tool_call_id=entry["id"] or None,
+                            argument_field="arguments",
+                            delta_chars=len(fn.arguments),
+                            total_chars=len(entry["arguments"]),
+                        )
                 if entry["name"] and idx not in self.started_idx:
                     self.started_idx.add(idx)
                     yield StreamEvent(
@@ -105,6 +115,15 @@ class _ChatStreamAccumulator:
 
         if choice0.finish_reason:
             self.finish_reason = choice0.finish_reason
+            for entry in self.tool_calls.values():
+                if entry.get("arguments"):
+                    yield StreamEvent(
+                        type=EVENT_TOOL_ARGUMENTS_FINISHED,
+                        tool_name=entry.get("name") or None,
+                        tool_call_id=entry.get("id") or None,
+                        argument_field="arguments",
+                        total_chars=len(entry.get("arguments") or ""),
+                    )
 
         if getattr(chunk, "usage", None):
             self.usage_obj = chunk.usage

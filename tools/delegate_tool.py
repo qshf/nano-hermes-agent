@@ -65,15 +65,19 @@ import os
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
 from agent.runtime import AgentRuntime, SESSION_TOKEN_KEYS
 from tools.registry import registry
 from tools.result import tool_error, tool_result
 from transports.chain import TransportChain
 from transports.streaming import EVENT_DONE, EVENT_TOOL_CALL_STARTED, StreamEvent
+
+if TYPE_CHECKING:
+    from agent.runtime_phase import PhaseCloseStatus, PhaseSpan
 
 logger = logging.getLogger(__name__)
 
@@ -454,6 +458,66 @@ def _run_one_task(
     }
 
 
+def _start_child_agent_phase(*, mode: str, task_count: int) -> "PhaseSpan | None":
+    if _delegate_context is None:
+        return None
+    tracker = getattr(_delegate_context.runtime, "phase_tracker", None)
+    if tracker is None:
+        return None
+    try:
+        from agent.runtime_phase import PHASE_CHILD_AGENT_RUNNING
+        return tracker.start(
+            PHASE_CHILD_AGENT_RUNNING,
+            mode=mode,
+            task_count=task_count,
+            completed_count=0,
+            running_count=task_count,
+            failed_count=0,
+        )
+    except Exception:  # noqa: BLE001 — delegate execution must not depend on observers
+        logger.debug("delegate child phase start failed", exc_info=True)
+        return None
+
+
+def _update_child_agent_phase(
+    span: "PhaseSpan | None",
+    *,
+    task_count: int,
+    completed_count: int,
+    failed_count: int,
+    mode: str,
+) -> None:
+    if span is None:
+        return
+    try:
+        span.activity_event(
+            mode=mode,
+            task_count=task_count,
+            completed_count=completed_count,
+            running_count=max(0, task_count - completed_count),
+            failed_count=failed_count,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("delegate child phase update failed", exc_info=True)
+
+
+def _close_child_agent_phase(
+    span: "PhaseSpan | None",
+    *,
+    status: "PhaseCloseStatus" = "finished",
+    **activity: Any,
+) -> None:
+    if span is None or _delegate_context is None:
+        return
+    tracker = getattr(_delegate_context.runtime, "phase_tracker", None)
+    if tracker is None:
+        return
+    try:
+        tracker.close(span, status=status, **activity)
+    except Exception:  # noqa: BLE001
+        logger.debug("delegate child phase close failed", exc_info=True)
+
+
 def _accumulate_runtime_tokens(
     runtime: AgentRuntime, child_tokens: Optional[dict[str, int]],
 ) -> None:
@@ -519,7 +583,14 @@ def delegate_task_handler(args: dict) -> str:
         err = _validate_task_entry(single_entry, idx=None)
         if err:
             return tool_error(err)
-        result = _run_one_task(single_entry, task_index=None, is_batch=False)
+        _child_phase = _start_child_agent_phase(mode="single", task_count=1)
+        try:
+            result = _run_one_task(single_entry, task_index=None, is_batch=False)
+        except Exception as exc:  # noqa: BLE001 — handler keeps V21.4 tool protocol shape
+            _close_child_agent_phase(_child_phase, status="error", mode="single", task_count=1, completed_count=0, running_count=0, failed_count=1)
+            logger.exception("[delegate] single task failed")
+            return tool_error(f"delegate_task failed: {type(exc).__name__}: {exc}")
+        _close_child_agent_phase(_child_phase, mode="single", task_count=1, completed_count=1, running_count=0, failed_count=0)
         # 单任务也走 results 数组（含 1 条），父 LLM 永远 json.loads → r["results"][i]
         return tool_result(output=json.dumps(
             _build_handler_payload(
@@ -548,21 +619,60 @@ def delegate_task_handler(args: dict) -> str:
         len(tasks), max_workers,
     )
 
-    # ``executor.map`` 保留输入顺序（无论 worker 完成快慢），结果与 tasks 数组对齐。
-    # 进度中继走侧路 stderr，与主路 tool_result 顺序无关。
+    # Future loop lets the parent report aggregate child-agent progress while waiting.
+    _child_phase = _start_child_agent_phase(mode="batch", task_count=len(tasks))
     indexed = list(enumerate(tasks))
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        results = list(pool.map(
-            lambda it: _run_one_task(it[1], task_index=it[0], is_batch=True),
-            indexed,
-        ))
+    results: list[dict | None] = [None] * len(tasks)
+    completed_count = 0
+    failed_count = 0
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_index = {
+                pool.submit(_run_one_task, entry, task_index=idx, is_batch=True): idx
+                for idx, entry in indexed
+            }
+            for future in as_completed(future_to_index):
+                idx = future_to_index[future]
+                result = future.result()
+                results[idx] = result
+                completed_count += 1
+                if result.get("status") in {"error", "interrupted"}:
+                    failed_count += 1
+                _update_child_agent_phase(
+                    _child_phase,
+                    mode="batch",
+                    task_count=len(tasks),
+                    completed_count=completed_count,
+                    failed_count=failed_count,
+                )
+    except Exception as exc:  # noqa: BLE001 — handler keeps V21.4 tool protocol shape
+        _close_child_agent_phase(
+            _child_phase,
+            status="error",
+            mode="batch",
+            task_count=len(tasks),
+            completed_count=completed_count,
+            running_count=0,
+            failed_count=max(failed_count, 1),
+        )
+        logger.exception("[delegate] batch failed")
+        return tool_error(f"delegate_task failed: {type(exc).__name__}: {exc}")
+    final_results = [r for r in results if r is not None]
+    _close_child_agent_phase(
+        _child_phase,
+        mode="batch",
+        task_count=len(tasks),
+        completed_count=len(final_results),
+        running_count=0,
+        failed_count=failed_count,
+    )
 
-    logger.info("[delegate] batch done tasks=%d", len(results))
+    logger.info("[delegate] batch done tasks=%d", len(final_results))
 
     # 单任务 + 批量统一返回 ``{"results":[...]}``；外层 ``tool_result`` 仍是
     # ``{"output": <json_string>}`` 协议，父 LLM 二次 ``json.loads`` 拿 results 数组。
     return tool_result(output=json.dumps(
-        _build_handler_payload(results=results, started_at=overall_started_at),
+        _build_handler_payload(results=final_results, started_at=overall_started_at),
         ensure_ascii=False,
     ))
 

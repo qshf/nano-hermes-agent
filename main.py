@@ -94,6 +94,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -116,8 +117,8 @@ def _parse_cli_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--cwd",
-        type=str,
-        default='', #'/Users/qshf/Documents/book',
+        type=str,           
+        default='./', #'/Users/qshf/Documents/book',
         metavar="PATH",
         help=(
             "启动后切到此目录工作。terminal / read_file 等工具的相对路径以及 "
@@ -151,12 +152,23 @@ from transports.streaming import (
     EVENT_DONE,
     EVENT_REASONING_DELTA,
     EVENT_TEXT_DELTA,
+    EVENT_TOOL_ARGUMENTS_DELTA,
+    EVENT_TOOL_ARGUMENTS_FINISHED,
     EVENT_TOOL_CALL_STARTED,
     CancelToken,
     StreamCancelled,
 )
 from transports.types import build_assistant_history_msg
-from agent import PromptBuilder, SkillLoader, VoiceHeartbeat
+from agent import (
+    PHASE_ASSISTANT_GENERATING_TEXT,
+    PHASE_ASSISTANT_GENERATING_TOOL_ARGUMENTS,
+    PHASE_TOOL_EXECUTING,
+    PromptBuilder,
+    SkillLoader,
+    VoiceEventSink,
+    build_turn_event_envelope,
+    preview_tool_result,
+)
 from agent.compaction import apply_compaction
 from agent.logging import setup_logging, set_log_session, get_logger
 from agent.runtime import AgentRuntime, SESSION_TOKEN_KEYS
@@ -329,7 +341,7 @@ def _esc_listener(cancel_token, stop_event):
             pass
 
 
-def _stream_one_turn(chain, model, messages, tools, cancel_token):
+def _stream_one_turn(chain, model, messages, tools, cancel_token, runtime: AgentRuntime | None = None):
     """跑一次 ``chain.stream_call`` 并实时打印增量 — 返回最终 NormalizedResponse。
 
     打印策略：
@@ -349,6 +361,10 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token):
     has_text = False
     saw_reasoning = False
     final_resp = None
+    text_phase = None
+    args_phase = None
+    _args_activity_last_chars = 0
+    _ARGS_ACTIVITY_THRESHOLD = int(os.environ.get("VOICE_ORCHESTRATOR_ARGUMENT_DELTA_MIN_CHARS", "512"))
 
     try:
         for ev in chain.stream_call(
@@ -358,6 +374,10 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token):
             tools=tools,
         ):
             if ev.type == EVENT_TEXT_DELTA:
+                if runtime is not None and text_phase is None:
+                    text_phase = runtime.phase_tracker.start(PHASE_ASSISTANT_GENERATING_TEXT)
+                if text_phase is not None:
+                    text_phase.activity_event(delta_chars=len(ev.text))
                 if not printed_prefix:
                     sys.stdout.write("\nAgent > ")
                     printed_prefix = True
@@ -373,6 +393,16 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token):
                     sys.stdout.flush()
                     saw_reasoning = True
             elif ev.type == EVENT_TOOL_CALL_STARTED:
+                if runtime is not None and text_phase is not None:
+                    runtime.phase_tracker.close(text_phase)
+                    text_phase = None
+                if runtime is not None:
+                    args_phase = runtime.phase_tracker.start(
+                        PHASE_ASSISTANT_GENERATING_TOOL_ARGUMENTS,
+                        tool_name=ev.tool_name or "",
+                        tool_call_id=ev.tool_call_id or "",
+                    )
+                    _args_activity_last_chars = 0
                 if saw_reasoning and not has_text:
                     # 清掉 [think] ... 占位，让 tool 行从行首开始
                     sys.stdout.write("\n")
@@ -382,7 +412,41 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token):
                     sys.stdout.write("\n")
                 sys.stdout.write(f"  [tool] {ev.tool_name} (streaming args...)\n")
                 sys.stdout.flush()
+            elif ev.type == EVENT_TOOL_ARGUMENTS_DELTA:
+                if runtime is not None and args_phase is None:
+                    args_phase = runtime.phase_tracker.start(
+                        PHASE_ASSISTANT_GENERATING_TOOL_ARGUMENTS,
+                        tool_name=ev.tool_name or "",
+                        tool_call_id=ev.tool_call_id or "",
+                    )
+                    _args_activity_last_chars = 0
+                total = ev.total_chars or 0
+                if args_phase is not None and (total - _args_activity_last_chars) >= _ARGS_ACTIVITY_THRESHOLD:
+                    _args_activity_last_chars = total
+                    args_phase.activity_event(
+                        tool_name=ev.tool_name or "",
+                        tool_call_id=ev.tool_call_id or "",
+                        argument_field=ev.argument_field or "",
+                        delta_chars=ev.delta_chars,
+                        total_chars=total,
+                    )
+            elif ev.type == EVENT_TOOL_ARGUMENTS_FINISHED:
+                if runtime is not None and args_phase is not None:
+                    runtime.phase_tracker.close(
+                        args_phase,
+                        tool_name=ev.tool_name or "",
+                        tool_call_id=ev.tool_call_id or "",
+                        argument_field=ev.argument_field or "",
+                        total_chars=ev.total_chars,
+                    )
+                    args_phase = None
             elif ev.type == EVENT_DONE:
+                if runtime is not None and args_phase is not None:
+                    runtime.phase_tracker.close(args_phase)
+                    args_phase = None
+                if runtime is not None and text_phase is not None:
+                    runtime.phase_tracker.close(text_phase)
+                    text_phase = None
                 final_resp = ev.response
                 if has_text:
                     sys.stdout.write("\n\n")
@@ -390,11 +454,19 @@ def _stream_one_turn(chain, model, messages, tools, cancel_token):
                     sys.stdout.write("\n")
                 sys.stdout.flush()
     except StreamCancelled:
+        if runtime is not None and args_phase is not None:
+            runtime.phase_tracker.close(args_phase, status="cancelled")
+        if runtime is not None and text_phase is not None:
+            runtime.phase_tracker.close(text_phase, status="cancelled")
         sys.stdout.write("\n  [cancelled] (Esc / Ctrl+C — back to prompt)\n\n")
         sys.stdout.flush()
         return None
 
     return final_resp
+
+
+def _voice_stream_only() -> bool:
+    return os.environ.get("VOICE_ORCHESTRATOR_STREAM_ONLY", "1") not in ("0", "false", "False", "")
 
 
 def _accumulate_parent_turn_tokens(runtime: AgentRuntime, usage) -> None:
@@ -483,34 +555,16 @@ def run_agent():
         stream_enabled=stream_enabled,
         cancel_token=cancel_token,
     )
+    voice_event_sink = VoiceEventSink.create_from_env()
+    if voice_event_sink is not None:
+        runtime.voice_event_sink = voice_event_sink
+        voice_event_sink.start()
+        log.info("voice orchestrator sink on")
+    registry.set_runtime(runtime)
     # V23.4: agent_busy 覆盖整轮 tool loop（含 delegate 子 agent 执行期间），
     # 取代仅在父流式期间为 True 的 streaming_active。SIGINT / Esc listener 据此
     # 判断"现在按取消是取消 agent，还是退出 prompt"。
     agent_busy = threading.Event()
-
-    # V26.4: 代码级语音心跳 —— 长任务（terminal 阻塞 / 多步检索）期间，主线程被
-    # 工具卡住、模型物理上无法插播时，由后台守护线程直连 nano_voice_kit 推一条
-    # 存活 progress，防用户以为"挂机"。门控两层：
-    #   1. skill 层：voice-runtime 必须 is_fully_available（DASHSCOPE_API_KEY 已设
-    #      + terminal 在）—— 与 V26.3 注入 directive 的门槛同源；
-    #   2. 链路层：VoiceHeartbeat.create_if_available 再探 VoiceClient import +
-    #      Runtime /health。任一不过 → voice_heartbeat 为 None，心跳不启、零副作用。
-    # env VOICE_HEARTBEAT_SECONDS=0 显式关闭。
-    voice_heartbeat = None
-    try:
-        _vmeta = skill_loader.get("voice-runtime")
-        _voice_tools = sorted(
-            set(get_available_tool_names(ENABLED_TOOLSETS))
-            | set(memory_manager.get_all_tool_names())
-        )
-        if _vmeta is not None and _vmeta.is_fully_available(_voice_tools):
-            voice_heartbeat = VoiceHeartbeat.create_if_available(agent_busy)
-    except Exception as exc:  # noqa: BLE001 — 心跳构造永不阻断 agent 启动
-        log.warning("voice heartbeat init skipped: %r", exc)
-        voice_heartbeat = None
-    if voice_heartbeat is not None:
-        voice_heartbeat.start()
-        log.info("voice heartbeat on (threshold=%ss)", voice_heartbeat._threshold)
 
     # V23.0: 注入 delegate_task 工具的运行期上下文 —— chain 构建完才注入。
     # 父全集 = registry 注册过的 + memory_manager 暴露的；黑名单（delegate_task /
@@ -617,6 +671,34 @@ def run_agent():
 
     turn_count = 0  # V9: 每轮递增，传给 on_turn_start
 
+    def _send_turn_event(
+        event_type: str,
+        *,
+        assistant_text: str = "",
+        reasoning_activity: str = "",
+        next_tool_name: str = "",
+        tool=None,
+        phase=None,
+    ) -> None:
+        if runtime.voice_event_sink is None:
+            return
+        if _voice_stream_only() and not runtime.stream_enabled:
+            return
+        envelope = build_turn_event_envelope(
+            event_type=event_type,
+            session_id=current_session_id,
+            turn_id=f"turn-{turn_count}",
+            messages=messages,
+            assistant_text=assistant_text,
+            reasoning_activity=reasoning_activity,
+            next_tool_name=next_tool_name,
+            tool=tool,
+            phase=phase,
+        )
+        runtime.voice_event_sink.submit(envelope)
+
+    runtime.phase_tracker.set_listener(lambda status, phase: _send_turn_event(status, phase=phase))
+
     # V22 cancel_token / agent_busy 已在 delegate 注入前提前构造（见上方）。
     # 这里仅注册 SIGINT handler —— 用 agent_busy.is_set() 区分两种语境：
     # - prompt 期间 SIGINT → 还原默认行为，让 input() 抛 KeyboardInterrupt 退出
@@ -705,6 +787,7 @@ def run_agent():
                 user_message_content = user_input
 
             messages.append({"role": "user", "content": user_message_content})
+            _send_turn_event("turn_started")
 
             # 收集本轮 assistant 的最终文本响应（不含 tool call），用于 sync
             final_assistant_text = ""
@@ -720,10 +803,6 @@ def run_agent():
             )
             cancel_token.reset()
             agent_busy.set()
-            # V26.4: 轮始刷新心跳基准 —— 从进入 tool loop 这刻起重新计沉默时长，
-            # 避免上一轮结束到本轮开始之间的间隔被算进沉默期、刚进 loop 就补播。
-            if voice_heartbeat is not None:
-                voice_heartbeat.mark_active()
             _esc_thread.start()
 
             try:
@@ -773,7 +852,7 @@ def run_agent():
                         if runtime.stream_enabled:
                             cancel_token.reset()
                             normalized = _stream_one_turn(
-                                chain, model, messages, all_tools_schema, cancel_token,
+                                chain, model, messages, all_tools_schema, cancel_token, runtime,
                             )
                             if normalized is None:
                                 # StreamCancelled — 用户取消，跳出 tool loop 回到 prompt
@@ -790,7 +869,7 @@ def run_agent():
                     except FailoverExhausted as e:
                         print(f"  [error] all transports failed: {e}")
                         break
-                    except ValueError:
+                    except ValueError as exc:
                         print("  [warn] invalid response shape, skipping turn")
                         break
 
@@ -842,9 +921,28 @@ def run_agent():
                         pretty_args = json.dumps(args, ensure_ascii=False)
                         print(f"  [tool] {name}({pretty_args})")
 
-                        # V8: 路由 — manager 接管的工具走 manager，其余走 registry
+                        # V8: 路由 — manager 接管的工具走 manager，其余走 registry。
+                        # V27.1: memory tools 不经过 registry，但也只报告通用 tool phase
+                        # 和安全 envelope；不在 main 里判断语音策略。
                         if memory_manager.has_tool(name):
-                            result = memory_manager.handle_tool_call(name, args)
+                            _mem_started_at = time.monotonic()
+                            _mem_phase = runtime.phase_tracker.start(PHASE_TOOL_EXECUTING, tool_name=name, tool_category="memory")
+                            try:
+                                result = memory_manager.handle_tool_call(name, args)
+                            except Exception as exc:  # noqa: BLE001 — 保持原异常语义，但先关 phase
+                                runtime.phase_tracker.close(_mem_phase, status="error", tool_name=name, error_type=type(exc).__name__)
+                                raise
+                            _duration_ms = int((time.monotonic() - _mem_started_at) * 1000)
+                            try:
+                                _mem_parsed = json.loads(result)
+                                _mem_result_kind = "error" if isinstance(_mem_parsed, dict) and "error" in _mem_parsed else "ok"
+                            except json.JSONDecodeError:
+                                _mem_result_kind = "non_json"
+                            runtime.phase_tracker.close(_mem_phase, tool_name=name, result_kind=_mem_result_kind)
+                            _send_turn_event(
+                                "tool_finished" if _mem_result_kind != "error" else "tool_error",
+                                tool=preview_tool_result(name, _mem_result_kind, result, duration_ms=_duration_ms),
+                            )
                         else:
                             result = registry.dispatch(name, args)
 
@@ -874,6 +972,8 @@ def run_agent():
                 agent_busy.clear()
                 _esc_stop.set()
                 _esc_thread.join(timeout=1.0)
+
+            _send_turn_event("turn_finished", assistant_text=final_assistant_text)
 
             # V9 生命周期：tool loop 结束后持久化对话
             # sync 用原始 user 输入（不含围栏），保持后端记录干净
@@ -930,10 +1030,9 @@ def run_agent():
             print(f"  [warn] trajectory flush on exit failed: {exc!r}")
         # V10: 释放外部 provider 的 httpx client；builtin 的 shutdown 是 no-op
         memory_manager.shutdown_all()
-        # V26.4: 停心跳守护线程（daemon 即便不 stop 进程退出也会回收，但显式
-        # stop 让 Ctrl+D 退出更干净、不在退出瞬间多吐一条心跳）。
-        if voice_heartbeat is not None:
-            voice_heartbeat.stop()
+        # V27.1: 语音 orchestrator sink 是纯 side-channel，退出时尽力收尾。
+        if runtime.voice_event_sink is not None:
+            runtime.voice_event_sink.stop()
 
 
 if __name__ == "__main__":

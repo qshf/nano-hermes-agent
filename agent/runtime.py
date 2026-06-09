@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from agent.runtime_phase import PhaseTracker
+from agent.voice_orchestrator_client import VoiceEventSink
 from transports.streaming import CancelToken
 
 
@@ -38,3 +40,7 @@ class AgentRuntime:
     # cache_read   = Anthropic cache 命中 tokens（OpenAI 兼容路径 = 0）
     # cache_write  = Anthropic cache_creation tokens（OpenAI 兼容路径 = 0）
     session_tokens: dict[str, int] = field(default_factory=_empty_session_tokens)
+    # V27.1: external voice orchestrator side-channel. The host submits bounded
+    # facts only; the external service owns speech policy and dispatch.
+    voice_event_sink: Optional[VoiceEventSink] = None
+    phase_tracker: PhaseTracker = field(default_factory=PhaseTracker)

@@ -1,5 +1,7 @@
 # Voice Kit API Provider 方案计划
 
+> **历史计划说明（v27.1 后需重读）**：本文描述的是 `nano_voice_kit` 作为独立语音包的 CLI/Runtime/API provider 设计，其中多处仍以“Agent 调 `nano-voice-say`”为接入假设。nano 主仓从 [v27.1](../decisions/v27.1.md) 起已经改为：主智能体不调用语音工具，host 只发送 bounded envelope + runtime phase lease，外部 Voice Orchestrator 决定并调用 `nano_voice_kit`。因此本文只作为 voice kit 包的历史/底层能力参考，不再代表 nano 主仓接入方式。
+
 ## 目标
 
 借鉴 `RoversCode/streamvox-agent-voice-kit` 的整体接入形态，先实现一个可全局安装、可被任意项目中的 Codex / Claude Code 调用的语音工具包；底层 TTS 暂时使用 DashScope API，后期再替换或新增本地模型 provider。

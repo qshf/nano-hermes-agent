@@ -27,6 +27,8 @@ chunk 累积、又要管 finish_reason 推断、还要管 silent fallback。教�
 - ``text_delta``        — 文本增量（``text`` 字段）
 - ``reasoning_delta``   — DeepSeek/Claude thinking 模式的 reasoning 增量
 - ``tool_call_started`` — 第一次见到完整 tool name 时（``tool_name`` 字段）
+- ``tool_arguments_delta`` — 工具参数流式增长元信息（不暴露参数正文）
+- ``tool_arguments_finished`` — 工具参数增长结束元信息
 - ``done``              — 流式正常结束，``response`` 字段给完整 ``NormalizedResponse``
 
 ``done`` 事件之前 transport 已经把所有增量重建成 ``NormalizedResponse`` —
@@ -62,6 +64,8 @@ from transports.types import NormalizedResponse
 EVENT_TEXT_DELTA = "text_delta"
 EVENT_REASONING_DELTA = "reasoning_delta"
 EVENT_TOOL_CALL_STARTED = "tool_call_started"
+EVENT_TOOL_ARGUMENTS_DELTA = "tool_arguments_delta"
+EVENT_TOOL_ARGUMENTS_FINISHED = "tool_arguments_finished"
 EVENT_DONE = "done"
 
 
@@ -84,6 +88,10 @@ class StreamEvent:
     type: str
     text: str = ""
     tool_name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    argument_field: Optional[str] = None
+    delta_chars: int = 0
+    total_chars: int = 0
     response: Optional[NormalizedResponse] = None
     provider_data: Optional[dict[str, Any]] = field(default=None, repr=False)
 

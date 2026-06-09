@@ -34,6 +34,8 @@ from transports.streaming import (
     EVENT_DONE,
     EVENT_REASONING_DELTA,
     EVENT_TEXT_DELTA,
+    EVENT_TOOL_ARGUMENTS_DELTA,
+    EVENT_TOOL_ARGUMENTS_FINISHED,
     EVENT_TOOL_CALL_STARTED,
     CancelToken,
     StreamEvent,
@@ -323,6 +325,9 @@ class AnthropicTransport(ProviderTransport):
         api_kwargs = self.build_kwargs(**kwargs)
 
         with client.messages.stream(**api_kwargs) as stream:
+            current_tool_name = ""
+            current_tool_id = ""
+            current_tool_arg_chars = 0
             for event in stream:
                 if cancel_token is not None:
                     cancel_token.check()
@@ -333,10 +338,14 @@ class AnthropicTransport(ProviderTransport):
                     block = getattr(event, "content_block", None)
                     if block is not None and getattr(block, "type", None) == "tool_use":
                         tool_name = getattr(block, "name", None)
+                        current_tool_name = tool_name or ""
+                        current_tool_id = getattr(block, "id", "") or ""
+                        current_tool_arg_chars = 0
                         if tool_name:
                             yield StreamEvent(
                                 type=EVENT_TOOL_CALL_STARTED,
                                 tool_name=tool_name,
+                                tool_call_id=current_tool_id or None,
                             )
                     continue
 
@@ -355,10 +364,35 @@ class AnthropicTransport(ProviderTransport):
                             yield StreamEvent(
                                 type=EVENT_REASONING_DELTA, text=thinking,
                             )
-                    # input_json_delta 不暴露 — get_final_message 会重建完整 input
+                    elif delta_type == "input_json_delta":
+                        partial = getattr(delta, "partial_json", "") or ""
+                        if partial:
+                            current_tool_arg_chars += len(partial)
+                            yield StreamEvent(
+                                type=EVENT_TOOL_ARGUMENTS_DELTA,
+                                tool_name=current_tool_name or None,
+                                tool_call_id=current_tool_id or None,
+                                argument_field="input_json",
+                                delta_chars=len(partial),
+                                total_chars=current_tool_arg_chars,
+                            )
                     continue
 
-                # message_start / content_block_stop / message_delta / message_stop
+                if event_type == "content_block_stop":
+                    if current_tool_name and current_tool_arg_chars:
+                        yield StreamEvent(
+                            type=EVENT_TOOL_ARGUMENTS_FINISHED,
+                            tool_name=current_tool_name,
+                            tool_call_id=current_tool_id or None,
+                            argument_field="input_json",
+                            total_chars=current_tool_arg_chars,
+                        )
+                    current_tool_name = ""
+                    current_tool_id = ""
+                    current_tool_arg_chars = 0
+                    continue
+
+                # message_start / message_delta / message_stop
                 # 在 nano 都不需要单独发事件 — 累积责任交给 SDK。
 
             # 流结束 — 取原生 Message 并复用 normalize_response 重建

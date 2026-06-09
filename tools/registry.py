@@ -12,16 +12,25 @@ V5：dispatch 集成 pre/post/transform 钩子。
 - hooks：dispatch 流程中的三个扩展点（pre/post/transform）
 """
 
+from __future__ import annotations
+
 import asyncio
 import concurrent.futures
 import json
 import logging
 import time
-from typing import Callable, Optional
+from collections.abc import Callable
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agent.runtime import AgentRuntime
+    from agent.runtime_phase import PhaseCloseStatus, PhaseSpan
 
 CHECK_FN_TTL = 30.0  # check_fn 缓存有效期（秒）
 
 log = logging.getLogger(__name__)
+
+ToolHandler = Callable[[dict[str, Any]], Any]
 
 
 # --- 异步桥接 ---
@@ -48,23 +57,60 @@ def _run_async(coro) -> str:
 class ToolRegistry:
     """全局工具注册表：存储 schema + handler + check_fn，带缓存。"""
 
-    def __init__(self):
-        self._tools: dict[str, dict] = {}
+    def __init__(self) -> None:
+        self._tools: dict[str, dict[str, Any]] = {}
         self._generation: int = 0
         # 内层缓存：check_fn 结果 → (timestamp, bool)，30s TTL
         self._check_fn_cache: dict[str, tuple[float, bool]] = {}
+        # Optional AgentRuntime for phase spans; core dispatch never depends on it.
+        self._runtime: AgentRuntime | None = None
 
     @property
     def generation(self) -> int:
         return self._generation
 
+    def set_runtime(self, runtime: "AgentRuntime | None") -> None:
+        """Attach optional AgentRuntime for phase spans."""
+
+        self._runtime = runtime
+
+    def _start_tool_phase(self, tool_name: str) -> "PhaseSpan | None":
+        runtime = self._runtime
+        tracker = getattr(runtime, "phase_tracker", None)
+        if tracker is None:
+            return None
+        try:
+            from agent.runtime_phase import PHASE_TOOL_EXECUTING
+            return tracker.start(PHASE_TOOL_EXECUTING, tool_name=tool_name)
+        except Exception:  # noqa: BLE001 — observers must never affect tools
+            log.debug("tool phase start failed", exc_info=True)
+            return None
+
+    def _close_tool_phase(
+        self,
+        span: "PhaseSpan | None",
+        *,
+        status: PhaseCloseStatus = "finished",
+        **activity: Any,
+    ) -> None:
+        if span is None:
+            return
+        runtime = self._runtime
+        tracker = getattr(runtime, "phase_tracker", None)
+        if tracker is None:
+            return
+        try:
+            tracker.close(span, status=status, **activity)
+        except Exception:  # noqa: BLE001
+            log.debug("tool phase close failed", exc_info=True)
+
     def register(
         self,
-        schema: dict,
-        handler: Callable[[dict], str],
-        check_fn: Optional[Callable[[], bool]] = None,
+        schema: dict[str, Any],
+        handler: ToolHandler,
+        check_fn: Callable[[], bool] | None = None,
         is_async: bool = False,
-    ):
+    ) -> None:
         """注册一个工具。每次注册递增 generation。"""
         name = schema["name"]
         self._tools[name] = {
@@ -75,14 +121,14 @@ class ToolRegistry:
         }
         self._generation += 1
 
-    def deregister(self, name: str):
+    def deregister(self, name: str) -> None:
         """移除一个工具。"""
         if name in self._tools:
             del self._tools[name]
             self._check_fn_cache.pop(name, None)
             self._generation += 1
 
-    def _is_available(self, name: str, entry: dict) -> bool:
+    def _is_available(self, name: str, entry: dict[str, Any]) -> bool:
         """判断工具是否可用，check_fn 结果带 TTL 缓存。"""
         check_fn = entry["check_fn"]
         if check_fn is None:
@@ -99,7 +145,7 @@ class ToolRegistry:
         log.debug("[内层缓存] 未命中 tool=%s, check_fn() → %s", name, result)
         return result
 
-    def get_definitions(self, names: list[str]) -> list[dict]:
+    def get_definitions(self, names: list[str]) -> list[dict[str, Any]]:
         """按名称列表返回可用工具的 OpenAI schema。check_fn 带 TTL 缓存。"""
         result = []
         for name in sorted(names):
@@ -111,11 +157,11 @@ class ToolRegistry:
             result.append({"type": "function", "function": entry["schema"]})
         return result
 
-    def get_openai_tools(self) -> list[dict]:
+    def get_openai_tools(self) -> list[dict[str, Any]]:
         """返回所有可用工具（兼容旧用法）。"""
         return self.get_definitions(list(self._tools.keys()))
 
-    def dispatch(self, name: str, args: dict) -> str:
+    def dispatch(self, name: str, args: dict[str, Any]) -> str:
         """根据工具名分发调用。
 
         流程：coerce → pre_hook → 执行 → post_hook → transform。
@@ -133,15 +179,18 @@ class ToolRegistry:
         from tools.coerce import coerce_args
         coerced = coerce_args(entry["schema"], args)
 
+        start = time.monotonic()
+        tool_phase = self._start_tool_phase(name)
+
         # pre_tool_call 钩子（可阻止执行）
         from tools.hooks import hook_manager
         pre_results = hook_manager.invoke("pre_tool_call", tool_name=name, args=coerced)
         for r in pre_results:
             if isinstance(r, dict) and r.get("action") == "block":
+                self._close_tool_phase(tool_phase, status="error", tool_name=name, error_type="Blocked")
                 return tool_error(f"Blocked: {r.get('message', '')}")
 
         # 执行 handler（计时） — 顶层 try 兜底未捕获异常
-        start = time.monotonic()
         try:
             if entry.get("is_async"):
                 result = _run_async(entry["handler"](coerced))
@@ -149,6 +198,7 @@ class ToolRegistry:
                 result = entry["handler"](coerced)
         except Exception as exc:
             log.exception("Tool %s dispatch error: %s", name, exc)
+            self._close_tool_phase(tool_phase, status="error", tool_name=name, error_type=type(exc).__name__)
             return tool_error(f"Tool execution failed: {type(exc).__name__}: {exc}")
         duration_ms = int((time.monotonic() - start) * 1000)
 
@@ -167,16 +217,23 @@ class ToolRegistry:
         # (3) 返回合法 JSON 但是 list/数字等非 object 顶层类型 — 也强转。
         if not isinstance(result, str):
             log.warning("Tool %s returned non-str (%s); coercing", name, type(result).__name__)
+            self._close_tool_phase(tool_phase, tool_name=name, result_kind="coerced_non_str")
             return tool_result(output=str(result))
         try:
             parsed = json.loads(result)
             if not isinstance(parsed, dict):
                 log.warning("Tool %s returned non-dict JSON; coercing", name)
+                self._close_tool_phase(tool_phase, tool_name=name, result_kind="coerced_non_dict")
                 return tool_result(output=result)
         except json.JSONDecodeError:
             log.warning("Tool %s returned non-JSON string; coercing", name)
+            self._close_tool_phase(tool_phase, tool_name=name, result_kind="coerced_non_json")
             return tool_result(output=result)
 
+        if "error" in parsed:
+            self._close_tool_phase(tool_phase, status="error", tool_name=name, error_type="ToolResultError")
+        else:
+            self._close_tool_phase(tool_phase, tool_name=name, result_kind="ok")
         return result
 
     @property
