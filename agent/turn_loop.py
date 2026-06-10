@@ -24,7 +24,6 @@ import json
 import signal
 import sys
 import threading
-import time
 
 import cli
 from agent.bootstrap import ENABLED_TOOLSETS, AgentServices
@@ -37,7 +36,6 @@ from agent import (
     PHASE_ASSISTANT_GENERATING_TOOL_ARGUMENTS,
     PHASE_TOOL_EXECUTING,
     build_turn_event_envelope,
-    preview_tool_result,
     tool_span,
 )
 from model_tools import get_tool_definitions
@@ -309,11 +307,7 @@ def run_repl(services: AgentServices) -> None:
         event_type: str,
         *,
         assistant_text: str = "",
-        reasoning_activity: str = "",
-        next_tool_name: str = "",
-        tool=None,
         phase=None,
-        send_message_preview=None,
     ) -> None:
         if runtime.voice_event_sink is None:
             return
@@ -329,22 +323,16 @@ def run_repl(services: AgentServices) -> None:
                 turn_id=f"turn-{turn_count}",
                 messages=messages,
                 assistant_text=assistant_text,
-                reasoning_activity=reasoning_activity,
-                next_tool_name=next_tool_name,
-                tool=tool,
                 phase=phase,
-                send_message_preview=send_message_preview,
             )
             runtime.voice_event_sink.submit(envelope)
         except Exception:  # noqa: BLE001 — 语音旁路绝不影响主 turn
             log.debug("voice turn-event build/submit failed", exc_info=True)
 
-    # phase 事件（尤其高频的 phase_activity）只携带 span 元数据，无需重走
-    # recent_messages 预览循环（遍历全部 messages + 逐条 redact）—— 那是 envelope
-    # 构建里最重的一段，挂在流式热路径上纯属浪费（v27.1 review #7）。最近用户
-    # 目标已由 last_user_message_preview 单独保留，不受影响。
+    # v2: phase span 事件经此 listener 归一成 activity_* 事件。activity 的 user_goal
+    # 仍由 build_turn_event_envelope 单次 last-user 反查补上（轻量，可挂高频 progress）。
     runtime.phase_tracker.set_listener(
-        lambda status, phase: _send_turn_event(status, phase=phase, send_message_preview=False)
+        lambda status, phase: _send_turn_event(status, phase=phase)
     )
 
     # V22 cancel_token / agent_busy 已在 delegate 注入前提前构造（见上方）。
@@ -573,22 +561,19 @@ def run_repl(services: AgentServices) -> None:
                         # V27.1: memory tools 不经过 registry，但也只报告通用 tool phase
                         # 和安全 envelope；不在 main 里判断语音策略。
                         if memory_manager.has_tool(name):
-                            _mem_started_at = time.monotonic()
                             # tool_span 收口 phase 生命周期：异常自动 error-close 后
                             # 重新抛出（保持原 raise 语义），正常退出按 finish。
+                            # v2: 不再额外手写 tool_finished 事件 —— memory 与普通
+                            # registry 工具一视同仁走 tool_span，结果预览由 span.finish
+                            # 的 result= 带出（在 turn_events 边界裁成 ≤200 安全预览）。
                             with tool_span(runtime, PHASE_TOOL_EXECUTING, tool_name=name, tool_category="memory") as _mem_span:
                                 result = memory_manager.handle_tool_call(name, args)
-                                _duration_ms = int((time.monotonic() - _mem_started_at) * 1000)
                                 try:
                                     _mem_parsed = json.loads(result)
                                     _mem_result_kind = "error" if isinstance(_mem_parsed, dict) and "error" in _mem_parsed else "ok"
                                 except json.JSONDecodeError:
                                     _mem_result_kind = "non_json"
-                                _mem_span.finish(tool_name=name, result_kind=_mem_result_kind)
-                            _send_turn_event(
-                                "tool_finished" if _mem_result_kind != "error" else "tool_error",
-                                tool=preview_tool_result(name, _mem_result_kind, result, duration_ms=_duration_ms),
-                            )
+                                _mem_span.finish(tool_name=name, result_kind=_mem_result_kind, result=result)
                         else:
                             result = registry.dispatch(name, args)
 

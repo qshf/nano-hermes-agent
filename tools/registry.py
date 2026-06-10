@@ -203,9 +203,11 @@ class ToolRegistry:
                 return tool_result(output=result)
 
             if "error" in parsed:
-                span.error(tool_name=name, error_type="ToolResultError")
+                span.error(tool_name=name, error_type="ToolResultError", result=result)
             else:
-                span.finish(tool_name=name, result_kind="ok")
+                # v2: 普通工具完成时也带 result 安全短预览（在 turn_events 边界裁成
+                # ≤200 + redact），让 orchestrator 对所有工具一视同仁，不止 memory。
+                span.finish(tool_name=name, result_kind="ok", result=result)
             return result
 
     @property

@@ -24,7 +24,7 @@ from agent.runtime_phase import (
     PHASE_TOOL_EXECUTING,
     PhaseTracker,
 )
-from agent.turn_events import build_turn_event_envelope, preview_tool_result
+from agent.turn_events import PhasePreview, build_turn_event_envelope
 from agent.voice_orchestrator_client import RecordingVoiceOrchestratorClient, VoiceEventSink
 from tools.registry import ToolRegistry
 from tools.result import tool_result
@@ -97,45 +97,63 @@ def test_1_envelope_uses_latest_user_and_omits_system():
         messages=messages,
     ).to_dict()
     text = json.dumps(env, ensure_ascii=False)
-    assert "最新问题" in text
-    assert "旧问题" in text
+    # v2: user_goal 只取最近一条 user（话题），不再外发 recent_messages
+    assert env["user_goal"].startswith("最新问题")
+    assert "旧问题" not in text
     assert "SYSTEM SECRET" not in text
     assert "/Users/qshf" not in text
     assert "sk-secret-token" not in text
-    assert env["safety"]["redacted"] is True
+    assert env["redacted"] is True
+    # v2 扁平形状：无 context / assistant_activity / tool / phase / safety 嵌套
+    assert "context" not in env
+    assert "safety" not in env
+    assert env["event_type"] == "turn_started"
 
 
-def test_2_envelope_bounds_recent_messages(monkey=None):
-    old = os.environ.get("VOICE_ORCHESTRATOR_MAX_MESSAGE_PREVIEWS")
-    os.environ["VOICE_ORCHESTRATOR_MAX_MESSAGE_PREVIEWS"] = "2"
-    try:
-        messages = [
-            {"role": "user", "content": "u1"},
-            {"role": "assistant", "content": "a1"},
-            {"role": "user", "content": "u2"},
-        ]
-        env = build_turn_event_envelope(event_type="x", session_id="s", turn_id="t", messages=messages).to_dict()
-        previews = env["context"]["recent_messages"]
-        assert [p["preview"]["text"] for p in previews] == ["a1", "u2"]
-    finally:
-        if old is None:
-            os.environ.pop("VOICE_ORCHESTRATOR_MAX_MESSAGE_PREVIEWS", None)
-        else:
-            os.environ["VOICE_ORCHESTRATOR_MAX_MESSAGE_PREVIEWS"] = old
 
-
-def test_3_tool_preview_head_tail_and_redaction():
-    preview = preview_tool_result(
-        "terminal",
-        "ok",
-        "head /Users/qshf/.env\n" + ("x" * 2000) + "\nTraceback (most recent call last): boom",
-        duration_ms=42,
+def test_2_phase_translates_to_v2_activity():
+    """v2: phase 预览在 envelope 边界翻译成 activity_* 事件 + activity 子对象。"""
+    messages = [{"role": "user", "content": "重构 main.py"}]
+    phase = PhasePreview(
+        name="tool_executing",
+        status="phase_finished",
+        span_id="span_7",
+        elapsed_ms=8200,
+        activity={"tool_name": "read_file", "result_kind": "ok", "result": "找到 3 个文件", "total_chars": 120},
     )
-    data = json.dumps(preview.__dict__, default=lambda o: o.__dict__, ensure_ascii=False)
-    assert "/Users/qshf" not in data
-    assert "Traceback" not in data
-    assert preview.result_truncated is True
-    assert preview.duration_ms == 42
+    env = build_turn_event_envelope(
+        event_type="phase_finished", session_id="s", turn_id="t", messages=messages, phase=phase,
+    ).to_dict()
+    assert env["event_type"] == "activity_finished"   # status 翻译成 wire 词表
+    act = env["activity"]
+    assert act["kind"] == "tool"                       # name 归一成 kind
+    assert act["name"] == "read_file"                  # tool_name 提到 activity.name
+    assert act["elapsed_ms"] == 8200
+    assert act["span_id"] == "span_7"
+    assert act["outcome"] == "ok"
+    assert act["result"] == "找到 3 个文件"             # 工具结果短预览
+    assert act["total_chars"] == 120
+    assert env["user_goal"] == "重构 main.py"           # 话题每事件都带
+
+
+
+def test_3_activity_result_redacted_and_capped():
+    """v2: 工具结果经 activity.result 外发时仍脱敏，且按 ≤200 上限截断。"""
+    messages = [{"role": "user", "content": "q"}]
+    long_result = "head /Users/qshf/.env\n" + ("x" * 2000) + "\nTraceback (most recent call last): boom"
+    phase = PhasePreview(
+        name="tool_executing", status="phase_finished", span_id="s1", elapsed_ms=10,
+        activity={"tool_name": "terminal", "result_kind": "ok", "result": long_result},
+    )
+    env = build_turn_event_envelope(
+        event_type="phase_finished", session_id="s", turn_id="t", messages=messages, phase=phase,
+    ).to_dict()
+    result = env["activity"]["result"]
+    assert "/Users/qshf" not in result
+    assert "Traceback" not in result
+    assert len(result) <= 200            # 默认 DEFAULT_MAX_ACTIVITY_RESULT_CHARS
+    assert env["redacted"] is True
+
 
 
 def test_4_sink_client_failure_isolated():
@@ -195,6 +213,9 @@ def test_9_tool_registry_phase_lifecycle():
     assert [s for s, _ in seen] == ["phase_started", "phase_finished"]
     assert seen[0][1].name == PHASE_TOOL_EXECUTING
     assert seen[0][1].activity["tool_name"] == "demo"
+    # v2: 普通 registry 工具完成时也带 result（供 orchestrator 一视同仁播报）
+    assert "result" in seen[-1][1].activity
+    assert seen[-1][1].activity["result_kind"] == "ok"
 
 
 def test_10_tool_registry_error_phase():
@@ -245,23 +266,23 @@ def test_13_agent_exports_do_not_expose_abandoned_supervisor():
     assert hasattr(agent, "TurnEventEnvelope")
 
 
-def test_14_preview_short_result_has_no_head_tail_overlap():
-    """review #6：结果放得下时只放 head，不切重叠的 tail，且 result_truncated=False。"""
-    os.environ["VOICE_ORCHESTRATOR_MAX_TOOL_RESULT_CHARS"] = "100"
+def test_14_activity_result_send_toggle_off():
+    """SEND_TOOL_PREVIEW=0 时 activity 不带 result（其余字段照常）。"""
+    os.environ["VOICE_ORCHESTRATOR_SEND_TOOL_PREVIEW"] = "0"
     try:
-        p = preview_tool_result("t", "ok", "abcdefg")
-        assert p.result_truncated is False
-        assert p.result_head.text == "abcdefg"
-        assert p.result_tail.text == ""
-        big = "H" * 60 + "M" * 200 + "T" * 60
-        p2 = preview_tool_result("t", "ok", big)
-        assert p2.result_truncated is True
-        # head 只含开头段、tail 只含结尾段 —— 中段被丢，两段不重叠
-        assert "T" not in p2.result_head.text
-        assert "H" not in p2.result_tail.text
-        assert len(p2.result_head.text) + len(p2.result_tail.text) <= 100
+        messages = [{"role": "user", "content": "q"}]
+        phase = PhasePreview(
+            name="tool_executing", status="phase_finished", span_id="s1", elapsed_ms=5,
+            activity={"tool_name": "demo", "result_kind": "ok", "result": "should-not-leak"},
+        )
+        env = build_turn_event_envelope(
+            event_type="phase_finished", session_id="s", turn_id="t", messages=messages, phase=phase,
+        ).to_dict()
+        assert "result" not in env["activity"]
+        assert "should-not-leak" not in json.dumps(env, ensure_ascii=False)
+        assert env["activity"]["outcome"] == "ok"
     finally:
-        os.environ.pop("VOICE_ORCHESTRATOR_MAX_TOOL_RESULT_CHARS", None)
+        os.environ.pop("VOICE_ORCHESTRATOR_SEND_TOOL_PREVIEW", None)
 
 
 def test_15_child_agent_scope_suppresses_tool_phase():
@@ -288,24 +309,27 @@ def test_15_child_agent_scope_suppresses_tool_phase():
     assert seen[0][1] == PHASE_TOOL_EXECUTING
 
 
-def test_16_recent_messages_skipped_when_preview_disabled():
-    """review #7：send_message_preview=False 时不走 recent_messages 预览循环。"""
+def test_16_progress_carries_user_goal_and_no_message_leak():
+    """v2: 高频 activity_progress 带 user_goal（话题），但不外发任何历史消息正文。"""
     messages = [
         {"role": "system", "content": "secret system prompt"},
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "hi there"},
     ]
+    phase = PhasePreview(
+        name="assistant_generating_tool_arguments", status="phase_activity",
+        span_id="s1", elapsed_ms=3000, activity={"tool_name": "write_file", "total_chars": 1800},
+    )
     env = build_turn_event_envelope(
-        event_type="phase_activity",
-        session_id="s",
-        turn_id="t",
-        messages=messages,
-        send_message_preview=False,
+        event_type="phase_activity", session_id="s", turn_id="t", messages=messages, phase=phase,
     ).to_dict()
-    assert env["context"]["recent_messages"] == []
-    # 最近用户目标仍单独保留
-    assert env["context"]["last_user_message_preview"]["text"] == "hello"
-    assert env["safety"]["message_preview_enabled"] is False
+    assert env["event_type"] == "activity_progress"
+    assert env["activity"]["kind"] == "generating_args"
+    assert env["activity"]["total_chars"] == 1800
+    assert env["user_goal"] == "hello"            # 话题保留
+    text = json.dumps(env, ensure_ascii=False)
+    assert "secret system prompt" not in text     # system 永不外发
+    assert "hi there" not in text                 # 历史 assistant 正文不外发
 
 
 def test_17_shared_env_helpers_single_source():
@@ -329,8 +353,8 @@ def main() -> None:
 
     tests = [
         test_1_envelope_uses_latest_user_and_omits_system,
-        test_2_envelope_bounds_recent_messages,
-        test_3_tool_preview_head_tail_and_redaction,
+        test_2_phase_translates_to_v2_activity,
+        test_3_activity_result_redacted_and_capped,
         test_4_sink_client_failure_isolated,
         test_5_sink_records_envelope_sync,
         test_6_phase_tracker_emits_metadata_only,
@@ -341,9 +365,9 @@ def main() -> None:
         test_11_delegate_child_phase_helpers_are_aggregate_only,
         test_12_voice_skill_no_longer_instructs_terminal_say,
         test_13_agent_exports_do_not_expose_abandoned_supervisor,
-        test_14_preview_short_result_has_no_head_tail_overlap,
+        test_14_activity_result_send_toggle_off,
         test_15_child_agent_scope_suppresses_tool_phase,
-        test_16_recent_messages_skipped_when_preview_disabled,
+        test_16_progress_carries_user_goal_and_no_message_leak,
         test_17_shared_env_helpers_single_source,
     ]
     failed = 0

@@ -4,6 +4,19 @@ The host process owns facts, not speech policy. This module builds compact,
 redacted envelopes that another service can inspect to decide if/when/how to
 speak. It intentionally avoids raw tool arguments, full outputs, file content,
 system prompts, and chain-of-thought.
+
+v2 wire shape（voice-orchestrator.v2）
+=====================================
+扁平到「顶层 7 字段 + 一个 activity 子对象」。两个数据源（手写 turn 事件 / phase span
+事件）在本模块出口归一成同一套词表：
+
+    turn_started / turn_finished        ← 手写（带 user_goal / assistant_text）
+    activity_started / _progress / _finished  ← phase span（带 activity{...}）
+
+phase span 的内部状态（phase_started/activity/finished/error/cancelled）是**运行时
+观测概念**，只在 ``build_turn_event_envelope`` 这个边界翻译成 wire 的 activity_* 词表 +
+``activity.outcome``——运行时代码不需要知道 wire 词表（消除 v1 里 ``phase.status ==
+event_type`` 的冗余）。
 """
 
 from __future__ import annotations
@@ -17,15 +30,36 @@ from agent.env import env_bool as _env_bool, env_int as _env_int
 from agent.redact import redact as _redact_secrets
 
 
-SCHEMA_VERSION = "voice-orchestrator.v1"
-DEFAULT_MAX_MESSAGE_PREVIEWS = 4
+SCHEMA_VERSION = "voice-orchestrator.v2"
 DEFAULT_MAX_MESSAGE_CHARS = 800
-DEFAULT_MAX_TOOL_RESULT_CHARS = 1200
+DEFAULT_MAX_ACTIVITY_RESULT_CHARS = 200
 
 _ABS_PATH_RE = re.compile(r"(?<!\w)(?:/Users/[^\s'\"]+|/var/[^\s'\"]+|/tmp/[^\s'\"]+|[A-Za-z]:\\[^\s'\"]+)")
 _ENV_RE = re.compile(r"(?i)(?:^|[\s/])\.env(?:\b|[._-])")
 _TRACE_RE = re.compile(r"(?is)Traceback \(most recent call last\):.*")
 _LONG_ID_RE = re.compile(r"\b[a-f0-9]{32,}\b", re.IGNORECASE)
+
+# phase span 内部状态 → v2 wire event_type（出口翻译，运行时不感知 wire 词表）
+_PHASE_STATUS_TO_EVENT = {
+    "phase_started": "activity_started",
+    "phase_activity": "activity_progress",
+    "phase_finished": "activity_finished",
+    "phase_error": "activity_finished",
+    "phase_cancelled": "activity_finished",
+}
+# 仅 *_finished 类事件带 outcome
+_PHASE_STATUS_TO_OUTCOME = {
+    "phase_finished": "ok",
+    "phase_error": "error",
+    "phase_cancelled": "cancelled",
+}
+# phase span 名 → v2 activity.kind（归一动词）
+_PHASE_NAME_TO_KIND = {
+    "assistant_generating_text": "generating_text",
+    "assistant_generating_tool_arguments": "generating_args",
+    "tool_executing": "tool",
+    "child_agent_running": "child_agent",
+}
 
 
 @dataclass
@@ -39,20 +73,12 @@ class TextPreview:
 
 
 @dataclass
-class ToolPreview:
-    """工具执行结果的安全预览，不包含原始参数和完整输出。"""
-
-    name: str = ""
-    status: str = ""
-    duration_ms: Optional[int] = None
-    result_head: TextPreview = field(default_factory=TextPreview)
-    result_tail: TextPreview = field(default_factory=TextPreview)
-    result_truncated: bool = False
-
-
-@dataclass
 class PhasePreview:
-    """Runtime 当前阶段的 span 预览，用于告诉外部服务 host 正在做什么。"""
+    """Runtime 当前阶段的 span 预览（listener 内部载荷）。
+
+    这是**运行时观测**结构，由 ``PhaseSpan.preview`` 构造，喂给
+    ``build_turn_event_envelope`` 在边界翻译成 v2 activity。不直接外发。
+    """
 
     name: str = ""
     status: str = ""
@@ -63,18 +89,17 @@ class PhasePreview:
 
 @dataclass
 class TurnEventEnvelope:
-    """发给 Voice Orchestrator 的最外层事件包。"""
+    """发给 Voice Orchestrator 的最外层事件包（v2 扁平形状）。"""
 
     schema_version: str
     session_id: str
     turn_id: str
     event_type: str
     timestamp: float
-    context: dict[str, Any] = field(default_factory=dict)
-    assistant_activity: dict[str, Any] = field(default_factory=dict)
-    tool: Optional[dict[str, Any]] = None
-    phase: Optional[dict[str, Any]] = None
-    safety: dict[str, Any] = field(default_factory=dict)
+    user_goal: str = ""
+    activity: Optional[dict[str, Any]] = None
+    assistant_text: str = ""
+    redacted: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """把 dataclass 递归转成普通 dict，供 HTTP client JSON 序列化。"""
@@ -89,88 +114,85 @@ def build_turn_event_envelope(
     turn_id: str,
     messages: list[dict[str, Any]],
     assistant_text: str = "",
-    reasoning_activity: str = "",
-    next_tool_name: str = "",
-    tool: Optional[ToolPreview | dict[str, Any]] = None,
     phase: Optional[PhasePreview | dict[str, Any]] = None,
     timestamp: Optional[float] = None,
-    send_message_preview: Optional[bool] = None,
 ) -> TurnEventEnvelope:
-    """构造一次可外发的语音编排事件。
+    """构造一次可外发的语音编排事件（v2）。
 
-    这里是 v27.1 的安全边界：host 只发送“事实预览”，不在本仓库决定
-    是否播报、播几次、怎么说。外发内容会经过截断、脱敏和字段白名单处理，
-    明确不发送 system prompt、原始工具参数、完整工具输出、文件内容和 CoT。
+    安全边界不变：host 只发送“事实预览”，经过截断、脱敏和字段白名单，明确不发送
+    system prompt、原始工具参数、完整工具输出、文件内容和 CoT。
+
+    - 有 ``phase`` → activity 事件：event_type / activity 由 phase 翻译得到。
+    - 无 ``phase`` → 手写 turn 事件：event_type 直接用传入值（turn_started/finished）。
     """
 
-    max_previews = _env_int("VOICE_ORCHESTRATOR_MAX_MESSAGE_PREVIEWS", DEFAULT_MAX_MESSAGE_PREVIEWS)
     max_message_chars = _env_int("VOICE_ORCHESTRATOR_MAX_MESSAGE_CHARS", DEFAULT_MAX_MESSAGE_CHARS)
-    send_messages = _env_bool("VOICE_ORCHESTRATOR_SEND_MESSAGE_PREVIEW", True) if send_message_preview is None else send_message_preview
 
-    # last_user_message_preview 总是保留，方便外部服务知道本轮用户目标。
-    last_user = _last_role_content(messages, "user")
-    user_preview = preview_text(last_user, max_chars=max_message_chars)
-    recent_previews: list[dict[str, Any]] = []
-    redactions = user_preview.redacted
-    truncations = user_preview.truncated
+    # user_goal：本轮用户目标，生成播报措辞的核心话题。仅一次 last-user 反查 + 一次
+    # redact，远轻于 v1 的 recent_messages 全量遍历——可挂在高频 activity_progress 上。
+    goal_preview = preview_text(_last_role_content(messages, "user"), max_chars=max_message_chars)
+    redacted = goal_preview.redacted or goal_preview.truncated
 
-    # recent_messages 是可配置的短窗口；system 消息会在 _recent_messages 里排除。
-    if send_messages:
-        for msg in _recent_messages(messages, max_previews):
-            role = str(msg.get("role") or "")[:32]
-            content = _message_content_preview(msg)
-            p = preview_text(content, max_chars=max_message_chars)
-            redactions = redactions or p.redacted
-            truncations = truncations or p.truncated
-            recent_previews.append({"role": role, "preview": asdict(p)})
-
-    assistant_preview = preview_text(assistant_text, max_chars=max_message_chars)
-    redactions = redactions or assistant_preview.redacted
-    truncations = truncations or assistant_preview.truncated
-
-    tool_dict = _coerce_dataclass_dict(tool)
+    final_event_type = event_type
+    activity: Optional[dict[str, Any]] = None
     phase_dict = _coerce_dataclass_dict(phase)
-    if tool_dict:
-        # 工具预览本身可能带嵌套 TextPreview；把其中的安全标记折叠到 envelope 顶层。
-        safety_ref = {"redactions": redactions, "truncations": truncations}
-        _fold_safety(tool_dict, safety_ref)
-        redactions = safety_ref["redactions"]
-        truncations = safety_ref["truncations"]
-    if phase_dict:
-        # phase activity 只允许简单值；字符串统一做短标签化，避免把大段内容塞出去。
-        phase_dict["activity"] = _safe_activity_dict(phase_dict.get("activity") or {})
+    if phase_dict is not None:
+        final_event_type, activity, act_redacted = _build_activity(phase_dict)
+        redacted = redacted or act_redacted
+
+    assistant_out = ""
+    if assistant_text:
+        ap = preview_text(assistant_text, max_chars=max_message_chars)
+        assistant_out = ap.text
+        redacted = redacted or ap.redacted or ap.truncated
 
     return TurnEventEnvelope(
         schema_version=SCHEMA_VERSION,
         session_id=_safe_identifier(session_id),
         turn_id=_safe_identifier(turn_id),
-        event_type=_safe_identifier(event_type),
+        event_type=_safe_identifier(final_event_type),
         timestamp=time.time() if timestamp is None else float(timestamp),
-        context={
-            "last_user_message_preview": asdict(user_preview),
-            "recent_messages": recent_previews,
-        },
-        assistant_activity={
-            "visible_text_preview": asdict(assistant_preview),
-            "reasoning_safe_summary": _safe_activity_label(reasoning_activity),
-            "next_tool_name": _safe_identifier(next_tool_name),
-        },
-        tool=tool_dict,
-        phase=phase_dict,
-        safety={
-            "message_preview_enabled": send_messages,
-            "redacted": redactions,
-            "truncated": truncations,
-            "omitted": [
-                "system_prompt",
-                "raw_tool_args",
-                "raw_tool_output",
-                "file_contents",
-                "child_agent_transcripts",
-                "raw_chain_of_thought",
-            ],
-        },
+        user_goal=goal_preview.text,
+        activity=activity,
+        assistant_text=assistant_out,
+        redacted=redacted,
     )
+
+
+def _build_activity(phase_dict: dict[str, Any]) -> tuple[str, dict[str, Any], bool]:
+    """把内部 phase 预览翻译成 v2 (event_type, activity, redacted)。"""
+
+    status = str(phase_dict.get("status") or "")
+    event_type = _PHASE_STATUS_TO_EVENT.get(status, "activity_progress")
+
+    raw = dict(phase_dict.get("activity") or {})
+    activity: dict[str, Any] = {
+        "kind": _PHASE_NAME_TO_KIND.get(str(phase_dict.get("name") or ""), _safe_identifier(phase_dict.get("name"))),
+        "name": _safe_identifier(raw.pop("tool_name", "") or ""),
+        "elapsed_ms": phase_dict.get("elapsed_ms"),
+        "span_id": _safe_identifier(phase_dict.get("span_id") or ""),
+    }
+    redacted = False
+
+    outcome = _PHASE_STATUS_TO_OUTCOME.get(status)
+    if outcome is not None:
+        # 应用层错误（如 memory 工具返回 {"error":...}）span 仍是正常 finish，
+        # 用 result_kind 把这种错误冒到 outcome，保留可观测性。
+        if outcome == "ok" and raw.get("result_kind") == "error":
+            outcome = "error"
+        activity["outcome"] = outcome
+
+    # result 只在工具完成时携带，且受 SEND_TOOL_PREVIEW 开关与 ≤200 字上限约束。
+    if "result" in raw:
+        raw_result = raw.pop("result")
+        if _env_bool("VOICE_ORCHESTRATOR_SEND_TOOL_PREVIEW", True):
+            rp = preview_text(raw_result, max_chars=_env_int("VOICE_ORCHESTRATOR_MAX_ACTIVITY_RESULT_CHARS", DEFAULT_MAX_ACTIVITY_RESULT_CHARS))
+            activity["result"] = rp.text
+            redacted = redacted or rp.redacted or rp.truncated
+
+    # 其余安全元信息（delta_chars/total_chars/completed_count/... 及 result_kind）折进 activity。
+    activity.update(_safe_activity_dict(raw))
+    return event_type, activity, redacted
 
 
 def preview_text(value: Any, *, max_chars: int) -> TextPreview:
@@ -190,39 +212,6 @@ def preview_text(value: Any, *, max_chars: int) -> TextPreview:
     return TextPreview(text=text, chars=original_len, truncated=truncated, redacted=redacted)
 
 
-def preview_tool_result(name: str, status: str, result: Any, *, duration_ms: Optional[int] = None) -> ToolPreview:
-    """生成工具结果预览。
-
-    工具输出可能很长或包含隐私信息，所以只取 head/tail 两段，并分别走
-    ``preview_text``。是否携带工具输出预览由 ``VOICE_ORCHESTRATOR_SEND_TOOL_PREVIEW`` 控制。
-    """
-
-    max_chars = _env_int("VOICE_ORCHESTRATOR_MAX_TOOL_RESULT_CHARS", DEFAULT_MAX_TOOL_RESULT_CHARS)
-    send_tool_preview = _env_bool("VOICE_ORCHESTRATOR_SEND_TOOL_PREVIEW", True)
-    raw = "" if result is None or not send_tool_preview else str(result)
-    truncated = len(raw) > max_chars
-    if not truncated:
-        # 整段放得下就只放 head，不再切 tail —— 否则 raw[:half] 和 raw[-half:]
-        # 会重叠，把中段内容外发两遍（v27.1 review #6）。
-        head = preview_text(raw, max_chars=max_chars)
-        tail = preview_text("", max_chars=max_chars)
-    else:
-        # 真截断时才 head/tail 分头取，丢中段。head_len + tail_len == max_chars
-        # < len(raw)，两段保证不重叠。
-        head_len = max(0, max_chars // 2)
-        tail_len = max_chars - head_len
-        head = preview_text(raw[:head_len], max_chars=head_len)
-        tail = preview_text(raw[-tail_len:] if tail_len else "", max_chars=tail_len)
-    return ToolPreview(
-        name=_safe_identifier(name),
-        status=_safe_identifier(status),
-        duration_ms=duration_ms,
-        result_head=head,
-        result_tail=tail,
-        result_truncated=truncated,
-    )
-
-
 def redact_text(text: str) -> tuple[str, bool]:
     """对文本做保守脱敏，返回脱敏后的文本和是否发生过替换。
 
@@ -232,9 +221,8 @@ def redact_text(text: str) -> tuple[str, bool]:
     脱敏：traceback / 绝对路径 / .env / 长 hex id。
     """
 
-    redacted = False
     secret_safe = _redact_secrets(text)
-    redacted = redacted or (secret_safe != text)
+    redacted = secret_safe != text
     text = secret_safe
     for pattern, replacement in (
         (_TRACE_RE, "[redacted-traceback]"),
@@ -245,19 +233,6 @@ def redact_text(text: str) -> tuple[str, bool]:
         text, n = pattern.subn(replacement, text)
         redacted = redacted or bool(n)
     return text, redacted
-
-
-def _recent_messages(messages: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
-    """取最近的非 system 消息，避免把系统提示词发给外部语音服务。
-
-    ``limit <= 0`` 显式返回空列表 —— 否则 ``candidates[-0:]`` 会退化成
-    ``candidates[0:]`` 把整段对话全部外发（v27.1 review #3）。
-    """
-
-    if limit <= 0:
-        return []
-    candidates = [m for m in messages if m.get("role") != "system"]
-    return candidates[-limit:]
 
 
 def _last_role_content(messages: list[dict[str, Any]], role: str) -> str:
@@ -288,21 +263,6 @@ def _coerce_dataclass_dict(value: Any) -> Optional[dict[str, Any]]:
     if isinstance(value, dict):
         return dict(value)
     return None
-
-
-def _fold_safety(value: Any, ref: dict[str, bool]) -> None:
-    """递归收集嵌套预览里的 redacted/truncated 标记。"""
-
-    if isinstance(value, dict):
-        if "redacted" in value:
-            ref["redactions"] = ref["redactions"] or bool(value["redacted"])
-        if "truncated" in value or "result_truncated" in value:
-            ref["truncations"] = ref["truncations"] or bool(value.get("truncated") or value.get("result_truncated"))
-        for child in value.values():
-            _fold_safety(child, ref)
-    elif isinstance(value, list):
-        for child in value:
-            _fold_safety(child, ref)
 
 
 def _safe_activity_dict(value: dict[str, Any]) -> dict[str, Any]:
