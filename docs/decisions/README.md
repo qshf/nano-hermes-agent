@@ -39,5 +39,6 @@
 | v26.5 | 事件驱动语音进度服务实验废弃（功能可跑但策略硬编码 / 多点插入 / 横切逻辑污染主流程；后续改走 EventBus + listener + policy 外置） | [v26.5.md](./v26.5.md) |
 | v27.0 | LLM ProgressSupervisor MVP 废弃实验（事件化方向正确 / 宿主侧策略仍耦合 / 主线切 v27.1） | [v27.0.md](./v27.0.md) |
 | v27.1 | 外部 Voice Orchestrator（主智能体零语音工具调用 / bounded envelope + phase lease / host 只发送事实） | [v27.1.md](./v27.1.md) |
+| v27.2 | 多服务焦点轮播 nano 侧（FR-3 假搜索服务 mini-agent / FR-4 `NANO_MCP_SERVERS` 挂 MCP / 控制流走 MCP·观测流服务自报） | [v27.2.md](./v27.2.md) |
 
 > 注：V8 的决策记录散落在对应的 commit message 与 [docs/Memory-system/](../Memory-system/) 子目录下，未来如有补录需求再回填本目录。V15 主决策（5 阶段压缩流水线）当时未单独建档，本目录从 v15.1 开始接力补完。

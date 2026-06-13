@@ -279,6 +279,42 @@ def _print_banner(svc: "AgentServices", resumed_note: str) -> None:
     print()
 
 
+def connect_mcp_servers(log: Any) -> None:
+    """V27.2 (FR-4): 启动期挂载外部 MCP 服务（按需，env 门控）。
+
+    控制平面与观测平面正交（见 docs/voice-system/multi-service-focus-rotation-plan）：
+    nano 通过 ``mcp_manager.connect`` 把外部 agent 服务当工具调（阻塞请求/响应），
+    服务内部进度由它**自己** POST 给 voice orchestrator —— nano 不转发子细节，契合
+    v27.1 非目标第 3 条「父进程只发 aggregate child phase」。
+
+    env ``NANO_MCP_SERVERS`` 形如 ``search=python:/abs/fake_search_service.py``，
+    分号隔多条；``connect`` 后 registry 自动注册 ``mcp_<name>_<tool>``，主 agent 可调。
+    连接失败只 warning 不掀翻启动（外部服务是可选增强，不该阻断主 agent）。
+    """
+    raw = os.environ.get("NANO_MCP_SERVERS", "").strip()
+    if not raw:
+        return
+    from tools.mcp_client import mcp_manager
+
+    for spec in raw.split(";"):
+        spec = spec.strip()
+        if not spec or "=" not in spec:
+            continue
+        name, rhs = spec.split("=", 1)
+        name, rhs = name.strip(), rhs.strip()
+        command, _, arg = rhs.partition(":")
+        command, arg = command.strip(), arg.strip()
+        if not (name and command and arg):
+            log.warning("skip malformed NANO_MCP_SERVERS entry: %r", spec)
+            continue
+        try:
+            mcp_manager.connect(name, command, [arg])
+            log.info("mcp connected: %s (%s %s) → tools=%s",
+                     name, command, arg, mcp_manager.get_tools(name))
+        except Exception as exc:  # noqa: BLE001 - 外部服务可选，连不上不阻断启动
+            log.warning("mcp connect failed for %s: %s: %s", name, type(exc).__name__, exc)
+
+
 def bootstrap_services() -> AgentServices:
     """组装运行期全部"建好不再换"的对象,返回 ``AgentServices``。
 
@@ -328,6 +364,10 @@ def bootstrap_services() -> AgentServices:
 
     skill_loader, prompt_builder = build_prompt_stack(memory_manager)
     builtin_provider = memory_manager.get_provider("builtin")
+
+    # V27.2 (FR-4): 挂外部 MCP 服务（env 门控）。放在 registry/runtime 就位后、
+    # prompt/banner 之前 —— 注册进 registry 的工具能进 available tools banner。
+    connect_mcp_servers(log)
     compressor = ContextCompressor()
     session_store = SessionStore()
 
