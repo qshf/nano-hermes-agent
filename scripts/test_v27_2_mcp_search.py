@@ -70,6 +70,37 @@ def test_4_bootstrap_helper_parses_env_spec():
     assert set(mcp_manager.connected_servers) == before
 
 
+def test_5_emit_self_reports_subordinate_role():
+    """V27.4 (A)：观测流 _emit 的 body 自报 producer_role=subordinate。
+
+    导入 fake_search_service 模块、截获 urlopen 拿到 POST body，验证字段就位 ——
+    这是 FocusRouter 认「插入流不抢焦点/不收尾」的信号源头。
+    """
+    import importlib
+    import urllib.request
+
+    fss = importlib.import_module("fake_search_service")
+    captured: dict = {}
+
+    class _FakeResp:
+        def read(self, *_a):
+            return b""
+
+    def _fake_urlopen(req, timeout=0):  # noqa: ARG001
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResp()
+
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen
+    try:
+        fss._emit("activity_started", turn_id="t", user_goal="x")
+    finally:
+        urllib.request.urlopen = orig
+    assert captured["body"]["producer_role"] == "subordinate", (
+        f"_emit 应自报 subordinate，实得 {captured.get('body', {}).get('producer_role')!r}"
+    )
+
+
 def _teardown():
     if "search" in mcp_manager.connected_servers:
         mcp_manager.disconnect("search")
@@ -81,6 +112,7 @@ def main() -> None:
         test_2_call_tool_returns_structured_results,
         test_3_search_unaffected_by_unreachable_orchestrator,
         test_4_bootstrap_helper_parses_env_spec,
+        test_5_emit_self_reports_subordinate_role,
     ]
     failed = 0
     try:

@@ -6,8 +6,14 @@ Two orthogonal planes meet here (see docs multi-service-focus-rotation-plan):
   request/response. During those seconds nano sees no intermediate events.
 - **Observation plane**: while ``search`` runs an internal mini-agent loop
   (think → fetch → compose), each beat POSTs a flat v2 envelope straight
-  to the voice orchestrator under a stable ``session_id="svc-search"``. The
-  orchestrator's FocusRouter treats this id as one producer and narrates its arc.
+  to the voice orchestrator under a stable ``session_id="svc-search"``. Every
+  envelope carries ``producer_role="subordinate"`` — declaring "I am an inlaid
+  observation stream nested inside the main agent's blocking tool call, not a
+  peer turn competing for the speaker." The orchestrator's FocusRouter honors
+  this: subordinate streams never own focus, never enter the closing-candidate
+  pool (no redundant wrap-up line), and skip the idle gate (spoken immediately,
+  no ~30s head blackout). Absent the field, a producer defaults to ``"peer"``
+  (a genuinely parallel service like svc-writer keeps the old rotation semantics).
 
 The control plane does a real network fetch — ``curl wttr.in/<query>`` — so the
 returned text is genuine weather, not canned data. Swapping in another backend
@@ -51,6 +57,12 @@ def _emit(event_type: str, *, turn_id: str, user_goal: str = "", activity: dict 
             "timestamp": 0.0,
             "user_goal": user_goal,
             "activity": activity,
+            # V27.4 (A)：自报「我是插入观测流，不是平级的一轮」。主 agent 调 search
+            # 是一次阻塞工具调用，这些事件全嵌套在它那一轮之内 —— 不该被 FocusRouter
+            # 当成抢麦的平级 producer。orchestrator 认这个标记后：不抢焦点 owner、
+            # 不进 closing 候选（不补多余收尾）、不走 idle 闸（开头即时放行）。
+            # 缺省 / 不带 = "peer"（真·并行服务如 svc-writer 仍走老语义，向下兼容）。
+            "producer_role": "subordinate",
         },
         ensure_ascii=False,
     ).encode("utf-8")
