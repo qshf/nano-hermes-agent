@@ -33,6 +33,7 @@ from agent.redact import redact as _redact_secrets
 SCHEMA_VERSION = "voice-orchestrator.v2"
 DEFAULT_MAX_MESSAGE_CHARS = 800
 DEFAULT_MAX_ACTIVITY_RESULT_CHARS = 200
+DEFAULT_MAX_REASONING_HINT_CHARS = 200  # reasoning_content 只取摘要，不外发完整 CoT
 
 _ABS_PATH_RE = re.compile(r"(?<!\w)(?:/Users/[^\s'\"]+|/var/[^\s'\"]+|/tmp/[^\s'\"]+|[A-Za-z]:\\[^\s'\"]+)")
 _ENV_RE = re.compile(r"(?i)(?:^|[\s/])\.env(?:\b|[._-])")
@@ -100,6 +101,7 @@ class TurnEventEnvelope:
     activity: Optional[dict[str, Any]] = None
     assistant_text: str = ""
     redacted: bool = False
+    reasoning_hint: str = ""  # 最近一条 assistant 思考内容摘要（截断），辅助 orchestrator 生成更贴合的播报
 
     def to_dict(self) -> dict[str, Any]:
         """把 dataclass 递归转成普通 dict，供 HTTP client JSON 序列化。"""
@@ -119,7 +121,7 @@ def build_turn_event_envelope(
 ) -> TurnEventEnvelope:
     """构造一次可外发的语音编排事件（v2）。
 
-    安全边界不变：host 只发送“事实预览”，经过截断、脱敏和字段白名单，明确不发送
+    安全边界不变：host 只发送"事实预览"，经过截断、脱敏和字段白名单，明确不发送
     system prompt、原始工具参数、完整工具输出、文件内容和 CoT。
 
     - 有 ``phase`` → activity 事件：event_type / activity 由 phase 翻译得到。
@@ -127,11 +129,28 @@ def build_turn_event_envelope(
     """
 
     max_message_chars = _env_int("VOICE_ORCHESTRATOR_MAX_MESSAGE_CHARS", DEFAULT_MAX_MESSAGE_CHARS)
+    max_reasoning_chars = _env_int("VOICE_ORCHESTRATOR_MAX_REASONING_HINT_CHARS", DEFAULT_MAX_REASONING_HINT_CHARS)
 
     # user_goal：本轮用户目标，生成播报措辞的核心话题。仅一次 last-user 反查 + 一次
     # redact，远轻于 v1 的 recent_messages 全量遍历——可挂在高频 activity_progress 上。
     goal_preview = preview_text(_last_role_content(messages, "user"), max_chars=max_message_chars)
     redacted = goal_preview.redacted or goal_preview.truncated
+
+    # reasoning_hint：最近一条 assistant 消息的 reasoning_content 摘要（截断），
+    # 让 orchestrator LLM 知道 agent 在想什么，生成更贴合的播报句。只取前 N 字，
+    # 不外发完整 CoT（符合 v27.1 安全边界：不发 system prompt / 原始工具参数 / 完整 CoT）。
+    #
+    # turn_started 例外：本轮 agent 尚未思考，messages 里最后一条 assistant 的
+    # reasoning_content 必然是**上一轮**残留。带上它会让开场白 LLM 拿着"上一轮已完工"
+    # 的思路写"本轮刚开始"的开场，吐出"诗写完了/完美收工"这类幻觉（见 v27.3 调查）。
+    # 开场这一刻只有 user_goal 是可信事实，reasoning_hint 一律留空。
+    reasoning_hint = ""
+    if max_reasoning_chars > 0 and event_type != "turn_started":
+        raw_reasoning = _last_reasoning_content(messages)
+        if raw_reasoning:
+            rp = preview_text(raw_reasoning, max_chars=max_reasoning_chars)
+            reasoning_hint = rp.text
+            redacted = redacted or rp.redacted
 
     final_event_type = event_type
     activity: Optional[dict[str, Any]] = None
@@ -156,6 +175,7 @@ def build_turn_event_envelope(
         activity=activity,
         assistant_text=assistant_out,
         redacted=redacted,
+        reasoning_hint=reasoning_hint,
     )
 
 
@@ -241,6 +261,17 @@ def _last_role_content(messages: list[dict[str, Any]], role: str) -> str:
     for msg in reversed(messages):
         if msg.get("role") == role:
             return _message_content_preview(msg)
+    return ""
+
+
+def _last_reasoning_content(messages: list[dict[str, Any]]) -> str:
+    """从后往前找最近一条 assistant 消息的 reasoning_content。"""
+
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            rc = msg.get("reasoning_content")
+            if rc:
+                return str(rc)
     return ""
 
 

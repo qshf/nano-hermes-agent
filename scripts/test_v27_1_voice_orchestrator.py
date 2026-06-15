@@ -332,6 +332,30 @@ def test_16_progress_carries_user_goal_and_no_message_leak():
     assert "hi there" not in text                 # 历史 assistant 正文不外发
 
 
+def test_18_turn_started_omits_stale_reasoning_hint():
+    """开场白幻觉根因回归：turn_started 时本轮 agent 尚未思考，messages 里最后一条
+    assistant 的 reasoning_content 必是上一轮残留。带上它会让开场白 LLM 拿"上一轮已
+    完工"的思路写本轮开场，吐出"诗写完了/完美收工"幻觉（v27.3 调查）。turn_started
+    一律不带 reasoning_hint；turn_finished 仍正常携带本轮思路。"""
+    messages = [
+        {"role": "user", "content": "你好"},
+        {"role": "assistant", "content": "嗨", "reasoning_content": "上一轮：任务已完成，完美收工。"},
+        {"role": "user", "content": "写一首诗"},
+    ]
+    started = build_turn_event_envelope(
+        event_type="turn_started", session_id="s", turn_id="turn-2", messages=messages,
+    )
+    assert started.reasoning_hint == "", "turn_started 不得携带上一轮残留 reasoning"
+    assert started.user_goal == "写一首诗", "user_goal 仍取本轮 last-user"
+
+    messages.append({"role": "assistant", "content": "诗写好了", "reasoning_content": "本轮：写一首七言。"})
+    finished = build_turn_event_envelope(
+        event_type="turn_finished", session_id="s", turn_id="turn-2",
+        messages=messages, assistant_text="诗写好了",
+    )
+    assert finished.reasoning_hint == "本轮：写一首七言。", "turn_finished 应带本轮 reasoning"
+
+
 def test_17_shared_env_helpers_single_source():
     """review 折叠项：env 解析只有一份实现，两个 voice 模块都引用 agent.env。"""
     from agent import env as shared_env
@@ -369,6 +393,7 @@ def main() -> None:
         test_15_child_agent_scope_suppresses_tool_phase,
         test_16_progress_carries_user_goal_and_no_message_leak,
         test_17_shared_env_helpers_single_source,
+        test_18_turn_started_omits_stale_reasoning_hint,
     ]
     failed = 0
     for test in tests:
