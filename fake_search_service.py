@@ -5,14 +5,14 @@ Two orthogonal planes meet here (see docs multi-service-focus-rotation-plan):
   nano connects to it via mcp_manager and calls ``search`` — a *blocking*
   request/response. During those seconds nano sees no intermediate events.
 - **Observation plane**: while ``search`` runs an internal mini-agent loop
-  (think → retrieve ×2 → compose), each beat POSTs a flat v2 envelope straight
+  (think → fetch → compose), each beat POSTs a flat v2 envelope straight
   to the voice orchestrator under a stable ``session_id="svc-search"``. The
   orchestrator's FocusRouter treats this id as one producer and narrates its arc.
 
-No real search engine, no external API — the mini-agent just sleeps between
-beats. Swapping in a real agent means replacing ``_mini_agent``'s body; the
-envelope-emitting scaffold stays. ``_emit`` failures are swallowed: voice must
-never affect the search's actual job.
+The control plane does a real network fetch — ``curl wttr.in/<query>`` — so the
+returned text is genuine weather, not canned data. Swapping in another backend
+means replacing ``_mini_agent``'s fetch; the envelope-emitting scaffold stays.
+``_emit`` failures are swallowed: voice must never affect the search's job.
 
 Run standalone for a smoke test::
 
@@ -24,7 +24,7 @@ Copy this file with ``SESSION="svc-writer"`` + different beats for a 2nd produce
 
 import json
 import os
-import time
+import subprocess
 import urllib.request
 
 from mcp.server.fastmcp import FastMCP
@@ -63,46 +63,52 @@ def _emit(event_type: str, *, turn_id: str, user_goal: str = "", activity: dict 
         pass  # 语音失败绝不影响搜索本职
 
 
-def _mini_agent(query: str, tid: str) -> list[str]:
-    """Minimal agent loop: think → retrieve ×2 → compose, emitting per beat.
+def _mini_agent(query: str, tid: str) -> str:
+    """Real weather lookup via ``curl wttr.in``, narrating the arc per beat.
 
     kind→category in the orchestrator's activity_arc: thinking→CAT_THINK,
     tool/web_search→CAT_SEARCH, generating_text→CAT_COMPOSE — so the spoken arc
     follows 思考 → 联网检索 → 整理回复, audible end-to-end during integ.
+
+    The control plane is now a genuine network fetch (wttr.in), not a sleep; the
+    observation plane (``_emit``) is unchanged. A failed/slow fetch still emits
+    its beats and returns a readable error — voice never blocks the job.
     """
     _emit("activity_started", turn_id=tid, user_goal=query,
           activity={"kind": "thinking", "name": ""})
-    time.sleep(1.0)
 
-    hits: list[str] = []
-    for round_i in range(2):
-        _emit("activity_progress", turn_id=tid, user_goal=query,
-              activity={"kind": "tool", "name": "web_search", "completed_count": round_i})
-        time.sleep(1.5)
-        hits += [f"result-{round_i}-{j}" for j in range(3)]
+    _emit("activity_progress", turn_id=tid, user_goal=query,
+          activity={"kind": "tool", "name": "web_search", "completed_count": 0})
+    url = f"https://wttr.in/{query}?lang=zh&T"
+    try:
+        proc = subprocess.run(
+            ["curl", "-s", "--max-time", "10", url],
+            capture_output=True, text=True, timeout=15,
+        )
+        report = proc.stdout.strip() or f"(wttr.in 无返回, code={proc.returncode})"
+    except Exception as exc:  # noqa: BLE001 - 网络失败也要把话说完、把错带回
+        report = f"(天气查询失败: {type(exc).__name__}: {exc})"
 
     _emit("activity_started", turn_id=tid, user_goal=query,
           activity={"kind": "generating_text", "name": ""})  # 汇总
-    time.sleep(0.8)
-    return hits
+    return report
 
 
 @mcp.tool()
 def search(query: str) -> str:
-    """Fake search: run a mini-agent loop and return ranked results as JSON.
+    """Search by fetching real weather for ``query`` via wttr.in; return as JSON.
 
-    Blocks until the loop finishes (control plane). The voice arc is driven out
+    Blocks until the fetch finishes (control plane). The voice arc is driven out
     of band by ``_emit`` inside the loop (observation plane).
     """
     tid = f"search-{abs(hash(query)) % 100000}"
     _emit("turn_started", turn_id=tid, user_goal=query)
-    hits = _mini_agent(query, tid)
+    report = _mini_agent(query, tid)
     _emit("activity_finished", turn_id=tid, user_goal=query,
-          activity={"kind": "tool", "name": "web_search", "outcome": "ok",
-                    "completed_count": len(hits)})
+          activity={"kind": "tool", "name": "web_search", "outcome": "ok"})
     _emit("turn_finished", turn_id=tid, user_goal=query)
-    return json.dumps({"query": query, "results": hits}, ensure_ascii=False)
+    return json.dumps({"query": query, "report": report}, ensure_ascii=False)
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    mcp.run(transport="stdio") # /mcp connect stdio python fake_search_service.py
