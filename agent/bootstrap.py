@@ -349,6 +349,13 @@ def bootstrap_services() -> AgentServices:
 
     memory_manager = build_memory_manager()
 
+    # V27.2 (FR-4) / V27.4 (C): 挂外部 MCP 服务（env 门控）必须在算
+    # parent_full_toolset 快照**之前** —— 子 agent 的 _resolve_child_toolset 读的是
+    # 这份冻结快照（delegate_tool.py），connect 晚于快照会让 mcp_* 永远进不了子允许集
+    # （主 agent 读 registry 实时态，不受影响）。connect 只依赖 registry（line 347
+    # set_runtime 已先行）+ os.environ，此处依赖已齐备。
+    connect_mcp_servers(log)
+
     # delegate 注入:父全集 = registry 注册的 + memory 暴露的;黑名单由
     # _resolve_child_toolset 自己过滤。子与父共享 runtime（同一 cancel_token,
     # stream_enabled 动态读取,让 /stream on|off 同时影响父子）。
@@ -365,9 +372,6 @@ def bootstrap_services() -> AgentServices:
     skill_loader, prompt_builder = build_prompt_stack(memory_manager)
     builtin_provider = memory_manager.get_provider("builtin")
 
-    # V27.2 (FR-4): 挂外部 MCP 服务（env 门控）。放在 registry/runtime 就位后、
-    # prompt/banner 之前 —— 注册进 registry 的工具能进 available tools banner。
-    connect_mcp_servers(log)
     compressor = ContextCompressor()
     session_store = SessionStore()
 

@@ -45,14 +45,15 @@ def test_2_call_tool_returns_structured_results():
     payload = json.loads(raw)
     inner = json.loads(payload["output"])   # V21.4 协议：tool_result(output=...)
     assert inner["query"] == "焦点轮播测试"
-    assert isinstance(inner["results"], list) and len(inner["results"]) == 6
+    # V27.3：控制平面改真实 wttr.in 抓取，返回 {query, report}（report 为天气文本或错误串）
+    assert isinstance(inner["report"], str) and inner["report"]
 
 
 def test_3_search_unaffected_by_unreachable_orchestrator():
-    """观测流（_emit）连不上 orchestrator 时，搜索本职仍正常返回结果。"""
+    """观测流（_emit）连不上 orchestrator 时，搜索本职仍正常返回 report。"""
     raw = mcp_manager.call_tool("mcp_search_search", {"query": "断网也要能搜"})
     inner = json.loads(json.loads(raw)["output"])
-    assert len(inner["results"]) == 6   # _emit 静默失败，不影响返回
+    assert isinstance(inner["report"], str) and inner["report"]  # _emit 静默失败，不影响返回
 
 
 def test_4_bootstrap_helper_parses_env_spec():
