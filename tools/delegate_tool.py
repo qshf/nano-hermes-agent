@@ -121,11 +121,25 @@ class DelegateContext:
     runtime: AgentRuntime = field(
         default_factory=lambda: AgentRuntime(stream_enabled=False, cancel_token=None)
     )
+    # V27.4 (C)：父全集的**实时**数据源（读 registry + memory 当下注册态）。设了它，
+    # 子 agent 的允许集就跟着父实时变 —— 运行时 /mcp connect 新挂的工具子也能拿到。
+    # 不设（None）→ 回落冻结的 parent_toolset_names（V23.x 行为，~30 处测试不受影响）。
+    parent_toolset_provider: Optional[Callable[[], set[str]]] = None
 
     def __post_init__(self) -> None:
         # 容忍 list / tuple — 调用方常以列表形式构造，set 化让黑名单逻辑统一
         if not isinstance(self.parent_toolset_names, set):
             self.parent_toolset_names = set(self.parent_toolset_names)
+
+    def live_parent_toolset(self) -> set[str]:
+        """父全集：有 provider 走实时态，否则回落冻结快照。
+
+        冻结快照是 bootstrap 启动时算的 —— 运行时 /mcp connect 的工具进不去它，
+        于是子 agent 看不到。provider 直接问 registry 当下态，绕过这层时间差。
+        """
+        if self.parent_toolset_provider is not None:
+            return set(self.parent_toolset_provider())
+        return self.parent_toolset_names
 
 
 # ── 模块级注入上下文（main.py 启动时填）────────────────────────────────────
@@ -164,7 +178,7 @@ def _resolve_child_toolset(requested: Optional[list[str]] = None) -> set[str]:
     """
     if _delegate_context is None:
         return set()
-    parent_full = _delegate_context.parent_toolset_names
+    parent_full = _delegate_context.live_parent_toolset()
     if requested is None:
         candidates = parent_full
     else:

@@ -92,6 +92,41 @@ def test_4_blacklist_still_excludes_delegate_and_memory():
     assert "memory_recall" not in allowed, "memory_ 前缀必须仍被排除"
 
 
+def test_5_provider_reflects_runtime_connect():
+    """运行时 /mcp connect：provider 让子全集实时跟父，绕过冻结快照（真正的根因）。
+
+    复刻用户复现的场景 —— agent 跑起来后才连 MCP（工具名 mcp_stdio_*），
+    bootstrap 启动期的 parent_toolset_names 快照里没有它。没 provider → 子看不到；
+    有 provider → 子当场拿到。
+    """
+    live: set[str] = {"terminal", "skill_view"}  # 启动期快照（不含运行时工具）
+    set_delegate_context(DelegateContext(
+        chain=None,
+        model="test-model",
+        parent_toolset_names=set(live),            # 冻结快照
+        parent_toolset_provider=lambda: set(live),  # 实时数据源（指向同一 live）
+    ))
+    assert "mcp_stdio_search" not in _resolve_child_toolset(["mcp_stdio_search"]), (
+        "连接前：子不应看到尚未注册的工具"
+    )
+    live.add("mcp_stdio_search")  # 模拟运行时 /mcp connect 注册了新工具
+    allowed = _resolve_child_toolset(["mcp_stdio_search"])
+    assert "mcp_stdio_search" in allowed, (
+        "连接后：provider 让子 agent 实时看到运行时新挂的 MCP 工具（绕过冻结快照）"
+    )
+
+
+def test_6_no_provider_falls_back_to_frozen_snapshot():
+    """回归：不设 provider → 回落冻结快照（V23.x 行为，~30 处旧测试不受影响）。"""
+    set_delegate_context(DelegateContext(
+        chain=None,
+        model="test-model",
+        parent_toolset_names={"read_file"},  # 只有冻结快照，无 provider
+    ))
+    allowed = _resolve_child_toolset(None)
+    assert allowed == {"read_file"}, f"无 provider 应严格用冻结快照，实得 {allowed}"
+
+
 def _teardown():
     if "search" in mcp_manager.connected_servers:
         mcp_manager.disconnect("search")
@@ -103,6 +138,8 @@ def main() -> None:
         test_2_requested_whitelist_intersects_mcp_tool,
         test_3_connect_before_snapshot_lets_child_see_mcp,
         test_4_blacklist_still_excludes_delegate_and_memory,
+        test_5_provider_reflects_runtime_connect,
+        test_6_no_provider_falls_back_to_frozen_snapshot,
     ]
     failed = 0
     try:

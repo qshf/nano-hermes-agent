@@ -359,14 +359,21 @@ def bootstrap_services() -> AgentServices:
     # delegate 注入:父全集 = registry 注册的 + memory 暴露的;黑名单由
     # _resolve_child_toolset 自己过滤。子与父共享 runtime（同一 cancel_token,
     # stream_enabled 动态读取,让 /stream on|off 同时影响父子）。
-    parent_full_toolset = sorted(
-        set(registry.tool_names) | set(memory_manager.get_all_tool_names())
-    )
+    #
+    # V27.4 (C)：parent_toolset_provider 让子全集跟父**实时**走 —— 运行时
+    # /mcp connect 新挂的工具（如 mcp_stdio_*）当场就进子允许集，不被 bootstrap
+    # 启动期的冻结快照卡住。parent_toolset_names 仍传（provider 为 None 时的回落，
+    # 也供 /status 等只读旁路）。
+    def _live_parent_toolset() -> set[str]:
+        return set(registry.tool_names) | set(memory_manager.get_all_tool_names())
+
+    parent_full_toolset = sorted(_live_parent_toolset())
     _inject_delegate_context(DelegateContext(
         chain=chain,
         model=model,
         parent_toolset_names=set(parent_full_toolset),
         runtime=runtime,
+        parent_toolset_provider=_live_parent_toolset,
     ))
 
     skill_loader, prompt_builder = build_prompt_stack(memory_manager)
