@@ -41,6 +41,41 @@ ORCH = os.environ.get("VOICE_ORCHESTRATOR_URL", "http://127.0.0.1:8766/v1/turn-e
 EMIT_TIMEOUT = float(os.environ.get("VOICE_ORCHESTRATOR_TIMEOUT_SECONDS", "0.5"))
 SESSION = "svc-search"  # 独占稳定的 producer 身份（焦点按它区分服务）
 
+# query 参数契约：只接受裸地名（中文 / 英文），不接受带任何修饰词或无意义参数。
+# 这些词若出现，说明调用方把意图（"查天气"）塞进了 query —— wttr.in 已默认查天气，
+# 地名后面再带 weather / 天气 只会让 URL 变成 wttr.in/Shenzhen%20weather 抓错。
+_NOISE_WORDS_EN = {"weather", "forecast", "temperature", "temp", "climate", "report", "today", "tomorrow"}
+_NOISE_SUBSTR_CJK = ("天气", "气温", "气候", "预报", "温度", "天氣", "氣溫")
+_MAX_WORDS = 4  # "Los Angeles" / "New York City" 合法；再多基本是塞了废话
+
+
+def _validate_query(query: str) -> str | None:
+    """裸地名校验：合格返回 None，不合格返回一句中文 error 说明。
+
+    规则（在发起网络抓取之前跑）：
+    1. 去空白后非空；
+    2. 只含 Unicode 字母 + 空格 + 连字符 + 撇号（拒 JSON 的 ``{}":,`` 与花括号噪声）；
+    3. 不含数字；
+    4. 不含「天气 / weather」一类意图修饰词（CJK 子串 + 英文整词两路判）；
+    5. 词数 <= 4（再多疑似塞了无意义参数）。
+    """
+    q = query.strip()
+    if not q:
+        return "query 不能为空，应为地名，如 'Shenzhen' 或 '广东'"
+    for ch in q:
+        if ch.isalpha() or ch in " -'":
+            continue
+        return f"query 只能是中英文地名（字母/空格/连字符），含非法字符 {ch!r}：{query!r}"
+    # 上一步已挡掉数字（数字非 isalpha 且不在白名单），此处无需再查 isdigit。
+    if any(sub in q for sub in _NOISE_SUBSTR_CJK):
+        return f"query 应只含地名，去掉天气/预报等修饰词：{query!r}"
+    words = q.split()
+    if any(w.lower() in _NOISE_WORDS_EN for w in words):
+        return f"query 应只含地名，去掉 weather/forecast 等修饰词：{query!r}"
+    if len(words) > _MAX_WORDS:
+        return f"query 词数过多（>{_MAX_WORDS}），应为单个地名：{query!r}"
+    return None
+
 
 def _emit(event_type: str, *, turn_id: str, user_goal: str = "", activity: dict | None = None) -> None:
     """POST one voice-orchestrator.v2 flat envelope; never raise.
@@ -110,9 +145,17 @@ def _mini_agent(query: str, tid: str) -> str:
 def search(query: str) -> str:
     """Search by fetching real weather for ``query`` via wttr.in; return as JSON.
 
+    ``query`` MUST be a bare place name in Chinese or English ('New York',
+    '广东', 'Shenzhen') — no intent modifiers ('weather', '天气'), no JSON, no
+    digits. An invalid query short-circuits to ``{"query", "error"}`` *before*
+    any network fetch or voice event, so the caller learns the contract fast.
+
     Blocks until the fetch finishes (control plane). The voice arc is driven out
     of band by ``_emit`` inside the loop (observation plane).
     """
+    err = _validate_query(query)
+    if err is not None:
+        return json.dumps({"query": query, "error": err}, ensure_ascii=False)
     tid = f"search-{abs(hash(query)) % 100000}"
     _emit("turn_started", turn_id=tid, user_goal=query)
     report = _mini_agent(query, tid)
