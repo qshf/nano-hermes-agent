@@ -6,7 +6,10 @@ Two orthogonal planes meet here (see docs multi-service-focus-rotation-plan):
   request/response. During those seconds nano sees no intermediate events.
 - **Observation plane**: while ``search`` runs an internal mini-agent loop
   (think → fetch → compose), each beat POSTs a flat v2 envelope straight
-  to the voice orchestrator under a stable ``session_id="svc-search"``. Every
+  to the voice orchestrator. Each call derives a **per-query** ``session_id``
+  (``f"svc-search-{qid}"``) so two concurrent ``search`` calls present as two
+  distinct subordinate streams — letting the orchestrator's FocusRouter rotate
+  focus between them instead of collapsing both into one identity (N3). Every
   envelope carries ``producer_role="subordinate"`` — declaring "I am an inlaid
   observation stream nested inside the main agent's blocking tool call, not a
   peer turn competing for the speaker." The orchestrator's FocusRouter honors
@@ -25,12 +28,13 @@ Run standalone for a smoke test::
     VOICE_ORCHESTRATOR_URL=http://127.0.0.1:8766/v1/turn-events python fake_search_service.py
 
 In integration nano launches it as an MCP subprocess (see agent/bootstrap.py).
-Copy this file with ``SESSION="svc-writer"`` + different beats for a 2nd producer.
+Copy this file with a different ``SESSION_PREFIX`` + beats for a 2nd producer.
 """
 
 import json
 import os
 import subprocess
+import time
 import urllib.request
 
 from mcp.server.fastmcp import FastMCP
@@ -39,7 +43,10 @@ mcp = FastMCP("search")
 
 ORCH = os.environ.get("VOICE_ORCHESTRATOR_URL", "http://127.0.0.1:8766/v1/turn-events")
 EMIT_TIMEOUT = float(os.environ.get("VOICE_ORCHESTRATOR_TIMEOUT_SECONDS", "0.5"))
-SESSION = "svc-search"  # 独占稳定的 producer 身份（焦点按它区分服务）
+# N3 修复：身份不再是单一常量。每次 search 调用按 query 派生独立 session_id
+# （``f"{SESSION_PREFIX}-{qid}"``），并发的两次查询 = 两条独立的 subordinate 流，
+# FocusRouter 才能在它们之间轮播焦点，而非塌缩成同一身份互相串台。
+SESSION_PREFIX = "svc-search"
 
 # query 参数契约：只接受裸地名（中文 / 英文），不接受带任何修饰词或无意义参数。
 # 这些词若出现，说明调用方把意图（"查天气"）塞进了 query —— wttr.in 已默认查天气，
@@ -77,19 +84,22 @@ def _validate_query(query: str) -> str | None:
     return None
 
 
-def _emit(event_type: str, *, turn_id: str, user_goal: str = "", activity: dict | None = None) -> None:
+def _emit(event_type: str, *, session_id: str, turn_id: str, user_goal: str = "", activity: dict | None = None) -> None:
     """POST one voice-orchestrator.v2 flat envelope; never raise.
 
     The observation plane is best-effort: a slow/absent orchestrator, a timeout,
     or a connection refusal must not slow down or fail the actual search.
+
+    ``session_id`` is per-query (caller passes ``f"{SESSION_PREFIX}-{qid}"``) so
+    concurrent searches are distinct subordinate streams (N3).
     """
     body = json.dumps(
         {
             "schema_version": "voice-orchestrator.v2",
-            "session_id": SESSION,
+            "session_id": session_id,
             "turn_id": turn_id,
             "event_type": event_type,
-            "timestamp": 0.0,
+            "timestamp": time.time(),  # producer 墙钟；审计可读，但跨 producer 排序仍以 orchestrator 的 logged_at 为权威
             "user_goal": user_goal,
             "activity": activity,
             # V27.4 (A)：自报「我是插入观测流，不是平级的一轮」。主 agent 调 search
@@ -110,7 +120,7 @@ def _emit(event_type: str, *, turn_id: str, user_goal: str = "", activity: dict 
         pass  # 语音失败绝不影响搜索本职
 
 
-def _mini_agent(query: str, tid: str) -> str:
+def _mini_agent(query: str, sid: str, tid: str) -> str:
     """Real weather lookup via ``curl wttr.in``, narrating the arc per beat.
 
     kind→category in the orchestrator's activity_arc: thinking→CAT_THINK,
@@ -121,10 +131,10 @@ def _mini_agent(query: str, tid: str) -> str:
     observation plane (``_emit``) is unchanged. A failed/slow fetch still emits
     its beats and returns a readable error — voice never blocks the job.
     """
-    _emit("activity_started", turn_id=tid, user_goal=query,
+    _emit("activity_started", session_id=sid, turn_id=tid, user_goal=query,
           activity={"kind": "thinking", "name": ""})
 
-    _emit("activity_progress", turn_id=tid, user_goal=query,
+    _emit("activity_progress", session_id=sid, turn_id=tid, user_goal=query,
           activity={"kind": "tool", "name": "web_search", "completed_count": 0})
     url = f"https://wttr.in/{query}?lang=zh&T"
     try:
@@ -136,7 +146,7 @@ def _mini_agent(query: str, tid: str) -> str:
     except Exception as exc:  # noqa: BLE001 - 网络失败也要把话说完、把错带回
         report = f"(天气查询失败: {type(exc).__name__}: {exc})"
 
-    _emit("activity_started", turn_id=tid, user_goal=query,
+    _emit("activity_started", session_id=sid, turn_id=tid, user_goal=query,
           activity={"kind": "generating_text", "name": ""})  # 汇总
     return report
 
@@ -156,12 +166,15 @@ def search(query: str) -> str:
     err = _validate_query(query)
     if err is not None:
         return json.dumps({"query": query, "error": err}, ensure_ascii=False)
-    tid = f"search-{abs(hash(query)) % 100000}"
-    _emit("turn_started", turn_id=tid, user_goal=query)
-    report = _mini_agent(query, tid)
-    _emit("activity_finished", turn_id=tid, user_goal=query,
+    # 每查询一个身份：qid 同时驱动 session_id 与 turn_id，并发调用互不串台（N3）。
+    qid = abs(hash(query)) % 100000
+    sid = f"{SESSION_PREFIX}-{qid}"
+    tid = f"search-{qid}"
+    _emit("turn_started", session_id=sid, turn_id=tid, user_goal=query)
+    report = _mini_agent(query, sid, tid)
+    _emit("activity_finished", session_id=sid, turn_id=tid, user_goal=query,
           activity={"kind": "tool", "name": "web_search", "outcome": "ok"})
-    _emit("turn_finished", turn_id=tid, user_goal=query)
+    _emit("turn_finished", session_id=sid, turn_id=tid, user_goal=query)
     return json.dumps({"query": query, "report": report}, ensure_ascii=False)
 
 

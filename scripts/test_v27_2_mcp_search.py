@@ -93,11 +93,64 @@ def test_5_emit_self_reports_subordinate_role():
     orig = urllib.request.urlopen
     urllib.request.urlopen = _fake_urlopen
     try:
-        fss._emit("activity_started", turn_id="t", user_goal="x")
+        fss._emit("activity_started", session_id="svc-search-42", turn_id="t", user_goal="x")
     finally:
         urllib.request.urlopen = orig
     assert captured["body"]["producer_role"] == "subordinate", (
         f"_emit 应自报 subordinate，实得 {captured.get('body', {}).get('producer_role')!r}"
+    )
+    # N3：session_id 不再是常量，由调用方按 query 派生，envelope 原样带出。
+    assert captured["body"]["session_id"] == "svc-search-42", (
+        f"_emit 应原样带出传入的 per-query session_id，实得 {captured['body'].get('session_id')!r}"
+    )
+    # timestamp 不再恒为 0.0（producer 自填真实墙钟，审计字段可信）。
+    assert captured["body"]["timestamp"] > 0, (
+        f"_emit 应填真实 timestamp，实得 {captured['body'].get('timestamp')!r}"
+    )
+
+
+def test_6_concurrent_queries_get_distinct_session_ids():
+    """N3：两个不同 query 派生互不相同的 session_id（svc-search-<qid>）。
+
+    身份塌缩的根因是 SESSION 常量；改成 per-query 派生后，FocusRouter 才能把并发
+    子流当成可轮播的独立身份。这里只验证派生规则本身，不跑真实网络。
+    """
+    import importlib
+
+    fss = importlib.import_module("fake_search_service")
+    sids = []
+    captured: list = []
+
+    class _FakeResp:
+        def read(self, *_a):
+            return b""
+
+    def _fake_urlopen(req, timeout=0):  # noqa: ARG001
+        captured.append(json.loads(req.data.decode("utf-8")))
+        return _FakeResp()
+
+    import urllib.request
+
+    orig = urllib.request.urlopen
+    urllib.request.urlopen = _fake_urlopen
+    orig_run = fss.subprocess.run
+
+    class _Proc:
+        stdout = "晴 20°C"
+        returncode = 0
+
+    fss.subprocess.run = lambda *a, **k: _Proc()
+    try:
+        fss.search("北京")
+        fss.search("上海")
+    finally:
+        urllib.request.urlopen = orig
+        fss.subprocess.run = orig_run
+
+    sids = {e["session_id"] for e in captured}
+    assert len(sids) == 2, f"两个不同 query 应得两个不同 session_id，实得 {sids!r}"
+    assert all(s.startswith("svc-search-") for s in sids), (
+        f"session_id 应为 svc-search-<qid> 形态，实得 {sids!r}"
     )
 
 
@@ -113,6 +166,7 @@ def main() -> None:
         test_3_search_unaffected_by_unreachable_orchestrator,
         test_4_bootstrap_helper_parses_env_spec,
         test_5_emit_self_reports_subordinate_role,
+        test_6_concurrent_queries_get_distinct_session_ids,
     ]
     failed = 0
     try:
