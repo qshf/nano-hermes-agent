@@ -2,8 +2,14 @@
 
 Two orthogonal planes meet here (see docs multi-service-focus-rotation-plan):
 - **Control plane**: this is a FastMCP stdio server exposing one ``search`` tool.
-  nano connects to it via mcp_manager and calls ``search`` — a *blocking*
-  request/response. During those seconds nano sees no intermediate events.
+  nano connects to it via mcp_manager and calls ``search`` — a request/response
+  that blocks the *caller* until the fetch returns. During those seconds nano
+  sees no intermediate events. ``search`` is ``async`` and offloads its blocking
+  arc (wttr.in fetch + ``_emit`` POSTs) to a worker thread, so the FastMCP event
+  loop stays free to dispatch a *second* concurrent ``search`` request — two
+  delegate child-agents querying different cities now genuinely overlap (N3④),
+  instead of running back-to-back. That overlap is what lets the orchestrator's
+  FocusRouter rotate between two *live* subordinate streams.
 - **Observation plane**: while ``search`` runs an internal mini-agent loop
   (think → fetch → compose), each beat POSTs a flat v2 envelope straight
   to the voice orchestrator. Each call derives a **per-query** ``session_id``
@@ -37,6 +43,7 @@ import subprocess
 import time
 import urllib.request
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("search")
@@ -156,7 +163,7 @@ def _mini_agent(query: str, goal: str, sid: str, tid: str) -> str:
 
 
 @mcp.tool()
-def search(query: str) -> str:
+async def search(query: str) -> str:
     """Search by fetching real weather for ``query`` via wttr.in; return as JSON.
 
     ``query`` MUST be a bare place name in Chinese or English ('New York',
@@ -164,12 +171,28 @@ def search(query: str) -> str:
     digits. An invalid query short-circuits to ``{"query", "error"}`` *before*
     any network fetch or voice event, so the caller learns the contract fast.
 
-    Blocks until the fetch finishes (control plane). The voice arc is driven out
-    of band by ``_emit`` inside the loop (observation plane).
+    ``async`` on purpose (N3④): validation is inline (pure, no I/O), but the
+    blocking arc (wttr.in fetch + best-effort ``_emit`` POSTs) is offloaded to a
+    worker thread via ``anyio.to_thread.run_sync``. That keeps the FastMCP event
+    loop free to dispatch a *second* concurrent ``search`` request, so two
+    delegate child-agents querying different cities overlap in time instead of
+    serializing — the precondition for the orchestrator's FocusRouter to rotate
+    between two live subordinate streams. The voice arc itself is still driven
+    out of band by ``_emit`` inside the (synchronous) ``_search_blocking`` body.
     """
     err = _validate_query(query)
     if err is not None:
         return json.dumps({"query": query, "error": err}, ensure_ascii=False)
+    # 阻塞段（网络抓取 + _emit POST）整段进工作线程，event loop 不被占住 → 并发 search 重叠。
+    return await anyio.to_thread.run_sync(_search_blocking, query)
+
+
+def _search_blocking(query: str) -> str:
+    """Synchronous arc body — runs inside a worker thread (see ``search``).
+
+    Keeps ``_emit`` / ``_mini_agent`` fully synchronous; isolating the blocking
+    work in one thread is what frees the event loop for concurrent calls.
+    """
     # 每查询一个身份：qid 同时驱动 session_id 与 turn_id，并发调用互不串台（N3）。
     qid = abs(hash(query)) % 100000
     sid = f"{SESSION_PREFIX}-{qid}"

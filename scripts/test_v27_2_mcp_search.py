@@ -13,6 +13,7 @@ Run::
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -141,8 +142,8 @@ def test_6_concurrent_queries_get_distinct_session_ids():
 
     fss.subprocess.run = lambda *a, **k: _Proc()
     try:
-        fss.search("北京")
-        fss.search("上海")
+        asyncio.run(fss.search("北京"))
+        asyncio.run(fss.search("上海"))
     finally:
         urllib.request.urlopen = orig
         fss.subprocess.run = orig_run
@@ -185,7 +186,7 @@ def test_7_user_goal_carries_weather_topic():
     urllib.request.urlopen = _fake_urlopen
     fss.subprocess.run = lambda *a, **k: _Proc()
     try:
-        fss.search("上海")
+        asyncio.run(fss.search("上海"))
     finally:
         urllib.request.urlopen = orig
         fss.subprocess.run = orig_run
@@ -197,6 +198,71 @@ def test_7_user_goal_carries_weather_topic():
     )
     assert all("上海" in g for g in goals), (
         f"user_goal 应保留地名「上海」，实得 {goals!r}"
+    )
+
+
+def test_8_concurrent_searches_overlap_in_time():
+    """N3④：两次 search 并发跑时 fetch 区间应**重叠**，而非背靠背串行。
+
+    根因是同步 tool 的 subprocess.run 阻塞 FastMCP 的 event loop → 即便底层 server
+    每请求开独立 task，也被这一阻塞调用一起饿死，两次查询事实上串行（实证子流
+    +6.3→7.0 然后 +7.0→7.7）。修法把 search 改 async + 阻塞段 anyio.to_thread.run_sync
+    丢工作线程，loop 空出来 → 两个 search task 真并发。
+
+    这里用 asyncio.gather 并发两次 search，让 fetch sleep 0.3s 并记墙钟区间；
+    断言后开始的那次在先一次结束**之前**就已开始（重叠），即真并发。
+    """
+    import importlib
+    import threading
+    import time
+    import urllib.request
+
+    fss = importlib.import_module("fake_search_service")
+    spans: list = []
+    lock = threading.Lock()
+
+    class _FakeResp:
+        def read(self, *_a):
+            return b""
+
+    def _fake_urlopen(req, timeout=0):  # noqa: ARG001
+        return _FakeResp()
+
+    class _Proc:
+        returncode = 0
+
+        def __init__(self):
+            self.stdout = "晴 20°C"
+
+    def _slow_run(*_a, **_k):
+        t0 = time.monotonic()
+        time.sleep(0.3)  # 模拟 wttr.in 抓取耗时；串行下两段首尾相接，并发下重叠
+        t1 = time.monotonic()
+        with lock:
+            spans.append((t0, t1))
+        return _Proc()
+
+    orig = urllib.request.urlopen
+    orig_run = fss.subprocess.run
+    urllib.request.urlopen = _fake_urlopen
+    fss.subprocess.run = _slow_run
+
+    async def _both():
+        # 两个不同 query → 两个独立子流身份；并发提交
+        await asyncio.gather(fss.search("广州"), fss.search("深圳"))
+
+    try:
+        asyncio.run(_both())
+    finally:
+        urllib.request.urlopen = orig
+        fss.subprocess.run = orig_run
+
+    assert len(spans) == 2, f"应有两次 fetch，实得 {len(spans)}"
+    (a0, a1), (b0, b1) = sorted(spans)
+    # 并发：后开始那次(b0)在先结束那次(a1)之前就已开始 → 区间重叠。
+    # 串行下 b0 >= a1（首尾相接），此断言会失败。
+    assert b0 < a1, (
+        f"两次 fetch 应重叠（并发），实测后一次 start={b0:.3f} >= 前一次 end={a1:.3f}（串行）"
     )
 
 
@@ -214,6 +280,7 @@ def main() -> None:
         test_5_emit_self_reports_subordinate_role,
         test_6_concurrent_queries_get_distinct_session_ids,
         test_7_user_goal_carries_weather_topic,
+        test_8_concurrent_searches_overlap_in_time,
     ]
     failed = 0
     try:
