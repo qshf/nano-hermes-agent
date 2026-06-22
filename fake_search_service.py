@@ -120,21 +120,25 @@ def _emit(event_type: str, *, session_id: str, turn_id: str, user_goal: str = ""
         pass  # 语音失败绝不影响搜索本职
 
 
-def _mini_agent(query: str, sid: str, tid: str) -> str:
+def _mini_agent(query: str, goal: str, sid: str, tid: str) -> str:
     """Real weather lookup via ``curl wttr.in``, narrating the arc per beat.
 
     kind→category in the orchestrator's activity_arc: thinking→CAT_THINK,
     tool/web_search→CAT_SEARCH, generating_text→CAT_COMPOSE — so the spoken arc
     follows 思考 → 联网检索 → 整理回复, audible end-to-end during integ.
 
+    ``query`` is the bare place name fed to wttr.in; ``goal`` is the narration
+    string fed to the orchestrator (N7：携带"天气"语义，见 ``search``）—— 两者
+    刻意分离：URL 抓取只认裸地名，叙事却要让措辞器知道这是「查天气」。
+
     The control plane is now a genuine network fetch (wttr.in), not a sleep; the
     observation plane (``_emit``) is unchanged. A failed/slow fetch still emits
     its beats and returns a readable error — voice never blocks the job.
     """
-    _emit("activity_started", session_id=sid, turn_id=tid, user_goal=query,
+    _emit("activity_started", session_id=sid, turn_id=tid, user_goal=goal,
           activity={"kind": "thinking", "name": ""})
 
-    _emit("activity_progress", session_id=sid, turn_id=tid, user_goal=query,
+    _emit("activity_progress", session_id=sid, turn_id=tid, user_goal=goal,
           activity={"kind": "tool", "name": "web_search", "completed_count": 0})
     url = f"https://wttr.in/{query}?lang=zh&T"
     try:
@@ -146,7 +150,7 @@ def _mini_agent(query: str, sid: str, tid: str) -> str:
     except Exception as exc:  # noqa: BLE001 - 网络失败也要把话说完、把错带回
         report = f"(天气查询失败: {type(exc).__name__}: {exc})"
 
-    _emit("activity_started", session_id=sid, turn_id=tid, user_goal=query,
+    _emit("activity_started", session_id=sid, turn_id=tid, user_goal=goal,
           activity={"kind": "generating_text", "name": ""})  # 汇总
     return report
 
@@ -170,11 +174,16 @@ def search(query: str) -> str:
     qid = abs(hash(query)) % 100000
     sid = f"{SESSION_PREFIX}-{qid}"
     tid = f"search-{qid}"
-    _emit("turn_started", session_id=sid, turn_id=tid, user_goal=query)
-    report = _mini_agent(query, sid, tid)
-    _emit("activity_finished", session_id=sid, turn_id=tid, user_goal=query,
+    # N7：query 契约只收裸地名（喂 wttr.in），但"天气"语义只有本服务知道——它就是个
+    # 天气服务。叙事字段 user_goal 必须把这层语义带上，否则措辞器拿到光秃秃的"上海"+
+    # 阶段"思考"会凭空编主题（实测被说成"上海有什么好玩的/玩法"，旅游）。user_goal 是
+    # 自由叙事串、绝不回喂 wttr.in，故可安全携带"天气"而 query 仍保持裸地名。
+    goal = f"{query}的天气"
+    _emit("turn_started", session_id=sid, turn_id=tid, user_goal=goal)
+    report = _mini_agent(query, goal, sid, tid)
+    _emit("activity_finished", session_id=sid, turn_id=tid, user_goal=goal,
           activity={"kind": "tool", "name": "web_search", "outcome": "ok"})
-    _emit("turn_finished", session_id=sid, turn_id=tid, user_goal=query)
+    _emit("turn_finished", session_id=sid, turn_id=tid, user_goal=goal)
     return json.dumps({"query": query, "report": report}, ensure_ascii=False)
 
 

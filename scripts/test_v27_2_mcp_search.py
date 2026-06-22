@@ -154,6 +154,52 @@ def test_6_concurrent_queries_get_distinct_session_ids():
     )
 
 
+def test_7_user_goal_carries_weather_topic():
+    """N7：观测流 user_goal 必须携带"天气"语义，而 query 仍是裸地名（喂 wttr.in）。
+
+    "天气"这层语义只有本服务知道（query 契约拒收"天气"修饰词）。若 user_goal 原样
+    传裸地名"上海"，下游措辞器无料可依会凭空编主题（实测被说成"上海有什么好玩的/
+    玩法"，旅游）。修法：user_goal=f"{query}的天气"（叙事串，绝不回喂 wttr.in），
+    措辞器据此只转述"在查上海的天气"，不再发明话题。
+    """
+    import importlib
+    import urllib.request
+
+    fss = importlib.import_module("fake_search_service")
+    captured: list = []
+
+    class _FakeResp:
+        def read(self, *_a):
+            return b""
+
+    def _fake_urlopen(req, timeout=0):  # noqa: ARG001
+        captured.append(json.loads(req.data.decode("utf-8")))
+        return _FakeResp()
+
+    class _Proc:
+        stdout = "晴 20°C"
+        returncode = 0
+
+    orig = urllib.request.urlopen
+    orig_run = fss.subprocess.run
+    urllib.request.urlopen = _fake_urlopen
+    fss.subprocess.run = lambda *a, **k: _Proc()
+    try:
+        fss.search("上海")
+    finally:
+        urllib.request.urlopen = orig
+        fss.subprocess.run = orig_run
+
+    assert captured, "search 应至少 emit 一条 envelope"
+    goals = {e.get("user_goal", "") for e in captured}
+    assert all("天气" in g for g in goals), (
+        f"每条 envelope 的 user_goal 都应携带「天气」语义，实得 {goals!r}"
+    )
+    assert all("上海" in g for g in goals), (
+        f"user_goal 应保留地名「上海」，实得 {goals!r}"
+    )
+
+
 def _teardown():
     if "search" in mcp_manager.connected_servers:
         mcp_manager.disconnect("search")
@@ -167,6 +213,7 @@ def main() -> None:
         test_4_bootstrap_helper_parses_env_spec,
         test_5_emit_self_reports_subordinate_role,
         test_6_concurrent_queries_get_distinct_session_ids,
+        test_7_user_goal_carries_weather_topic,
     ]
     failed = 0
     try:
