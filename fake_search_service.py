@@ -46,7 +46,7 @@ import urllib.request
 import anyio
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("search")
+mcp = FastMCP("weather-search")
 
 ORCH = os.environ.get("VOICE_ORCHESTRATOR_URL", "http://127.0.0.1:8766/v1/turn-events")
 EMIT_TIMEOUT = float(os.environ.get("VOICE_ORCHESTRATOR_TIMEOUT_SECONDS", "0.5"))
@@ -164,7 +164,12 @@ def _mini_agent(query: str, goal: str, sid: str, tid: str) -> str:
 
 @mcp.tool()
 async def search(query: str) -> str:
-    """Search by fetching real weather for ``query`` via wttr.in; return as JSON.
+    """【天气查询，不是通用网页搜索】按地名查实时天气，返回 JSON。
+
+    ⚠️ 与 ``web`` 服务的 ``search`` 区分：那个是**通用网页检索**（关键词 → 网页候选列表，
+    再配 ``open_page`` 读正文）。**本工具只做天气**——给一个裸地名，返回该地实时天气，不接受
+    通用检索词或主题词。要查网页 / 资料 / 概念时用 ``web`` 服务的 ``search``，别用这个；
+    要查某地天气才用这个，别用 ``web`` 服务。
 
     ``query`` MUST be a bare place name in Chinese or English ('New York',
     '广东', 'Shenzhen') — no intent modifiers ('weather', '天气'), no JSON, no
