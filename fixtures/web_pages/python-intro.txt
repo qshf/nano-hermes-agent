@@ -1,0 +1,12 @@
+Python 入门指南
+
+Python 是一门解释型、动态类型的通用编程语言，以简洁可读著称。
+适合初学者快速上手，也支撑 Web、数据科学、自动化与 AI 等大型工程。
+
+核心特性：
+- 缩进即语法块，强制统一代码风格
+- 丰富的标准库（"batteries included"）
+- 庞大的第三方生态：requests、numpy、pandas、fastapi
+- 跨平台，CPython / PyPy 多种解释器实现
+
+安装后运行 `python3 hello.py` 即可执行脚本。

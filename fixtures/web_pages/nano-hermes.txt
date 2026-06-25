@@ -1,0 +1,10 @@
+nano_hermes_agent 项目简介
+
+这是一个教学版 AI Agent，从零迭代演进，逐步挂载长期记忆、多智能体、
+会话持久化、技能子系统与语音编排等能力，最终做到跨项目可用。
+
+它从生产级源项目 hermes-agent 中提取核心设计模式，以多版本（git 分支）
+的方式逐档还原精华，每档都配套决策日志与不变量测试。
+
+近期主轴：observability 与外部 voice orchestrator —— host 只发送 bounded
+事件信封，外部服务决定是否播报、播几次、怎么说。

@@ -1,0 +1,12 @@
+Model Context Protocol（MCP）概览
+
+MCP 是一套让大模型与外部工具、数据源对接的开放协议。
+服务端（server）暴露 tools / resources / prompts，客户端（host）通过
+stdio 或 HTTP 连接并发现这些能力，再由模型按需调用。
+
+关键概念：
+- tool：可被模型调用的函数，带 JSON Schema 描述参数
+- resource：可读取的上下文数据（文件、数据库行等）
+- transport：stdio 适合本地子进程，HTTP/SSE 适合远端服务
+
+典型用法：把一个搜索后端包装成 MCP server，模型即可"联网检索"。

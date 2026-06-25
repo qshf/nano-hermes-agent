@@ -163,7 +163,7 @@ def run_child_loop(
     model: str,
     registry: ToolRegistry,
     allowed_tool_names: set[str],
-    max_iterations: int = 8,
+    max_iterations: int = 16,
     cancel_token: Optional[CancelToken] = None,
     stream_enabled: bool = False,
     progress_callback: Optional[Callable[[StreamEvent], None]] = None,
