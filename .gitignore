@@ -28,3 +28,7 @@ docs/voice-system
 # 个人草稿/笔记（不入库）
 docs/1
 测试任务
+
+# 合同生成 skill
+skills/contract-generator-v2
+test_input
