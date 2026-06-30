@@ -21,6 +21,7 @@ memory prefetch → LLM turn loop（流式 / 同步）→ tool 分发 → 压缩
 from __future__ import annotations
 
 import json
+import logging
 import signal
 import sys
 import threading
@@ -51,6 +52,9 @@ from transports.streaming import (
     StreamCancelled,
 )
 from transports.types import build_assistant_history_msg
+
+
+logger = logging.getLogger(__name__)
 
 
 def _esc_listener(cancel_token, stop_event):
@@ -503,6 +507,10 @@ def run_repl(services: AgentServices) -> None:
                                 tools=all_tools_schema,
                             )
                     except FailoverExhausted as e:
+                        # v0.28.0: exc_info=True 让 traceback 展开 __cause__
+                        # （链耗尽时挂的最后一个原始异常），落进 v25.1 结构化日志，
+                        # 给用户的 print 仍只给一行聚合摘要。
+                        logger.error("all transports failed: %s", e, exc_info=True)
                         print(f"  [error] all transports failed: {e}")
                         break
                     except ValueError as exc:

@@ -29,6 +29,8 @@
 
 **完整 30 档进度表（版本 / 标题 / 关键词 / 引入概念）见 [docs/decisions/README.md](docs/decisions/README.md)，每档细节看对应 `v<N>.md`。** 本节只留规划。
 
+**当前系列**：**v0.28.x 稳健性硬化**（分支 `hardening/v0.28.0`，计划见 [docs/hardening/v0.28.x-plan.md](docs/hardening/v0.28.x-plan.md)）— ✅ v0.28.0 异常链 `raise ... from e`（chain.py 两处 FailoverExhausted 挂 cause）/ 🔲 v0.28.1 脏 JSON 解析错回喂 LLM 自修 / 🔲 v0.28.2 高频对象 `@dataclass(slots=True)` / 🔲 v0.28.3 工厂统一注册表 + registry 单例注释。
+
 **下一档候选**：v27.3 voice orchestrator 服务端深化（ContextExtractor / SpeechPolicy / PhrasePlanner / VoiceDispatcher + decision log / 回放）+ FR-5 全链路人耳验收 / pricing 多家对账（pricing_version + actual_cost）/ insights 扩展（platform/skill breakdown + 活动模式）/ v15.2 prefill retry / v23.5 嵌套 delegate（role: orchestrator + max_spawn_depth）/ v24.2 会话级锁修 last-write-wins / FTS5 全文检索。
 
 **已规划档组**：**v26 skill 子系统纵深补强** — ✅ v26.0 bundled 资源发现 + tier 3 读取 + 路径沙箱 / ✅ v26.1 可用性门控 / ✅ v26.2 安全 token 替换 / ✅ v26.3 行为指令注入 / ✅ v26.4 代码级语音心跳 / ✅ v26.5 事件驱动语音进度服务实验废弃。**v27 voice / observability 子系统** — ✅ v27.0 LLM ProgressSupervisor MVP 废弃实验 / ✅ v27.1 外部 Voice Orchestrator host-side（bounded envelope + runtime phase lease + 主智能体零语音工具调用）/ ✅ v27.2 多服务焦点轮播 nano 侧（FR-3 假搜索服务 + FR-4 `NANO_MCP_SERVERS` 挂 MCP；FocusRouter/source_label 在 nano_voice_kit FR-1/FR-2）；后续 v27.3 做服务端深化与 FR-5 联调验收。
@@ -142,7 +144,8 @@ cd /Users/qshf/my-project/nano_hermes_agent && \
 #       v20_prompt_cache, v21_slash, v21_2_prompt_builder, v21_3_skill, v21_4_tool_result_protocol,
 #       v22_streaming, v23_0_delegate, v23_1_batch, v23_2_project_context, v23_3_streaming, v23_4_structured_result,
 #       v24_0_session_store, v24_1_compaction_chain, v26_0_skill_resources, v26_1_availability, v26_2_token_subst,
-#       v26_3_inject_directive, v26_4_voice_heartbeat, v27_1_voice_orchestrator, v27_2_mcp_search
+#       v26_3_inject_directive, v26_4_voice_heartbeat, v27_1_voice_orchestrator, v27_2_mcp_search,
+#       v28_0_exception_chaining
 
 # 看当前装了几个 skill
 ls /Users/qshf/my-project/nano_hermes_agent/skills/

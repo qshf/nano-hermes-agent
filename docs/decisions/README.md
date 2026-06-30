@@ -42,5 +42,6 @@
 | v27.2 | 多服务焦点轮播 nano 侧（FR-3 假搜索服务 mini-agent / FR-4 `NANO_MCP_SERVERS` 挂 MCP / 控制流走 MCP·观测流服务自报） | [v27.2.md](./v27.2.md) |
 | v27.3 | voice_say 结果朗读 + self-narrate 让位（v27.1「零语音工具调用」的正交例外 / 仅用户显式要求念结果 / description+skill+directive 三道闸焊边界 / 自播后掐掉 orchestrator 追播） | [v27.3.md](./v27.3.md) |
 | v27.4 | 子 agent 调 MCP + 子流自报 producer_role（C：connect 上移 + 子全集读 registry 实时态解锁运行时 /mcp connect / A：MCP 插入流自报 subordinate，FocusRouter 不抢焦点·不收尾·即时放行，头尾两 bug 一起治 / B：_advance 跳过陈旧 memo 防幽灵会话） | [v27.4.md](./v27.4.md) |
+| v0.28.0 | 异常链 `raise ... from e`（稳健性硬化系列开篇 / chain.py 两处 FailoverExhausted 挂 cause / 平行 errors 列表带出原始异常 / 纯机械零行为变更） | [v0.28.0.md](./v0.28.0.md) |
 
 > 注：V8 的决策记录散落在对应的 commit message 与 [docs/Memory-system/](../Memory-system/) 子目录下，未来如有补录需求再回填本目录。V15 主决策（5 阶段压缩流水线）当时未单独建档，本目录从 v15.1 开始接力补完。

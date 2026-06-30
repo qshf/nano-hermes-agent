@@ -308,6 +308,8 @@ def run_child_loop(
                 messages=messages,
             )
         except FailoverExhausted as exc:
+            # v0.28.0: exc_info=True 展开 __cause__（最后一家原始异常）到结构化日志。
+            logger.error("[child_loop] transport failover exhausted: %s", exc, exc_info=True)
             return _build_result(
                 summary=f"sub-agent transport failover exhausted: {exc}",
                 exit_reason="error",

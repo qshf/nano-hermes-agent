@@ -185,6 +185,9 @@ class TransportChain:
         """
         del client  # 链版本由 entry.client 承担调用，外部 client 不参与
         attempts: list[ClassifiedError] = []
+        # V0.28.0: 与 attempts 平行收集每个 entry 的最后一次原始异常，
+        # 链耗尽抛 FailoverExhausted 时挂最后一个作为 __cause__，保住 traceback 因果链。
+        errors: list[BaseException] = []
         now = self._clock()
 
         for entry in self.entries:
@@ -201,7 +204,7 @@ class TransportChain:
             # 半开探针：cooldown 过了但 opened_at != 0 — 尝试一次，成功则关闭
             half_open = entry.breaker.opened_at != 0.0
 
-            result = self._try_with_retry(entry, kwargs, attempts)
+            result = self._try_with_retry(entry, kwargs, attempts, errors)
             if result is not None:
                 # 成功 — 关闭断路器
                 if half_open or entry.breaker.consecutive_failures > 0:
@@ -213,7 +216,7 @@ class TransportChain:
             # 失败 — 决策已写入 breaker，继续下一家
             now = self._clock()
 
-        raise FailoverExhausted(attempts)
+        raise FailoverExhausted(attempts) from (errors[-1] if errors else None)
 
     # ── 流式入口 ──────────────────────────────────────────
     def stream_call(
@@ -238,6 +241,8 @@ class TransportChain:
         """
         del client
         attempts: list[ClassifiedError] = []
+        # V0.28.0: 同 call()，平行留存最后一次原始异常用于挂 __cause__。
+        errors: list[BaseException] = []
         now = self._clock()
 
         for entry in self.entries:
@@ -280,6 +285,7 @@ class TransportChain:
             except Exception as exc:
                 classified = classify_error(exc)
                 attempts.append(classified)
+                errors.append(exc)
                 logger.warning(
                     "stream transport=%s failed: action=%s reason=%s status=%s delivered=%s",
                     entry.api_mode, classified.action.value,
@@ -298,7 +304,7 @@ class TransportChain:
                 now = self._clock()
                 continue
 
-        raise FailoverExhausted(attempts)
+        raise FailoverExhausted(attempts) from (errors[-1] if errors else None)
 
     # ── 单 transport 重试 ─────────────────────────────────────
 
@@ -307,6 +313,7 @@ class TransportChain:
         entry: _ChainEntry,
         kwargs: dict,
         attempts: list[ClassifiedError],
+        errors: list[BaseException],
     ) -> Optional[NormalizedResponse]:
         """对单个 entry 做 RETRYABLE 错误的内部重试。
 
@@ -343,6 +350,7 @@ class TransportChain:
             except Exception as exc:
                 classified = classify_error(exc)
                 attempts.append(classified)
+                errors.append(exc)
                 logger.warning(
                     "transport=%s attempt=%d failed: action=%s reason=%s status=%s",
                     entry.api_mode, attempt, classified.action.value,
