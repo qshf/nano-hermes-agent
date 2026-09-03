@@ -1,13 +1,17 @@
 """
 HookManager — V5 钩子管理器。
 
-管理 pre/post/transform 钩子的注册、注销和调用。
+管理工具钩子和模型生命周期钩子的注册、注销和调用。
 每个钩子回调用 try/except 隔离，一个插件出错不影响其他插件。
 
-三种钩子：
+工具钩子：
 - pre_tool_call(tool_name, args): 可阻止执行（返回 {"action": "block", "message": "..."}）
 - post_tool_call(tool_name, args, result, duration_ms): 观察者，返回值忽略
 - transform_tool_result(tool_name, args, result): 第一个非 None 字符串替换结果
+
+模型钩子：
+- before_model_call(messages, model, turn_id, stream_enabled, tools): 模型调用前观察者
+- after_model_call(messages, model, turn_id, response, stream_enabled): 模型调用后观察者
 
 使用方式：
     from tools.hooks import hook_manager
@@ -20,7 +24,13 @@ from typing import Callable
 
 log = logging.getLogger(__name__)
 
-VALID_HOOKS = {"pre_tool_call", "post_tool_call", "transform_tool_result"}
+VALID_HOOKS = {
+    "pre_tool_call",
+    "post_tool_call",
+    "transform_tool_result",
+    "before_model_call",
+    "after_model_call",
+}
 
 
 class HookManager:

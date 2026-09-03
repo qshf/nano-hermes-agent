@@ -137,6 +137,7 @@ if _cli_args.cwd is not None:
 
 from model_tools import get_tool_definitions, get_available_tool_names
 from tools.registry import registry
+from tools.hooks import hook_manager
 from tools.skill_view_tool import set_skill_loader as _inject_skill_loader
 from tools.delegate_tool import (
     DelegateContext,
@@ -159,6 +160,7 @@ from agent import PromptBuilder, SkillLoader
 from agent.compaction import apply_compaction
 from agent.logging import setup_logging, set_log_session, get_logger
 from agent.runtime import AgentRuntime, SESSION_TOKEN_KEYS
+from agent.voice_readout import install_voice_hooks, uninstall_voice_hooks
 from agent.session_store import SessionStore
 import cli  # 触发 cli/commands 下所有命令的装饰器注册
 
@@ -609,6 +611,9 @@ def run_agent():
 
     signal.signal(signal.SIGINT, _sigint_handler)
 
+    # 模型生命周期 hook：语音播报只挂在统一模型边界，不散落到工具分支。
+    install_voice_hooks()
+
 
     # V21.1: slash handler 共享的运行期上下文
     ctx = cli.AgentCtx(
@@ -742,6 +747,15 @@ def run_agent():
                     normalized = None
                     streamed_text_already = False  # 流式路径已打印过 final text，不再二次打印
                     try:
+                        hook_manager.invoke(
+                            "before_model_call",
+                            messages=messages,
+                            model=model,
+                            turn_id=f"{current_session_id}:{turn_count}",
+                            stream_enabled=runtime.stream_enabled,
+                            tools=all_tools_schema,
+                            chain=chain,
+                        )
                         if runtime.stream_enabled:
                             cancel_token.reset()
                             normalized = _stream_one_turn(
@@ -765,6 +779,16 @@ def run_agent():
                     except ValueError:
                         print("  [warn] invalid response shape, skipping turn")
                         break
+
+                    hook_manager.invoke(
+                        "after_model_call",
+                        messages=messages,
+                        model=model,
+                        turn_id=f"{current_session_id}:{turn_count}",
+                        response=normalized,
+                        stream_enabled=runtime.stream_enabled,
+                        chain=chain,
+                    )
 
                     # 用 API 返回的真实 token 数更新压缩器（下一轮触发判断用）
                     if normalized.usage and normalized.usage.prompt_tokens:
@@ -902,6 +926,7 @@ def run_agent():
             print(f"  [warn] trajectory flush on exit failed: {exc!r}")
         # V10: 释放外部 provider 的 httpx client；builtin 的 shutdown 是 no-op
         memory_manager.shutdown_all()
+        uninstall_voice_hooks()
 
 
 if __name__ == "__main__":

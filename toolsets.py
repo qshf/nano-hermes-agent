@@ -22,6 +22,7 @@ TOOLSETS: dict[str, list[str]] = {
         "async_demo",
         "skill_view",
         "delegate_task",
+        "voice_say",
     ],
     "docker": [
         "terminal",
@@ -31,6 +32,7 @@ TOOLSETS: dict[str, list[str]] = {
         "async_demo",
         "skill_view",
         "delegate_task",
+        "voice_say",
     ],
 }
 

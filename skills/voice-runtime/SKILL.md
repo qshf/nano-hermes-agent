@@ -1,39 +1,16 @@
 ---
 name: voice-runtime
-description: "把任务进展用语音播报出来。在任务起手、长耗时步骤、风险、阻塞、阶段完成、最终完成时调用，让用户不盯屏幕也能跟进。"
-required_environment_variables:
-  - DASHSCOPE_API_KEY
+description: "本地 nano_voice_kit Runtime、nano-voice-say CLI 的连接配置与故障处理。"
 metadata:
   category: voice
-  requires_tools:
-    - terminal
-inject_directive: |
-  语音播报已就绪：你必须用 `terminal` 调
-  `nano-voice-say --intent <intent> --text "<简短文案>"` 主动播报。这些是强制检查点，不是可选建议。
-
-  关键检查点（强制）：
-  - 起手：在第一个实质性动作（任何工具调用、长分析、改文件、跑耗时命令）之前，必须先播一条
-    `info`，说明你现在开始做什么。任务再短也要先播一条极短起手。
-  - 阶段：每进入新的耗时步骤、或一批工具/检索/分析结束得出新状态结论时，播 `progress`。
-  - 风险：发现风险或注意点播 `warning`；出现阻塞、继续无意义播 `urgent`。
-  - 完成：输出最终文本回复之前，必须先做一次完成态检查——结果已成形且无未解决阻塞，就先播 `done`
-    再回复；纯阅读/分析/总结/问答任务也不例外，不能因为"没改代码"就跳过完成播报。
-
-  封堵失败模式（最重要）：
-  - 文本更新与语音播报不是二选一。只要你正要发的中间文本里包含新状态（切了路径/数据源、拿到样本、
-    阶段切换、下一步变了、风险已确认），就必须先播报再发文本——只发文字不发语音是错误。
-  - 禁止出现"已经连续做了几步、文本里也多次同步了新状态，但期间一条语音都没播"。除非那些文本纯属
-    礼貌过渡、不含任何新状态。
-
-  规则：intent 五选一；文案口语化短句、一次一个要点、不念代码/路径/长 ID；必须真执行命令而非只打印
-  命令字符串。若 `nano-voice-say` 返回非零（Runtime 未起），告知用户一次即可，继续干主任务，不要反复
-  重试、也不要自己去 `start` 服务。详细规则按需 skill_view 读 voice-runtime 正文。
+  requires_tools: []
 ---
 
 # voice-runtime
 
-用语音播报任务进展。底层是常驻的本地语音 Runtime（`nano_voice_kit`，云 API 合成 + 本机播放）。
-你通过 `terminal` 工具调用 `nano-voice-say` 命令把文案发给 Runtime。
+底层是常驻的本地语音 Runtime（`nano_voice_kit`，云 API 合成 + 本机播放）。模型生命周期
+播报由宿主的 `before_model_call` / `after_model_call` hook 负责；本 skill 只说明 Runtime
+和 CLI 的可用性，不要求模型自行播报。
 
 ## 调用方式
 
@@ -59,19 +36,11 @@ nano-voice-say --intent <intent> --text "<文案>"
 | `urgent` | 需要立刻打断当前播报 | 打断当前播放，立即播 |
 | `done` | 任务最终完成 | 清空待播后播收尾 |
 
-## 何时播报
+## 文案与执行边界
 
-- **起手**：接到任务、开始执行时，用 `info` 说明要做什么。
-- **进度**：多步骤任务每进入新阶段，用 `progress` 更新（旧进度会被自动替换）。
-- **风险**：遇到风险操作、需要用户注意时，用 `warning`。
-- **阻塞**：卡住、需要用户输入时，用 `warning` 或 `urgent`。
-- **完成**：任务结束时**必须**用 `done` 播报，否则用户不知道已经完成。
-
-## 文案规则
-
-- 口语化、短句，像同事在旁边随口说，不要念长段落。
-- 一次一个要点，别把多件事塞进一句。
-- 不要播报代码、路径、长串 ID。
+- 模型前后 hook 负责决定播报内容和 intent；本 skill 不增加额外时机。
+- 每次先拿到完整短句，再一次性执行 CLI；不发送流式 token。
+- 口语化、短句，不播报代码、路径或长串 ID。
 - `--text` 里避免双引号；要带引号时用单引号包整个文案。
 
 ## 运行前检查
@@ -87,7 +56,5 @@ nano-voice-runtime status
 就提示用户执行 `nano-voice-runtime start --daemon`，然后**继续干主任务**，仅告知用户语音暂不可用——
 `nano-voice-say` 在 Runtime 没起时会返回非零退出码，属预期，不要因此中断或反复重试启动。
 
-> 门控说明：本 skill 声明 `required_environment_variables: [DASHSCOPE_API_KEY]`（缺失时索引里软标记
-> `⚠ setup_needed`）与 `metadata.requires_tools: [terminal]`（无 terminal 工具时硬隐藏）。这也是 v26.1
-> 可用性门控的真实用例。
-
+> 门控说明：Runtime 是否可用由 `VOICE_READOUT_ENABLED`、CLI 路径和 Runtime 地址决定；
+> 这些变量由宿主 dispatcher 在调用时读取，skill 索引本身不再强制要求 `terminal` 或云端 key。
